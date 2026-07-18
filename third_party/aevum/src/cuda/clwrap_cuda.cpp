@@ -106,8 +106,19 @@ cl_context clCreateContext(const intptr_t*, unsigned nDevices, const cl_device_i
   }
   g_cudaContext = ctx->ctx;  // Track for ensureContextCurrent()
 
-  // L2 persistence: no benefit measured for this workload.
-  // cuCtxSetLimit(CU_LIMIT_PERSISTING_L2_CACHE_SIZE, 16 * 1024 * 1024);
+  // L2 persistence (opt-in via AEVUM_L2PIN=1). The upstream "no benefit" note was on
+  // hardware whose working set exceeds L2; on Blackwell (5090: 96MB L2 / 60MB persisting)
+  // the ~48MB residue fits, so pinning it can keep the carry/tail read traffic off DRAM.
+  if (getenv("AEVUM_L2PIN")) {
+    int maxPersist = 0;
+    cuDeviceGetAttribute(&maxPersist, CU_DEVICE_ATTRIBUTE_MAX_PERSISTING_L2_CACHE_SIZE, ctx->dev);
+    size_t want = 50u * 1024 * 1024;
+    if (const char* m = getenv("AEVUM_L2PIN_MB")) { long v = atol(m); if (v > 0) want = (size_t)v * 1024 * 1024; }
+    if (maxPersist > 0 && want > (size_t)maxPersist) want = (size_t)maxPersist;
+    CUresult lr = cuCtxSetLimit(CU_LIMIT_PERSISTING_L2_CACHE_SIZE, want);
+    fprintf(stderr, "L2 persist: reserved %zuMB persisting L2 (device max %dMB) rc=%d\n",
+            want / (1024*1024), maxPersist / (1024*1024), (int)lr);
+  }
 
   if (err) *err = CL_SUCCESS;
   return ctx;
@@ -716,12 +727,34 @@ cl_command_queue clCreateCommandQueueWithProperties(cl_context ctx, cl_device_id
 
 // ---- Enqueue operations ----
 
+// Defined below with C++ linkage (uses std::vector); declare here so the first kernel
+// launch can lazily pin the residue buffer(s) into persisting L2.
+extern "C++" void cudaSetL2Persistent(cl_command_queue q, const std::vector<cl_mem>& buffers);
+
 int clEnqueueNDRangeKernel(cl_command_queue q, cl_kernel k, unsigned workDim,
                             const size_t* globalOffset, const size_t* globalSize,
                             const size_t* localSize, unsigned nWaits,
                             const cl_event* waits, cl_event* event) {
   if (!q || !k) return CL_INVALID_VALUE;
   ensureContextCurrent();
+
+  // One-time L2 persistence pin (opt-in). By the first launch all device buffers exist.
+  // Default: pin the single largest buffer (the GF61 residue, ~33.5MB) — a contiguous
+  // window with hitRatio ~1.0. AEVUM_L2PIN_MINMB=<N> instead pins every buffer >= N MB.
+  static bool s_l2pinDone = false;
+  if (!s_l2pinDone && getenv("AEVUM_L2PIN")) {
+    s_l2pinDone = true;
+    std::vector<cl_mem> chosen;
+    if (const char* t = getenv("AEVUM_L2PIN_MINMB")) {
+      size_t thB = (size_t)atol(t) * 1024 * 1024;
+      for (cl_mem b : g_allocatedBuffers) if (b && b->size >= thB) chosen.push_back(b);
+    } else {
+      cl_mem big = nullptr;
+      for (cl_mem b : g_allocatedBuffers) if (b && (!big || b->size > big->size)) big = b;
+      if (big) chosen.push_back(big);
+    }
+    if (!chosen.empty()) cudaSetL2Persistent(q, chosen);
+  }
 
   size_t gs = globalSize[0];
   // NULL localSize: OpenCL lets the runtime choose, and with reqd_work_group_size the
