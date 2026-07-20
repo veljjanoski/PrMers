@@ -16,6 +16,9 @@ KERNEL(IN_WG) fftMiddleIn(P(T2) out, CP(T2) in, Trig trig) {
   u32 N = WIDTH / IN_SIZEX;
 
   u32 g = get_group_id(0);
+#if LIFO_MID
+  g = get_num_groups(0) - 1 - g;   // LIFO dispatch: consume producer's most-recent (L2-hot) tiles first
+#endif
   u32 gx = g % N;
   u32 gy = g / N;
 
@@ -77,6 +80,9 @@ KERNEL(IN_WG) fftMiddleIn(P(T2) out, CP(T2) in, Trig trig) {
   u32 N = WIDTH / IN_SIZEX;
 
   u32 g = get_group_id(0);
+#if LIFO_MID
+  g = get_num_groups(0) - 1 - g;   // LIFO dispatch: consume producer's most-recent (L2-hot) tiles first
+#endif
   u32 gx = g % N;
   u32 gy = g / N;
 
@@ -138,6 +144,9 @@ KERNEL(IN_WG) fftMiddleInGF31(P(T2) out, CP(T2) in, Trig trig) {
   u32 N = WIDTH / IN_SIZEX;
   
   u32 g = get_group_id(0);
+#if LIFO_MID
+  g = get_num_groups(0) - 1 - g;   // LIFO dispatch: consume producer's most-recent (L2-hot) tiles first
+#endif
   u32 gx = g % N;
   u32 gy = g / N;
 
@@ -199,6 +208,9 @@ KERNEL(IN_WG) fftMiddleInGF61(P(T2) out, CP(T2) in, Trig trig) {
   u32 N = WIDTH / IN_SIZEX;
   
   u32 g = get_group_id(0);
+#if LIFO_MID
+  g = get_num_groups(0) - 1 - g;   // LIFO dispatch: consume producer's most-recent (L2-hot) tiles first
+#endif
   u32 gx = g % N;
   u32 gy = g / N;
 
@@ -255,6 +267,9 @@ KERNEL(256) fftMiddleIn(P(T2) out, P(T2) in, Trig trig) {
   T2 u[MIDDLE];
 
   u32 g = get_group_id(0);
+#if LIFO_MID
+  g = get_num_groups(0) - 1 - g;   // LIFO dispatch: consume producer's most-recent (L2-hot) tiles first
+#endif
 #if INPLACE == 1                                   // nVidia friendly padding
   u32 N = SMALL_HEIGHT / 16;
   u32 starty = g % N * 16;
@@ -310,6 +325,9 @@ KERNEL(256) fftMiddleIn(P(T2) out, P(T2) in, Trig trig) {
   TrigFP32 trigF2 = (TrigFP32) trig;
 
   u32 g = get_group_id(0);
+#if LIFO_MID
+  g = get_num_groups(0) - 1 - g;   // LIFO dispatch: consume producer's most-recent (L2-hot) tiles first
+#endif
 #if INPLACE == 1                                   // nVidia friendly padding
   u32 N = SMALL_HEIGHT / 16;
   u32 starty = g % N * 16;
@@ -365,6 +383,9 @@ KERNEL(256) fftMiddleInGF31(P(T2) out, P(T2) in, Trig trig) {
   TrigGF31 trig31 = (TrigGF31) (trig + DISTMTRIGGF31);
 
   u32 g = get_group_id(0);
+#if LIFO_MID
+  g = get_num_groups(0) - 1 - g;   // LIFO dispatch: consume producer's most-recent (L2-hot) tiles first
+#endif
 #if INPLACE == 1                                   // nVidia friendly padding
   u32 N = SMALL_HEIGHT / 16;
   u32 starty = g % N * 16;
@@ -420,6 +441,9 @@ KERNEL(256) fftMiddleInGF61(P(T2) out, P(T2) in, Trig trig) {
   TrigGF61 trig61 = (TrigGF61) (trig + DISTMTRIGGF61);
 
   u32 g = get_group_id(0);
+#if LIFO_MID
+  g = get_num_groups(0) - 1 - g;   // LIFO dispatch: consume producer's most-recent (L2-hot) tiles first
+#endif
 #if INPLACE == 1                                   // nVidia friendly padding
   u32 N = SMALL_HEIGHT / 16;
   u32 starty = g % N * 16;
