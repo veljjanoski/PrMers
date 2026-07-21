@@ -299,7 +299,11 @@ string clDefines(const Args& args, cl_device_id id, FFTConfig fft, const vector<
                               "MODM31",
                               "LOADS","STORES",
                               "NOREG",                  // CUDA - experimental
-                              "WMUL"
+                              "WMUL",
+                              "MEGAPASS31",             // Fused middles+tail single-launch (GF31)
+                              "MEGAPASS61",             // Fused middles+tail single-launch (GF61)
+                              "MEGA_DEBUG",             // Megapass bring-up: bounded spins, canary, diagnostics
+                              "MEGA_SPIN_BOUND"         // Megapass debug spin bound override
                             });
     if (!isValid) {
       log("Warning: unrecognized -use key '%s'\n", k.c_str());
@@ -546,7 +550,188 @@ string formatSecsPerIter(float secsPerIter) {
   } else {
     snprintf(buf, sizeof(buf), "%6.1f", usecsPerIter);
   }
-  return string(buf);  
+  return string(buf);
+}
+
+// ---------------------------------------------------------------------------------------
+// Megapass schedule map (see src/cl/megasquare.cl for the map/flag layout documentation).
+//
+// Geometry is hard-locked to shape 1:512:8:512 with the default middle/tail tunables
+// (compile guards in megasquare.cl + runtime checks in megaInit enforce this):
+//   32 width-chunks x 64 y-chunks per middle role, 2048 double-wide tail WGs, H=4096.
+//
+// Flat WG id order is cohort-major: cohort c in [0,16) is the mirror-closed width-chunk
+// pair {c, 31-c}. Each cohort emits [MidIn (gy-fast)][Tail (ascending g)][MidOut] blocks.
+// Tail WG g is assigned to cohort t(g) = max over its two columns of the column cohort,
+// and MidOut WG (gxo,gyo) to the COMPUTED max t over its 8-column window [8gyo, 8gyo+8)
+// (boundary columns migrate cohorts; closed forms are deliberately not used).
+// ---------------------------------------------------------------------------------------
+
+constexpr u32 MEGA_NWGS       = 6144;                    // 3 roles x 2048 WGs
+constexpr u32 MEGA_FLAGTAB    = 6144;                    // MidOut flag tables start here in bufMegaMap
+constexpr u32 MEGA_MAP_SIZE   = MEGA_FLAGTAB + 2048 * 64;
+constexpr u32 MEGA_READY_SIZE = 12288;                   // two 6144-flag regions (GF31, GF61)
+constexpr u32 MEGA_DBG_SIZE   = 512;
+
+u32 megaCoh(u32 gx) { return std::min(gx, 31 - gx); }    // cohort of width-chunk gx in [0,32)
+
+// Cohort of memline column x in [0,512): both the tail WG writing column x (via line_u)
+// and its mirror partner share this value, by construction of the max.
+u32 megaColT(u32 x) {
+  u32 xv = (512 - x) % 512;
+  return std::max(megaCoh(x / 16), megaCoh(xv / 16));
+}
+
+[[noreturn]] void megaFail(const string& mes) {
+  log("MEGAPASS schedule validation FAILED: %s\n", mes.c_str());
+  throw "MEGAPASS schedule validation failed";
+}
+
+// Build the schedule map + MidOut consume-flag tables. This is the SINGLE source of truth:
+// the packed fields the kernel decodes are the same values validateMegaSchedule() checks.
+vector<u32> buildMegaScheduleMap() {
+  vector<u32> map(MEGA_MAP_SIZE, 0xffffffffu);
+  u32 flat = 0;
+  u32 slotCounter = 0;
+
+  for (u32 c = 0; c < 16; ++c) {
+    // MidIn block: both chunks of the mirror pair, gy fast (so a column's 64 producers are
+    // the contiguous flat ids [F(gx,0), F(gx,0)+64) -- the forward-only enabler).
+    for (u32 gx : {c, 31 - c}) {
+      for (u32 gy = 0; gy < 64; ++gy) {
+        map[flat++] = (0u << 30) | (gy << 5) | gx;
+      }
+    }
+
+    // Tail block: ascending g among WGs whose cohort is c.
+    for (u32 g = 0; g < 2048; ++g) {
+      u32 xu = g % 512;
+      if (megaColT(xu) != c) continue;
+      u32 xv = (512 - xu) % 512;
+      u32 gxu = xu / 16;
+      u32 gxv = xv / 16;
+      map[flat++] = (1u << 30) | (gxv << 16) | (gxu << 11) | g;
+    }
+
+    // MidOut block: gyo windows whose computed max-t is c; gxo ascending inside.
+    for (u32 gyo = 0; gyo < 64; ++gyo) {
+      u32 T = 0;
+      for (u32 x = 8 * gyo; x < 8 * gyo + 8; ++x) { T = std::max(T, megaColT(x)); }
+      if (T != c) continue;
+      for (u32 gxo = 0; gxo < 32; ++gxo) {
+        u32 slot = slotCounter++;
+        map[flat++] = (2u << 30) | (slot << 11) | (gyo << 5) | gxo;
+        // 64-entry consume-flag table: thread 'lane' (lane < 64) spins this exact index.
+        // Column x = 8*gyo + lane/8; j = lane%8 enumerates the 8 producers of column x
+        // as the set {512j+x : j<4} u {512j+((512-x)%512) : j<4} (set-correct permutation
+        // of per-line producers; bar() collectivizes the wait so per-lane naming is free).
+        for (u32 lane = 0; lane < 64; ++lane) {
+          u32 x = 8 * gyo + lane / 8;
+          u32 j = lane % 8;
+          u32 g_p = (j < 4) ? (j * 512 + x) : ((j - 4) * 512 + ((512 - x) % 512));
+          map[MEGA_FLAGTAB + slot * 64 + lane] = 2048 + g_p;
+        }
+      }
+    }
+  }
+
+  if (flat != MEGA_NWGS) { megaFail("emitted " + to_string(flat) + " WGs, expected " + to_string(MEGA_NWGS)); }
+  if (slotCounter != 2048) { megaFail("emitted " + to_string(slotCounter) + " MidOut slots, expected 2048"); }
+  return map;
+}
+
+// Executable safety proof, run at every startup. Decodes the map EXACTLY as the kernel
+// does and checks that (a) every flag has exactly one producer WG in the grid, (b) every
+// consumed flag's producer has a strictly smaller flat id (forward-only => deadlock-free
+// under nondecreasing-id dispatch), (c) the consume-flag sets cover every data producer
+// (independently recomputed from the stock kernels' index math).
+void validateMegaSchedule(const vector<u32>& map) {
+  if (map.size() != MEGA_MAP_SIZE) { megaFail("bad map size"); }
+
+  // Pass 1: producers. Region-relative flag index -> producing flat id.
+  vector<i32> flagProducer(4096, -1);
+  vector<char> midinSeen(2048, 0), tailSeen(2048, 0), midoutSeen(2048, 0), slotSeen(2048, 0);
+  u32 roleCount[3] = {0, 0, 0};
+
+  for (u32 fid = 0; fid < MEGA_NWGS; ++fid) {
+    u32 desc = map[fid];
+    u32 role = desc >> 30;
+    if (role > 2) { megaFail("wg " + to_string(fid) + " has invalid role"); }
+    ++roleCount[role];
+    if (role == 0) {
+      u32 gx = desc & 31, gy = (desc >> 5) & 63;
+      u32 flag = gx * 64 + gy;
+      if (midinSeen[flag]++) { megaFail("duplicate MidIn work (" + to_string(gx) + "," + to_string(gy) + ")"); }
+      flagProducer[flag] = fid;
+    } else if (role == 1) {
+      u32 g = desc & 2047;
+      if (tailSeen[g]++) { megaFail("duplicate Tail work g=" + to_string(g)); }
+      flagProducer[2048 + g] = fid;
+    } else {
+      u32 gxo = desc & 31, gyo = (desc >> 5) & 63, slot = (desc >> 11) & 2047;
+      u32 work = gyo * 32 + gxo;
+      if (midoutSeen[work]++) { megaFail("duplicate MidOut work (" + to_string(gxo) + "," + to_string(gyo) + ")"); }
+      if (slotSeen[slot]++) { megaFail("duplicate MidOut flag-table slot " + to_string(slot)); }
+    }
+  }
+  for (int r = 0; r < 3; ++r) {
+    if (roleCount[r] != 2048) { megaFail("role " + to_string(r) + " has " + to_string(roleCount[r]) + " WGs, expected 2048"); }
+  }
+  // Full coverage of the seen arrays follows from counts 2048 + no duplicates.
+
+  // Pass 2: consumers. Enumerate the kernel's ACTUAL spin indices and check each edge.
+  for (u32 fid = 0; fid < MEGA_NWGS; ++fid) {
+    u32 desc = map[fid];
+    u32 role = desc >> 30;
+
+    if (role == 1) {  // Tail: waits the flag set {gx_u*64+k} u {gx_v*64+k}, k in [0,64) (one spinner per column)
+      u32 g = desc & 2047;
+      u32 gxu = (desc >> 11) & 31;
+      u32 gxv = (desc >> 16) & 31;
+      // Independent recomputation of the true producer chunks from the stock index math
+      // (readTailFusedLine: chunk_x = (line%WIDTH)/IN_SIZEX, all 64 chunk_y needed).
+      u32 xu = g % 512;
+      u32 xv = (512 - xu) % 512;
+      if (gxu != xu / 16 || gxv != xv / 16) { megaFail("tail g=" + to_string(g) + " packed chunks disagree with line math"); }
+      for (u32 me = 0; me < 128; ++me) {
+        u32 flag = ((me < 64) ? gxu : gxv) * 64 + (me % 64);
+        i32 prod = flagProducer[flag];
+        if (prod < 0) { megaFail("tail g=" + to_string(g) + " spins never-produced flag " + to_string(flag)); }
+        if ((u32) prod >= fid) {
+          megaFail("FORWARD-ONLY violated: tail wg " + to_string(fid) + " (g=" + to_string(g) +
+                   ") waits on MidIn wg " + to_string(prod) + " (flag " + to_string(flag) + ")");
+        }
+      }
+    } else if (role == 2) {  // MidOut: thread me<64 spins the table entry
+      u32 gxo = desc & 31, gyo = (desc >> 5) & 63, slot = (desc >> 11) & 2047;
+      (void) gxo;
+      vector<char> inSet(2048, 0);
+      for (u32 lane = 0; lane < 64; ++lane) {
+        u32 flag = map[MEGA_FLAGTAB + slot * 64 + lane];
+        if (flag < 2048 || flag >= 4096) { megaFail("midout slot " + to_string(slot) + " lane " + to_string(lane) + " has out-of-range flag"); }
+        i32 prod = flagProducer[flag];
+        if (prod < 0) { megaFail("midout wg " + to_string(fid) + " spins never-produced flag " + to_string(flag)); }
+        if ((u32) prod >= fid) {
+          megaFail("FORWARD-ONLY violated: midout wg " + to_string(fid) + " waits on tail wg " + to_string(prod) +
+                   " (flag " + to_string(flag) + ")");
+        }
+        inSet[flag - 2048] = 1;
+      }
+      // Data-coverage: every memline this WG reads (readMiddleOutLine: memlines
+      // [64*gyo, 64*gyo+64)) must have its producing tail WG in the waited flag set.
+      for (u32 m = 64 * gyo; m < 64 * gyo + 64; ++m) {
+        u32 xw = m / 8;              // transPos inverse: line L = (m%8)*512 + m/8
+        u32 im = m % 8;
+        u32 L = im * 512 + xw;
+        u32 gp = (L < 2048) ? L : (4096 - L) % 2048;  // tail WG writing line L (line_u or line_v)
+        if (!inSet[gp]) {
+          megaFail("midout wg " + to_string(fid) + " (gyo=" + to_string(gyo) +
+                   ") reads memline " + to_string(m) + " but does not wait on its producer tail g=" + to_string(gp));
+        }
+      }
+    }
+  }
+  log("MEGAPASS: schedule map validated (6144 WGs, all dependency edges forward-only)\n");
 }
 
 } // namespace
@@ -808,6 +993,11 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
   K(kfftMidOutGF61,        "fftmiddleout.cl", "fftMiddleOutGF61", hN / (BIG_H / SMALL_H), (kernelDefines(K61) + numCudaRegisters(MIDOUT61)).c_str()),
   K(kfftWGF61,             "fftw.cl", "fftWGF61", hN / nW, kernelDefines(K61).c_str()),
 
+  // Megapass fused kernels: 6144 WGs x 128 threads. Compiled lazily, i.e. only when launched.
+  K(kMegaSquareGF31,       "megasquare.cl", "megaSquareGF31", 6144 * 128, kernelDefines(K31).c_str()),
+  K(kMegaSquareGF61,       "megasquare.cl", "megaSquareGF61", 6144 * 128, kernelDefines(K61).c_str()),
+  K(kMegaCanary,           "megasquare.cl", "megaCanary",     6144 * 128, kernelDefines(KALL).c_str()),
+
   K(kfftP,                 "fftp.cl", "fftP", hN / nW, kernelDefines(KALL).c_str()),
   K(kCarryA,               "carry.cl", "carry", hN / CARRY_LEN, kernelDefines(KALL).c_str()),
   K(kCarryAROE,            "carry.cl", "carry", hN / CARRY_LEN, (kernelDefines(KALL) + "-DROE=1").c_str()),
@@ -871,6 +1061,15 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
   BUF(buf1, TOTAL_DATA_SIZE(fft, WIDTH, fft.shape.middle, SMALL_H, in_place, pad_size)),
   BUF(buf2, TOTAL_DATA_SIZE(fft, WIDTH, fft.shape.middle, SMALL_H, in_place, pad_size)),
   BUF(buf3, TOTAL_DATA_SIZE(fft, WIDTH, fft.shape.middle, SMALL_H, in_place, pad_size)),
+
+  // Megapass buffers: size 0 (no allocation) unless the corresponding -use flag is active.
+  BUF(bufMegaMap,   (args.value("MEGAPASS31", 0) || args.value("MEGAPASS61", 0)) ? MEGA_MAP_SIZE : 0),
+  BUF(bufMegaReady, (args.value("MEGAPASS31", 0) || args.value("MEGAPASS61", 0)) ? MEGA_READY_SIZE : 0),
+  BUF(bufMegaDebug, (args.value("MEGAPASS31", 0) || args.value("MEGAPASS61", 0)) ? MEGA_DBG_SIZE : 0),
+  BUF(bufMegaA31,   (fft.NTT_GF31 && args.value("MEGAPASS31", 0)) ? GF31_DATA_SIZE(WIDTH, fft.shape.middle, SMALL_H, in_place, pad_size) : 0),
+  BUF(bufMegaB31,   (fft.NTT_GF31 && args.value("MEGAPASS31", 0)) ? GF31_DATA_SIZE(WIDTH, fft.shape.middle, SMALL_H, in_place, pad_size) : 0),
+  BUF(bufMegaA61,   (fft.NTT_GF61 && args.value("MEGAPASS61", 0)) ? GF61_DATA_SIZE(WIDTH, fft.shape.middle, SMALL_H, in_place, pad_size) : 0),
+  BUF(bufMegaB61,   (fft.NTT_GF61 && args.value("MEGAPASS61", 0)) ? GF61_DATA_SIZE(WIDTH, fft.shape.middle, SMALL_H, in_place, pad_size) : 0),
 #undef BUF
 
   statsBits{u32(args.value("STATS", 0))},
@@ -964,6 +1163,10 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
   bufStatsCarry.zero();
   bufTrue.write({1});
 
+  // Megapass setup: validates config, builds+uploads the schedule map, zeroes the flag
+  // buffer, sets kernel args, and (under MEGA_DEBUG) runs the ascending-dispatch canary.
+  megaInit();
+
   if (args.verbose) {
     selftestTrig();
   }
@@ -975,8 +1178,107 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
   if (args.value("MULTI_Q", 0))
     queue.setSquareKernels(5 + ((fft.FFT_FP64 + fft.FFT_FP32 + fft.NTT_GF31 + fft.NTT_GF61) - 1));
   else
-    queue.setSquareKernels(1 + 3 * (fft.FFT_FP64 + fft.FFT_FP32 + fft.NTT_GF31 + fft.NTT_GF61));
+    queue.setSquareKernels(1 + 3 * (fft.FFT_FP64 + fft.FFT_FP32) +
+                           (megapass31 ? 1 : 3) * fft.NTT_GF31 +
+                           (megapass61 ? 1 : 3) * fft.NTT_GF61);
   queue.finish();
+}
+
+// Megapass initialization: runs once in the Gpu constructor.
+void Gpu::megaInit() {
+  megapass31 = fft.NTT_GF31 && args.value("MEGAPASS31", 0) > 0;
+  megapass61 = fft.NTT_GF61 && args.value("MEGAPASS61", 0) > 0;
+  megaDebug  = args.value("MEGA_DEBUG", 0) > 0;
+  if (!megapass31 && !megapass61) { return; }
+
+  // Reject configurations the fused kernel's index math cannot handle. The .cl compile
+  // guards catch these too, but failing here gives a clearer message before any launch.
+  if (args.value("MULTI_Q", 0)) {
+    log("MEGAPASS requires a single command queue: remove -use MULTI_Q\n");
+    throw "MEGAPASS is incompatible with MULTI_Q";
+  }
+  if (in_place) {
+    log("MEGAPASS requires INPLACE=0\n");
+    throw "MEGAPASS is incompatible with INPLACE";
+  }
+  if (pad_size != 0) {
+    log("MEGAPASS requires PAD=0\n");
+    throw "MEGAPASS is incompatible with PAD";
+  }
+  if (tail_single_wide || !tail_single_kernel) {
+    log("MEGAPASS requires TAIL_KERNELS=2 (double-wide single-kernel tailSquare)\n");
+    throw "MEGAPASS requires TAIL_KERNELS=2";
+  }
+  if (args.value("LIFO_MID", 0) > 0) {
+    log("MEGAPASS is incompatible with LIFO_MID\n");
+    throw "MEGAPASS is incompatible with LIFO_MID";
+  }
+  if (WIDTH != 512 || fft.shape.middle != 8 || SMALL_H != 512 || nW != 8 || nH != 8) {
+    log("MEGAPASS supports only shape 1:512:8:512 (got %s)\n", fft.shape.spec().c_str());
+    throw "MEGAPASS unsupported FFT shape";
+  }
+
+  // Build the schedule map and run the executable forward-only proof; then upload.
+  vector<u32> map = buildMegaScheduleMap();
+  validateMegaSchedule(map);
+  bufMegaMap.write(map);
+  bufMegaReady.zero();
+  bufMegaDebug.zero();
+
+  if (megapass31) {
+    kMegaSquareGF31.setFixedArgs(3, bufMegaA31, bufMegaB31, bufMegaReady, bufMegaMap, bufTrigM, bufTrigH, bufMegaDebug);
+  }
+  if (megapass61) {
+    kMegaSquareGF61.setFixedArgs(3, bufMegaA61, bufMegaB61, bufMegaReady, bufMegaMap, bufTrigM, bufTrigH, bufMegaDebug);
+  }
+
+  log("MEGAPASS enabled:%s%s (fused middles+tail, 6144 WGs x 128)%s\n",
+      megapass31 ? " GF31" : "", megapass61 ? " GF61" : "",
+      megaDebug ? " with MEGA_DEBUG bounded spins" : "");
+
+  // Ascending-dispatch canary: the forward-only safety argument assumes WGs are dispatched
+  // in nondecreasing id order (empirical on NVIDIA, proven by carryFused's stairway).
+  // Verify it on this device/driver before trusting the fused kernel.
+  if (megaDebug) {
+    u32 e = nextMegaEpoch();
+    kMegaCanary(bufMegaReady, e, bufMegaDebug);
+    queue.finish();
+    vector<u32> flags = bufMegaReady.read(MEGA_NWGS);
+    u32 bad = 0;
+    for (u32 i = 0; i < MEGA_NWGS; ++i) { if (flags[i] != e) { ++bad; } }
+    if (bad) {
+      log("MEGAPASS canary: %u of %u flags missing after run\n", bad, MEGA_NWGS);
+      throw "MEGAPASS canary failed";
+    }
+    megaCheckDebug("canary");
+    log("MEGAPASS canary passed: 6144-WG ascending-dispatch chain completed\n");
+  }
+}
+
+// Returns the epoch to stamp the next mega launch's flags with. Epoch 0 is reserved for
+// "never published"; on u32 wrap the flag buffer is re-zeroed (in-order in the queue,
+// hence before the next launch that would otherwise alias old epochs).
+u32 Gpu::nextMegaEpoch() {
+  if (megaEpoch == 0) {
+    bufMegaReady.zero();
+    megaEpoch = 1;
+  }
+  return megaEpoch++;
+}
+
+// Under MEGA_DEBUG: drain the queue and report any bounded-spin timeouts recorded by the
+// kernels. A timeout means a WG waited ~MEGA_SPIN_BOUND spins for a flag that never came:
+// with the startup edge-assert green, that indicates a dispatch-order violation.
+void Gpu::megaCheckDebug(const char *what) {
+  if (!megaDebug) { return; }
+  queue.finish();
+  vector<u32> dbg = bufMegaDebug.read(8 + 63 * 4);
+  if (dbg[0] == 0) { return; }
+  log("MEGAPASS %s: %u bounded-spin timeout(s); records (wg role flagIdx lastSeen):\n", what, dbg[0]);
+  for (u32 i = 0; i < std::min(dbg[0], 16u); ++i) {
+    log("  wg=%u role=%u flag=%u seen=%u\n", dbg[8 + i*4], dbg[8 + i*4 + 1], dbg[8 + i*4 + 2], dbg[8 + i*4 + 3]);
+  }
+  throw "MEGAPASS spin timeout (see log)";
 }
 
 // Optionallly split some of the MiddleIn/Tail/MiddleOut kernels off od executing on the main queue to run on an auxiliary queue.
@@ -1113,7 +1415,28 @@ void Gpu::replay(void) {
 
     // Iterate over the recorded kernels
     int arg = 0;
-    for (auto kern : recorded_kernels) {
+    for (size_t ik = 0; ik < recorded_kernels.size(); ++ik) {
+      auto kern = recorded_kernels[ik];
+
+      // Megapass: replace the fftMiddleIn -> tailSquare -> fftMiddleOut trio with ONE fused
+      // launch for the fields where it is enabled. Only the exact squaring triple is fused;
+      // every other sequence (tailMul paths, standalone fftMidIn, etc.) stays on the stock
+      // kernels, which coexist safely (they share no state with the mega scratch buffers).
+      if (kern == KMIDIN && ik + 2 < recorded_kernels.size() &&
+          recorded_kernels[ik + 1] == KTAILSQUARE && recorded_kernels[ik + 2] == KMIDOUT &&
+          ((cache_group == 2 && megapass31) || (cache_group == 3 && megapass61))) {
+        Buffer<double> *buf = recorded_kernel_args[arg];
+        assert(recorded_kernel_args[arg + 1] == buf && recorded_kernel_args[arg + 2] == buf);
+        // Same dataflow as the stock trio: reads buf3 (post-carryFused), writes buf (pre-carryFused);
+        // intermediates go to the dedicated scratch buffers (fixed args).
+        if (cache_group == 2) { kMegaSquareGF31(*buf, buf3, nextMegaEpoch()); }
+        if (cache_group == 3) { kMegaSquareGF61(*buf, buf3, nextMegaEpoch()); }
+        if (megaDebug && megaLaunchCount < 8) { megaCheckDebug("bring-up launch"); }
+        ++megaLaunchCount;
+        arg += 3;
+        ik += 2;
+        continue;
+      }
 
       // Call the appropriate kernel
       if (kern == KMIDIN) {

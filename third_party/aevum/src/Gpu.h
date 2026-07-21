@@ -140,6 +140,11 @@ private:
   Kernel kfftMidOutGF61;
   Kernel kfftWGF61;
 
+  /* Megapass fused kernels (fftMiddleIn+tailSquare+fftMiddleOut in one launch), behind -use MEGAPASS31/MEGAPASS61 */
+  Kernel kMegaSquareGF31;
+  Kernel kMegaSquareGF61;
+  Kernel kMegaCanary;
+
   /* Kernels dealing with the FP data and product of NTT primes */
   Kernel kfftP;
   Kernel kCarryA;
@@ -218,6 +223,15 @@ private:
   Buffer<double> buf2;
   Buffer<double> buf3;
 
+  // Megapass buffers (allocated with size 0 unless -use MEGAPASS31/MEGAPASS61 is active)
+  Buffer<u32> bufMegaMap;      // host-built schedule map + MidOut consume-flag tables (uploaded once)
+  Buffer<u32> bufMegaReady;    // epoch-stamped cross-WG flags: GF31 region [0,6144), GF61 region [6144,12288)
+  Buffer<u32> bufMegaDebug;    // MEGA_DEBUG bounded-spin timeout diagnostics
+  Buffer<double> bufMegaA31;   // dedicated GF31 scratch, MidIn->Tail, stock writeMiddleInLine layout
+  Buffer<double> bufMegaB31;   // dedicated GF31 scratch, Tail->MidOut, stock writeTailFusedLine layout
+  Buffer<double> bufMegaA61;   // dedicated GF61 scratch, MidIn->Tail
+  Buffer<double> bufMegaB61;   // dedicated GF61 scratch, Tail->MidOut
+
   unsigned statsBits;
   TimeInfo* timeBufVect;
   ZAvg zAvg;
@@ -230,6 +244,16 @@ private:
   void splitQueue(void);
   void mergeQueue(void);
   void replay(void);
+
+  // Megapass state and helpers
+  bool megapass31 = false;      // fuse the GF31 middles+tail trio into one launch
+  bool megapass61 = false;      // fuse the GF61 middles+tail trio into one launch
+  bool megaDebug = false;       // -use MEGA_DEBUG=1: bounded spins + canary + first-launch checks
+  u32 megaEpoch = 1;            // next epoch value to stamp flags with (0 is never used)
+  u32 megaLaunchCount = 0;      // number of mega launches so far (drives bring-up checks)
+  void megaInit();              // validate config, build+upload schedule map, zero flags, run canary
+  u32 nextMegaEpoch();          // returns the epoch for the next launch, handling u32 wrap
+  void megaCheckDebug(const char *what);  // under MEGA_DEBUG: finish queue, read+report timeouts
 
   void fftP(Buffer<double>& out, Buffer<double>& in) { fftP(out, reinterpret_cast<Buffer<Word>&>(in)); }
   void fftP(Buffer<double>& out, Buffer<Word>& in);
