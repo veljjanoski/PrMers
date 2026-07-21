@@ -43,6 +43,10 @@ public:
   void startLoad(KernelCompiler* compiler);
   void finishLoad();
 
+  // Diagnostic (megapass MEGA_PROF/MEGA_DEBUG): compile the kernel now if needed (never
+  // enqueues it) and log its register/occupancy work-group info as one "MEGAPROF:" line.
+  void logWorkGroupInfo();
+
   // Change which queue is used to run a kernel
   void setQueue(Queue *q) { queue = q; }
 

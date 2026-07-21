@@ -303,7 +303,10 @@ string clDefines(const Args& args, cl_device_id id, FFTConfig fft, const vector<
                               "MEGAPASS31",             // Fused middles+tail single-launch (GF31)
                               "MEGAPASS61",             // Fused middles+tail single-launch (GF61)
                               "MEGA_DEBUG",             // Megapass bring-up: bounded spins, canary, diagnostics
-                              "MEGA_SPIN_BOUND"         // Megapass debug spin bound override
+                              "MEGA_SPIN_BOUND",        // Megapass debug spin bound override
+                              "MEGA_NOSYNC",            // Megapass diagnostic: waits disabled, TIMING ONLY, RESULTS INVALID
+                              "MEGA_PROF",              // Megapass diagnostic: log kernel reg/occupancy introspection
+                              "MEGA_SPIN_NS"            // Megapass diagnostic: ns between flag polls (default 256, 0=empty spin)
                             });
     if (!isValid) {
       log("Warning: unrecognized -use key '%s'\n", k.c_str());
@@ -1167,6 +1170,10 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
   // buffer, sets kernel args, and (under MEGA_DEBUG) runs the ascending-dispatch canary.
   megaInit();
 
+  // Megapass diagnostics: under -use MEGA_PROF=1 (or MEGA_DEBUG=1) log reg/occupancy
+  // introspection for the mega kernels and the stock trio kernels. Compile-only, no enqueue.
+  megaProfIntrospect();
+
   if (args.verbose) {
     selftestTrig();
   }
@@ -1189,7 +1196,13 @@ void Gpu::megaInit() {
   megapass31 = fft.NTT_GF31 && args.value("MEGAPASS31", 0) > 0;
   megapass61 = fft.NTT_GF61 && args.value("MEGAPASS61", 0) > 0;
   megaDebug  = args.value("MEGA_DEBUG", 0) > 0;
+  megaNoSync = (megapass31 || megapass61) && args.value("MEGA_NOSYNC", 0) > 0;
   if (!megapass31 && !megapass61) { return; }
+
+  if (megaNoSync) {
+    log("MEGA_NOSYNC: TIMING MODE, RESULTS INVALID -- kernel cross-WG waits are disabled;\n");
+    log("MEGA_NOSYNC: GEC verdicts will be skipped and no savefiles written; use only to read the -time Profile.\n");
+  }
 
   // Reject configurations the fused kernel's index math cannot handle. The .cl compile
   // guards catch these too, but failing here gives a clearer message before any launch.
@@ -1279,6 +1292,30 @@ void Gpu::megaCheckDebug(const char *what) {
     log("  wg=%u role=%u flag=%u seen=%u\n", dbg[8 + i*4], dbg[8 + i*4 + 1], dbg[8 + i*4 + 2], dbg[8 + i*4 + 3]);
   }
   throw "MEGAPASS spin timeout (see log)";
+}
+
+// Diagnostic introspection (-use MEGA_PROF=1, or MEGA_DEBUG=1): one "MEGAPROF:" line per
+// kernel with CL_KERNEL_WORK_GROUP_SIZE (reg-limited max threads/WG -- the occupancy
+// signal), private/local mem sizes, and the preferred WG-size multiple, for the mega
+// kernels (when enabled) and the six stock trio kernels they replace. The stock trio
+// kernels are compiled explicitly for the query (a megapass run never launches
+// tailSquareGF31/61, so lazy loading would leave them unqueryable) but NEVER enqueued.
+// With no flag present this returns immediately: zero effect on normal runs.
+void Gpu::megaProfIntrospect() {
+  if (!(args.value("MEGA_PROF", 0) > 0 || megaDebug)) { return; }
+  log("MEGAPROF: kernel work-group introspection (maxWG = reg-limited max threads/WG)\n");
+  if (megapass31) { kMegaSquareGF31.logWorkGroupInfo(); }
+  if (megapass61) { kMegaSquareGF61.logWorkGroupInfo(); }
+  if (fft.NTT_GF31) {
+    kfftMidInGF31.logWorkGroupInfo();
+    ktailSquareGF31.logWorkGroupInfo();
+    kfftMidOutGF31.logWorkGroupInfo();
+  }
+  if (fft.NTT_GF61) {
+    kfftMidInGF61.logWorkGroupInfo();
+    ktailSquareGF61.logWorkGroupInfo();
+    kfftMidOutGF61.logWorkGroupInfo();
+  }
 }
 
 // Optionallly split some of the MiddleIn/Tail/MiddleOut kernels off od executing on the main queue to run on an auxiliary queue.
@@ -2677,7 +2714,7 @@ PRPResult Gpu::isPrimePRP(const Task& task) {
     queue.setSquareTime((int) (secsPerIt * 1'000'000));
 
     vector<Word> rawCheck = readChecked(bufCheck);
-    if (rawCheck.empty()) {
+    if (rawCheck.empty() && !megaNoSync) {  // MEGA_NOSYNC: data is intentionally garbage; never reload
       ++nErrors;
       log("%9" PRIu64 " %016" PRIx64 " read NULL check\n", k, res);
       if (++nSeqErrors > 2) { throw "sequential errors"; }
@@ -2685,10 +2722,12 @@ PRPResult Gpu::isPrimePRP(const Task& task) {
     }
 
     if (!doCheck) {
-      (*background)([=, this] {
-        getSaver()->saveUnverified({E, k, blockSize, res, compactBits(rawCheck, E), nErrors,
-                                    elapsedBefore + elapsedTimer.at()});
-      });
+      if (!megaNoSync) {  // MEGA_NOSYNC: don't persist invalid results
+        (*background)([=, this] {
+          getSaver()->saveUnverified({E, k, blockSize, res, compactBits(rawCheck, E), nErrors,
+                                      elapsedBefore + elapsedTimer.at()});
+        });
+      }
 
       log("   %9" PRIu64 " %016" PRIx64 " %s\n", k, res, formatSecsPerIter(secsPerIt).c_str());
       RoeInfo carryStats = readCarryStats();
@@ -2697,6 +2736,19 @@ PRPResult Gpu::isPrimePRP(const Task& task) {
         double z = carryStats.z();
         log("Carry: %x Z(%u)=%.1f\n", m, carryStats.N, z);
       }
+    } else if (megaNoSync) {
+      // MEGA_NOSYNC: TIMING MODE. Results are intentionally wrong (kernel waits disabled),
+      // so the GEC verdict is meaningless: print the profile INSTEAD of checking, then
+      // either keep timing or stop cleanly at the -iters bound. Never reload/rollback.
+      log("MEGA_NOSYNC: TIMING MODE, RESULTS INVALID -- %9" PRIu64 " %016" PRIx64 " %s (GEC verdict skipped)\n",
+          k, res, formatSecsPerIter(secsPerIt).c_str());
+      logTimeKernels();
+      if (doStop || k >= kEndEnd) {
+        queue.finish();
+        log("MEGA_NOSYNC: timing run complete; exiting cleanly (results invalid)\n");
+        throw "MEGA_NOSYNC timing run complete (results invalid by design)";
+      }
+      iterationTimer.reset(k);
     } else {
       bool ok = this->doCheck(blockSize);
       [[maybe_unused]] float secsCheck = iterationTimer.reset(k);

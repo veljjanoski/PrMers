@@ -92,24 +92,35 @@
 // MidOut flag tables start here inside bufMegaMap.
 #define MEGA_FLAGTAB    6144
 
+// Diagnostic knob (-use MEGA_SPIN_NS=<n>): nanoseconds between ready-flag polls on the
+// sm_70+ path. Default 256 (the measured-best production value; the default expansion is
+// byte-identical to the previous hardcoded "nanosleep.u32 256"). 0 = empty spin.
+#if !defined(MEGA_SPIN_NS)
+#define MEGA_SPIN_NS 256
+#endif
+
 #if !defined(MEGA_SPIN_BOUND)
-#if HAS_PTX >= 700
-#define MEGA_SPIN_BOUND 4000000u     // polls are ~256ns apart with nanosleep -> bound ~1s
+#if HAS_PTX >= 700 && MEGA_SPIN_NS > 0
+#define MEGA_SPIN_BOUND 4000000u     // polls are ~MEGA_SPIN_NS(=256 default) apart -> bound ~1s
 #else
 #define MEGA_SPIN_BOUND 100000000u
 #endif
 #endif
 
+#define MEGA_STR_(x) #x
+#define MEGA_STR(x) MEGA_STR_(x)
+
 // carryFused's spin() (carryfused.cl:9-18) is an empty loop on Nvidia. Here many threads
 // poll concurrently, so throttle the L2 atomic-poll rate with nanosleep where available
 // (sm_70+); ~256ns measured best on the 3090 (1024ns was slower, 0ns/empty was slower).
+// The nanosleep is only emitted when the sm_70+ path exists AND MEGA_SPIN_NS > 0.
 void megaSpin() {
 #if defined(__has_builtin) && __has_builtin(__builtin_amdgcn_s_sleep)
   __builtin_amdgcn_s_sleep(0);
 #elif HAS_ASM
   __asm("s_sleep 0");
-#elif HAS_PTX >= 700
-  __asm volatile("nanosleep.u32 256;");
+#elif HAS_PTX >= 700 && MEGA_SPIN_NS > 0
+  __asm volatile("nanosleep.u32 " MEGA_STR(MEGA_SPIN_NS) ";");
 #else
   // nothing: just spin
 #endif
@@ -133,8 +144,14 @@ void megaRecordTimeout(P(u32) dbg, u32 flatId, u32 role, u32 flagIdx, u32 seen) 
 // Spin until ready[flagIdx] == epoch (relaxed load, exactly like carryfused.cl:1915).
 // Under MEGA_DEBUG the spin is bounded; on expiry a diagnostic is recorded and *fail set.
 // Returns 0 on success, 1 on (debug) timeout.
+// MEGA_NOSYNC=1 (-use, diagnostic only): the wait becomes a no-op so the kernel's compute
+// cost can be timed without any spin/sync overhead. Publishes stay (cheap stores).
+// RESULTS ARE INVALID in this mode -- the host logs this loudly and skips GEC verdicts.
 u32 megaSpinWait(P(u32) ready, u32 flagIdx, u32 epoch, u32 role, P(u32) dbg, local u32 *fail) {
-#if MEGA_DEBUG
+#if MEGA_NOSYNC
+  (void) ready; (void) flagIdx; (void) epoch; (void) role; (void) dbg; (void) fail;
+  return 0;
+#elif MEGA_DEBUG
   u32 n = 0;
   u32 seen;
   while ((seen = atomic_load_explicit((atomic_uint *) &ready[flagIdx], memory_order_relaxed, memory_scope_device)) != epoch) {

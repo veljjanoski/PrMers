@@ -249,11 +249,13 @@ private:
   bool megapass31 = false;      // fuse the GF31 middles+tail trio into one launch
   bool megapass61 = false;      // fuse the GF61 middles+tail trio into one launch
   bool megaDebug = false;       // -use MEGA_DEBUG=1: bounded spins + canary + first-launch checks
+  bool megaNoSync = false;      // -use MEGA_NOSYNC=1 (diagnostic): kernel waits disabled, RESULTS INVALID, GEC verdict skipped
   u32 megaEpoch = 1;            // next epoch value to stamp flags with (0 is never used)
   u32 megaLaunchCount = 0;      // number of mega launches so far (drives bring-up checks)
   void megaInit();              // validate config, build+upload schedule map, zero flags, run canary
   u32 nextMegaEpoch();          // returns the epoch for the next launch, handling u32 wrap
   void megaCheckDebug(const char *what);  // under MEGA_DEBUG: finish queue, read+report timeouts
+  void megaProfIntrospect();    // under MEGA_PROF/MEGA_DEBUG: log reg/occupancy info for mega + stock trio kernels
 
   void fftP(Buffer<double>& out, Buffer<double>& in) { fftP(out, reinterpret_cast<Buffer<Word>&>(in)); }
   void fftP(Buffer<double>& out, Buffer<Word>& in);
