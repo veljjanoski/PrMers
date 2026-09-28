@@ -40,6 +40,20 @@ int main() {
     eng->square_mul(0, 3);
     expect(value(*eng, 0), 3675, "square_mul");
 
+    // square_loop must match the equivalent sequence of square_mul / sub(2) steps.
+    eng->set(7, 3);
+    eng->square_loop(7, 5);
+    std::uint64_t sq = 3;
+    for (int i = 0; i < 5; ++i) sq = static_cast<std::uint64_t>((static_cast<unsigned __int128>(sq) * sq) % modulus);
+    expect(value(*eng, 7), sq, "square_loop");
+    eng->set(7, 4);
+    eng->square_loop(7, 6, true);
+    std::uint64_t ll = 4;
+    for (int i = 0; i < 6; ++i) ll = static_cast<std::uint64_t>(((static_cast<unsigned __int128>(ll) * ll) + modulus - 2) % modulus);
+    expect(value(*eng, 7), ll, "square_loop sub2");
+    eng->square_loop(7, 0);
+    expect(value(*eng, 7), ll, "square_loop count 0");
+
     eng->add(0, 1);
     eng->sub_reg(0, 1);
     eng->sub(0, 2);

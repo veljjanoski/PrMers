@@ -52,6 +52,9 @@ AEVUM_ENGINE_API int aevum_engine_get_words(aevum_engine_handle handle, size_t s
 AEVUM_ENGINE_API int aevum_engine_copy(aevum_engine_handle handle, size_t dst, size_t src);
 AEVUM_ENGINE_API int aevum_engine_prepare(aevum_engine_handle handle, size_t dst, size_t src);
 AEVUM_ENGINE_API int aevum_engine_square_mul(aevum_engine_handle handle, size_t reg, uint32_t factor);
+/* count consecutive squarings of reg using the fused carry kernel between steps.
+   mode 0: reg := reg^2 (count times), mode 1: reg := reg^2 - 2 (Lucas-Lehmer steps). */
+AEVUM_ENGINE_API int aevum_engine_square_loop(aevum_engine_handle handle, size_t reg, uint64_t count, int mode);
 AEVUM_ENGINE_API int aevum_engine_mul(aevum_engine_handle handle, size_t dst, size_t src, uint32_t factor);
 AEVUM_ENGINE_API int aevum_engine_add(aevum_engine_handle handle, size_t dst, size_t src);
 AEVUM_ENGINE_API int aevum_engine_sub_reg(aevum_engine_handle handle, size_t dst, size_t src);

@@ -49,6 +49,16 @@ public:
 	virtual void copy(const Reg dst, const Reg src) const = 0;
 	// src = src^2 * a
 	virtual void square_mul(const Reg src, const uint32 a = 1) const = 0;
+	// src = src^2 repeated count times, or src = src^2 - 2 (Lucas-Lehmer steps) when sub2 is set.
+	// Backends may keep the data in the transform domain between the steps.
+	virtual void square_loop(const Reg src, const uint64 count, const bool sub2 = false) const
+	{
+		for (uint64 i = 0; i < count; ++i)
+		{
+			square_mul(src);
+			if (sub2) sub(src, 2);
+		}
+	}
 	// dst = multiplicand(src). A multiplicand is the src of the mul operation.
 	virtual void set_multiplicand(const Reg dst, const Reg src) const = 0;
 	virtual void set_multiplicand2(const Reg dst, const Reg src) const

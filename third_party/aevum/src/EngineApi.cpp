@@ -154,6 +154,15 @@ public:
     multiply_small(index, factor);
   }
 
+  // mode 0: count squarings, mode 1: count Lucas-Lehmer steps x := x^2 - 2.
+  void square_loop(size_t index, uint64_t count, int mode) {
+    check_reg(index);
+    if (mode != 0 && mode != 1) throw std::runtime_error("invalid Aevum square loop mode");
+    if (count == 0) return;
+    invalidate_if(index);
+    gpu_->regSquareLoop(reg(index), count, mode == 1);
+  }
+
   void mul(size_t dst, size_t src, uint32_t factor) {
     check_reg(dst);
     check_reg(src);
@@ -365,6 +374,7 @@ int aevum_engine_get_words(aevum_engine_handle handle, size_t src, uint32_t* wor
 int aevum_engine_copy(aevum_engine_handle handle, size_t dst, size_t src) { return invoke([&] { runtime(handle).copy(dst, src); }); }
 int aevum_engine_prepare(aevum_engine_handle handle, size_t dst, size_t src) { return invoke([&] { runtime(handle).prepare(dst, src); }); }
 int aevum_engine_square_mul(aevum_engine_handle handle, size_t reg, uint32_t factor) { return invoke([&] { runtime(handle).square_mul(reg, factor); }); }
+int aevum_engine_square_loop(aevum_engine_handle handle, size_t reg, uint64_t count, int mode) { return invoke([&] { runtime(handle).square_loop(reg, count, mode); }); }
 int aevum_engine_mul(aevum_engine_handle handle, size_t dst, size_t src, uint32_t factor) { return invoke([&] { runtime(handle).mul(dst, src, factor); }); }
 int aevum_engine_add(aevum_engine_handle handle, size_t dst, size_t src) { return invoke([&] { runtime(handle).add(dst, src); }); }
 int aevum_engine_sub_reg(aevum_engine_handle handle, size_t dst, size_t src) { return invoke([&] { runtime(handle).sub_reg(dst, src); }); }

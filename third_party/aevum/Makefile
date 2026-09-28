@@ -117,6 +117,13 @@ test-small-factor-gpu: engine-lib
 	$(CXX) -O2 -std=c++20 tests/engine_small_factor_gpu_test.cpp $(DL_LIBS) -o build-tests/aevum-engine-small-factor-gpu-test
 	build-tests/aevum-engine-small-factor-gpu-test build-engine/libaevum_engine.so $${AEVUM_TEST_DEVICE:-0} .
 
+# Checks aevum_engine_square_loop (fused carry) against GMP and reports its speed-up.
+.PHONY: test-square-loop-gpu
+test-square-loop-gpu: engine-lib
+	@mkdir -p build-tests
+	$(CXX) -O2 -std=c++20 tests/engine_square_loop_gpu_test.cpp $(DL_LIBS) -lgmp -o build-tests/aevum-engine-square-loop-gpu-test
+	build-tests/aevum-engine-square-loop-gpu-test build-engine/libaevum_engine.so $${AEVUM_TEST_DEVICE:-0} . $${AEVUM_TEST_EXPONENTS:-}
+
 clean:
 	rm -rf build-debug build-release build-cuda build-engine build-tests build-examples
 

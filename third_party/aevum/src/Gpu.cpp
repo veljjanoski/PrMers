@@ -1366,6 +1366,18 @@ void Gpu::regSquare(Buffer<Word>& io, u32 factor) {
   square(io, io, LEAD_NONE, LEAD_NONE, false, false);
 }
 
+// n consecutive squarings of io (x := x^2, or x := x^2 - 2 when doLL).  Between squarings the
+// data stays in the transform domain and the fused carryFused kernel replaces the
+// fftW + carryA + carryB + fftP sequence that a lone regSquare() needs, like squareLoop().
+void Gpu::regSquareLoop(Buffer<Word>& io, u64 n, bool doLL) {
+  enum LEAD_TYPE leadIn = LEAD_NONE;
+  for (u64 k = 0; k < n; ++k) {
+    const enum LEAD_TYPE leadOut = (useLongCarry || k + 1 == n) ? LEAD_NONE : LEAD_WIDTH;
+    square(io, io, leadIn, leadOut, false, doLL);
+    leadIn = leadOut;
+  }
+}
+
 void Gpu::regPrepare(Buffer<Word>& src) {
   fftP(buf1, src);
   fftMidIn(buf1);

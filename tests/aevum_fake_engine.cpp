@@ -75,6 +75,17 @@ int aevum_engine_square_mul(void* handle, std::size_t reg, std::uint32_t factor)
     const unsigned __int128 v = static_cast<unsigned __int128>(rt->regs[reg]) * rt->regs[reg] * factor;
     rt->regs[reg] = static_cast<std::uint64_t>(v % rt->modulus); return 1;
 }
+#ifndef AEVUM_FAKE_NO_SQUARE_LOOP   // older plugins do not export square_loop
+int aevum_engine_square_loop(void* handle, std::size_t reg, std::uint64_t count, int mode) {
+    auto* rt = checked(handle, reg); if (!rt || (mode != 0 && mode != 1)) return 0;
+    for (std::uint64_t i = 0; i < count; ++i) {
+        const unsigned __int128 v = static_cast<unsigned __int128>(rt->regs[reg]) * rt->regs[reg];
+        rt->regs[reg] = static_cast<std::uint64_t>(v % rt->modulus);
+        if (mode == 1) rt->regs[reg] = (rt->regs[reg] + rt->modulus - 2) % rt->modulus;
+    }
+    return 1;
+}
+#endif
 int aevum_engine_mul(void* handle, std::size_t dst, std::size_t src, std::uint32_t factor) {
     auto* rt = checked(handle, dst); if (!rt || !checked(handle, src)) return 0;
     const unsigned __int128 v = static_cast<unsigned __int128>(rt->regs[dst]) * rt->regs[src] * factor;

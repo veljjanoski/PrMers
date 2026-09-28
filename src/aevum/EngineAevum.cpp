@@ -100,6 +100,7 @@ struct Api {
     using copy_fn = int (*)(Handle, std::size_t, std::size_t);
     using prepare_fn = int (*)(Handle, std::size_t, std::size_t);
     using square_fn = int (*)(Handle, std::size_t, uint32_t);
+    using square_loop_fn = int (*)(Handle, std::size_t, uint64_t, int);
     using mul_fn = int (*)(Handle, std::size_t, std::size_t, uint32_t);
     using binary_fn = int (*)(Handle, std::size_t, std::size_t);
     using sub_u32_fn = int (*)(Handle, std::size_t, uint32_t);
@@ -121,6 +122,7 @@ struct Api {
     copy_fn copy = nullptr;
     prepare_fn prepare = nullptr;
     square_fn square_mul = nullptr;
+    square_loop_fn square_loop = nullptr;   // optional: absent in older plugins
     mul_fn mul = nullptr;
     binary_fn add = nullptr;
     binary_fn sub_reg = nullptr;
@@ -148,6 +150,18 @@ struct Api {
             throw std::runtime_error(std::string("Aevum plugin missing symbol ") + name +
                                      (error ? std::string(": ") + error : std::string()));
         }
+        return reinterpret_cast<T>(symbol);
+#endif
+    }
+
+    template <class T>
+    T load_optional_symbol(const char* name) {
+#if defined(_WIN32)
+        return reinterpret_cast<T>(GetProcAddress(library, name));
+#else
+        dlerror();
+        void* symbol = dlsym(library, name);
+        dlerror();
         return reinterpret_cast<T>(symbol);
 #endif
     }
@@ -236,6 +250,7 @@ struct Api {
         copy = load_symbol<copy_fn>("aevum_engine_copy");
         prepare = load_symbol<prepare_fn>("aevum_engine_prepare");
         square_mul = load_symbol<square_fn>("aevum_engine_square_mul");
+        square_loop = load_optional_symbol<square_loop_fn>("aevum_engine_square_loop");
         mul = load_symbol<mul_fn>("aevum_engine_mul");
         add = load_symbol<binary_fn>("aevum_engine_add");
         sub_reg = load_symbol<binary_fn>("aevum_engine_sub_reg");
@@ -304,6 +319,18 @@ public:
     void square_mul(const Reg src, const uint32 a = 1) const override {
         check_reg(src);
         require(api_.square_mul(handle_, src, a), "square_mul");
+    }
+
+    // Consecutive squarings run through the plugin's fused-carry loop, which avoids the
+    // per-squaring fftP/fftW/carryA/carryB round trip of square_mul.
+    void square_loop(const Reg src, const uint64 count, const bool sub2 = false) const override {
+        if (!api_.square_loop) {
+            engine::square_loop(src, count, sub2);
+            return;
+        }
+        check_reg(src);
+        if (count == 0) return;
+        require(api_.square_loop(handle_, src, count, sub2 ? 1 : 0), "square_loop");
     }
 
     void set_multiplicand(const Reg dst, const Reg src) const override {
