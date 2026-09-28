@@ -24,7 +24,9 @@ public:
                  const std::vector<std::string>& knownFactors = {});
     void checkpoint(cl_mem buf, uint32_t iter);    
     void checkpointMarin(engine::digit host, uint32_t iter);
-    std::filesystem::path proof() const;
+    // Computes the proof on eng when given (see ProofSetMarin::computeProof), else on the CPU.
+    std::filesystem::path proof(const engine* eng = nullptr) const;
+    uint32_t proofEngineRegisters() const { return proofSet_.engineRegisters(); }
     bool shouldCheckpoint(uint32_t iter) const;
 
 private:

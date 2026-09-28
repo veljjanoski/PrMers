@@ -110,6 +110,7 @@ int App::runPrpOrLlMarin()
 
     engine* eng = engine::create_gpu(p, static_cast<size_t>(8), static_cast<size_t>(options.device_id), verbose  /*,options.chunk256*/);
     const char* active_backend_name = eng->is_aevum_backend() ? "Aevum" : "Marin";
+    const size_t transform_size = eng->get_size();
 
     //auto to_hex16 = [](uint64_t u){ std::stringstream ss; ss << std::uppercase << std::hex << std::setfill('0') << std::setw(16) << u; return ss.str(); };
 
@@ -594,7 +595,23 @@ int App::runPrpOrLlMarin()
         try {
             std::cout << "\nGenerating PRP proof file..." << std::endl;
             if (guiServer_) guiServer_->appendLog("\nGenerating PRP proof file...");
-            const auto proofFilePath = proofManagerMarin.proof();
+            // The proof needs ~2^power exponentiations by 64-bit hashes of full-size residues:
+            // hours of GMP work on one CPU core at the wavefront, minutes on the GPU. The PRP
+            // registers are no longer needed, so release them for a proof engine.
+            delete eng;
+            eng = nullptr;
+            std::filesystem::path proofFilePath;
+            bool proof_done = false;
+            try {
+                std::unique_ptr<engine> proof_eng(engine::create_gpu(p, proofManagerMarin.proofEngineRegisters(),
+                                                                     static_cast<size_t>(options.device_id), verbose));
+                proofFilePath = proofManagerMarin.proof(proof_eng.get());
+                proof_done = true;
+            } catch (const std::exception& e) {
+                std::cerr << "Warning: GPU proof generation failed (" << e.what() << "), computing the proof on the CPU." << std::endl;
+                if (guiServer_) guiServer_->appendLog(std::string("Warning: GPU proof generation failed, using the CPU: ") + e.what());
+            }
+            if (!proof_done) proofFilePath = proofManagerMarin.proof();
             options.proofFile = proofFilePath.string();
             std::cout << "Proof file saved: " << proofFilePath << std::endl;
             if (guiServer_) guiServer_->appendLog("Proof file saved: " + proofFilePath.string());
@@ -660,7 +677,7 @@ int App::runPrpOrLlMarin()
         is_prp_prime = isPrime;
         json = io::JsonBuilder::generate(
             options,
-            static_cast<int>(eng->get_size()),
+            static_cast<int>(transform_size),
             isPrime,
             res64,
             res2048
@@ -676,7 +693,7 @@ int App::runPrpOrLlMarin()
     else{
         json = io::JsonBuilder::generate(
             options,
-            static_cast<int>(eng->get_size()),
+            static_cast<int>(transform_size),
             is_prp_prime,
             res64_hex,
             res2048_hex

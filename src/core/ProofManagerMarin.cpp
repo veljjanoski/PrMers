@@ -121,10 +121,10 @@ void ProofManagerMarin::checkpointMarin(engine::digit host, uint32_t iter)
 }
 
 
-std::filesystem::path ProofManagerMarin::proof() const {
+std::filesystem::path ProofManagerMarin::proof(const engine* eng) const {
     try {
         // Generate proof from collected checkpoints
-        ProofMarin proof = proofSet_.computeProof();
+        ProofMarin proof = eng ? proofSet_.computeProof(*eng) : proofSet_.computeProof();
         
         // Create proof file name: {exponent}-{power}.proof
         std::string filename = std::to_string(exponent_) + "-" + 

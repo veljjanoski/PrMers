@@ -5,6 +5,8 @@
 #include <vector>
 #include <filesystem>
 
+class engine;
+
 namespace core {
 
 class WordsMarin {
@@ -41,6 +43,13 @@ public:
     
     // Core proof generation algorithm
     ProofMarin computeProof() const;
+
+    // Registers needed by computeProof(const engine&): accumulator, two multiplicands and
+    // the stack of partial products (at most `power` deep).
+    uint32_t engineRegisters() const { return power + 3; }
+    // Same proof as computeProof(), with the modular exponentiations done by a GPU engine
+    // for 2^E - 1 that has at least engineRegisters() registers.
+    ProofMarin computeProof(const engine& eng) const;
 
 private:
     std::vector<uint32_t> points; // checkpoint iteration points

@@ -24,7 +24,9 @@
 #include "util/Crc32.hpp"
 #include "util/Timer.hpp"
 #include "util/GmpUtils.hpp"
+#include "marin/engine.h"
 #include <algorithm>
+#include <bit>
 #include <cassert>
 #include <cmath>
 #include <fstream>
@@ -307,6 +309,106 @@ ProofMarin ProofSetMarin::computeProof() const {
   double elapsed = timer.elapsed();
   std::cout << "Proof generated in " << std::fixed << std::setprecision(2) << elapsed << " seconds." << std::endl;
   
+  return ProofMarin{E, std::move(B), std::move(middles), knownFactors};
+}
+
+ProofMarin ProofSetMarin::computeProof(const engine& eng) const {
+  util::Timer timer;
+
+  // The partial products stay in engine registers: stack[k] is register STACK + k.
+  const engine::Reg ACC = 0, BASE = 1, MULT = 2, STACK = 3;
+
+  std::vector<std::vector<uint32_t>> middles;
+  std::vector<uint64_t> hashes;
+
+  auto B = load(E);
+  auto hash = ProofMarin::hashWords(E, B);
+
+  mpz_t z, Mp;
+  mpz_inits(z, Mp, nullptr);
+  mpz_setbit(Mp, E);
+  mpz_sub_ui(Mp, Mp, 1);
+
+  // A := A^h * B, as the CPU expMul (mersennePowMod then multiply).
+  auto expMul = [&](const engine::Reg a, const uint64_t h, const engine::Reg b) {
+    if (h == 0) { eng.copy(a, b); return; }
+    eng.set_multiplicand(BASE, a);
+    eng.copy(ACC, a);
+    // Left-to-right binary exponentiation; runs of squarings go through square_loop.
+    int bit = static_cast<int>(std::bit_width(h)) - 1;
+    while (bit > 0) {
+      int next = bit - 1;
+      while (next >= 0 && ((h >> next) & 1) == 0) --next;
+      if (next < 0) { eng.square_loop(ACC, static_cast<uint64_t>(bit)); break; }
+      eng.square_loop(ACC, static_cast<uint64_t>(bit - next));
+      eng.mul(ACC, BASE);
+      bit = next;
+    }
+    eng.set_multiplicand(MULT, b);
+    eng.mul(ACC, MULT);
+    eng.copy(a, ACC);
+  };
+
+  for (uint32_t p = 0; p < power; ++p) {
+    assert(p == hashes.size());
+
+    uint32_t s = (1u << (power - p - 1)); // Step size for this level
+    uint32_t levelBuffers = (1u << p);    // Number of buffers needed for this level
+    uint32_t bufIndex = 0;
+
+    for (uint32_t i = 0; i < levelBuffers; ++i) {
+      // PRPLL's formula: load checkpoint at points[s * (i * 2 + 1) - 1]
+      uint32_t checkpointIndex = s * (i * 2 + 1) - 1;
+      if (checkpointIndex >= points.size()) continue;
+
+      uint32_t iteration = points[checkpointIndex];
+      if (iteration > E || !shouldCheckpoint(iteration)) continue;
+
+      auto w = load(iteration);
+      mpz_import(z, w.size(), -1, sizeof(uint32_t), 0, 0, w.data());
+      eng.set_mpz(STACK + bufIndex, z);
+      bufIndex++;
+
+      // Apply hashes from previous levels
+      for (uint32_t k = 0; i & (1u << k); ++k) {
+        assert(k <= p - 1);
+        if (bufIndex < 2) {
+          std::cerr << "Error: need at least 2 buffers for expMul, have " << bufIndex << std::endl;
+          continue;
+        }
+        bufIndex--;
+        expMul(STACK + bufIndex - 1, hashes[p - 1 - k], STACK + bufIndex);
+      }
+    }
+
+    if (bufIndex != 1) {
+      std::cerr << "Warning: expected bufIndex=1, got " << bufIndex << std::endl;
+    }
+
+    eng.get_mpz(z, STACK);
+    mpz_mod(z, z, Mp);
+    auto levelResult = util::convertFromGMP(mpz_class(z));
+
+    if (levelResult.empty()) {
+      mpz_clears(z, Mp, nullptr);
+      throw std::runtime_error("Read ZERO during proof generation at level " + std::to_string(p));
+    }
+
+    middles.push_back(levelResult);
+
+    hash = ProofMarin::hashWords(E, hash, levelResult);
+    uint64_t newHash = hash[0];
+    hashes.push_back(newHash);
+
+    uint64_t middleRes64 = ProofMarin::res64(levelResult);
+    std::cout << "proof [" << p << "] : M " << std::hex << std::setfill('0') << std::setw(16) << middleRes64
+              << ", h " << std::setw(16) << newHash << std::dec << std::endl;
+  }
+  mpz_clears(z, Mp, nullptr);
+
+  double elapsed = timer.elapsed();
+  std::cout << "Proof generated on the GPU in " << std::fixed << std::setprecision(2) << elapsed << " seconds." << std::endl;
+
   return ProofMarin{E, std::move(B), std::move(middles), knownFactors};
 }
 
