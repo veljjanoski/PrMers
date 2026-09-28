@@ -12,6 +12,8 @@
 #include <memory>
 #include <vector>
 #include <array>
+#include <random>
+#include <system_error>
 
 using namespace std;
 
@@ -260,7 +262,18 @@ string getBuildLog(cl_program program, cl_device_id deviceId) {
 Program loadBinary(cl_context context, cl_device_id id, string_view fileName) {
   File f = File::openRead(fileName);
   if (!f) { return {}; }
-  string bytes = f.readAll();
+  string bytes;
+  // A run interrupted while writing the cache can leave an empty or truncated entry.  Treat an
+  // unreadable entry as a cache miss so the kernel is recompiled instead of failing forever.
+  try {
+    bytes = f.readAll();
+  } catch (const ReadError&) {
+    bytes.clear();
+  }
+  if (bytes.empty()) {
+    log("Ignoring unreadable kernel cache entry %s\n", string(fileName).c_str());
+    return {};
+  }
   size_t size = bytes.size();
   const unsigned char *ptr = reinterpret_cast<const unsigned char *>(bytes.c_str());
   int err = 0;
@@ -286,7 +299,15 @@ string getBinary(cl_program program) {
 }
 
 void saveBinary(cl_program program, string_view fileName) {
-  File::openWrite(fileName).write(getBinary(program));
+  // Write to a unique temporary file, then rename it into place: the cache entry is either
+  // complete or absent, even if the process is killed while the binary is being produced.
+  const string binary = getBinary(program);
+  const fs::path target{string(fileName)};
+  const fs::path tmp{string(fileName) + ".tmp" + to_string(random_device{}())};
+  File::openWrite(tmp).write(binary);
+  std::error_code ec;
+  fs::rename(tmp, target, ec);
+  if (ec) { fs::remove(tmp, ec); }
 }
 
 cl_kernel loadKernel(cl_program program, const char *name) {
