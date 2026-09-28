@@ -16,6 +16,7 @@ Licensed under GNU GPL version 3. See LICENSE and UPSTREAM.md.
 #include "TrigBufCache.h"
 #include "common.h"
 #include "gpuid.h"
+#include "log.h"
 #include "version.h"
 
 #include <algorithm>
@@ -24,6 +25,7 @@ Licensed under GNU GPL version 3. See LICENSE and UPSTREAM.md.
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -160,7 +162,7 @@ public:
     if (mode != 0 && mode != 1) throw std::runtime_error("invalid Aevum square loop mode");
     if (count == 0) return;
     invalidate_if(index);
-    gpu_->regSquareLoop(reg(index), count, mode == 1);
+    gpu_->regSquareLoop(reg(index), count, mode == 1, count > 1 && fused_loop_verified());
   }
 
   void mul(size_t dst, size_t src, uint32_t factor) {
@@ -202,6 +204,46 @@ public:
 
 private:
   static constexpr size_t no_prepared = std::numeric_limits<size_t>::max();
+
+  enum class FusedState { unknown, enabled, disabled };
+
+  // carryFused depends on cross-workgroup synchronization that not every OpenCL
+  // implementation provides. Before the first fused loop, compare fused and unfused
+  // squarings of a random full-size residue (PRP and LL steps); on any mismatch keep
+  // using unfused squarings, which are always correct.
+  bool fused_loop_verified() {
+    if (fused_state_ == FusedState::unknown) {
+      fused_state_ = FusedState::disabled;
+      if (std::getenv("AEVUM_DISABLE_FUSED_LOOP")) {
+        log("Fused square loop disabled by AEVUM_DISABLE_FUSED_LOOP\n");
+      } else if (fused_self_test()) {
+        fused_state_ = FusedState::enabled;
+        log("Fused square loop enabled (self-test passed)\n");
+      } else {
+        log("Warning: fused square loop self-test failed on this device, using unfused squarings\n");
+      }
+    }
+    return fused_state_ == FusedState::enabled;
+  }
+
+  bool fused_self_test() {
+    auto bufs = gpu_->makeBufVector(2);
+    std::mt19937_64 rng(0x5eedULL + exponent_);
+    Words x(word_count_);
+    for (auto& w : x) w = static_cast<uint32_t>(rng());
+    if (exponent_ % 32) x.back() &= (uint32_t(1) << (exponent_ % 32)) - 1;
+    constexpr u64 steps = 6;
+    for (const bool ll : {false, true}) {
+      gpu_->regWrite(bufs[0], x);
+      gpu_->regWrite(bufs[1], x);
+      gpu_->regSquareLoop(bufs[0], steps, ll, true);
+      gpu_->regSquareLoop(bufs[1], steps, ll, false);
+      const Words fused = gpu_->regRead(bufs[0]);
+      const Words plain = gpu_->regRead(bufs[1]);
+      if (plain.empty() || fused != plain) return false;
+    }
+    return true;
+  }
 
   struct PreparedSlot {
     size_t reg = no_prepared;
@@ -273,6 +315,7 @@ private:
   std::vector<PreparedSlot> prepared_slots_;
   std::vector<Buffer<Word>> small_factor_scratch_;
   uint64_t prepared_clock_ = 0;
+  FusedState fused_state_ = FusedState::unknown;
 };
 
 template <class F>

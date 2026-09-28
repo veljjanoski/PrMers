@@ -348,7 +348,7 @@ public:
   void regWrite(Buffer<Word>& dst, const Words& words);
   Words regRead(Buffer<Word>& src);
   void regSquare(Buffer<Word>& io, u32 factor = 1);
-  void regSquareLoop(Buffer<Word>& io, u64 n, bool doLL);
+  void regSquareLoop(Buffer<Word>& io, u64 n, bool doLL, bool fused = true);
   void regPrepare(Buffer<Word>& src);
   void regPrepare(Buffer<double>& prepared, Buffer<Word>& src);
   void regMulPrepared(Buffer<Word>& dst, u32 factor = 1);
