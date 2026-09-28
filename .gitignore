@@ -16,6 +16,7 @@ logs/
 *.save
 *.p95
 *.o
+*.d
 *.swp
 /prmers
 *.bufd
@@ -35,6 +36,7 @@ lastcurve.gp
 /prmers.exe
 /*.zip
 /package
+/tests/build-*/
 /.vscode
 prmers.log
 proof/
