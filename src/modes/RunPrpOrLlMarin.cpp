@@ -248,11 +248,8 @@ int App::runPrpOrLlMarin()
         totalIters /= 2;
     }
 
-    uint64_t itersave =  backupManager.loadGerbiczIterSave();
-    uint64_t jsave = backupManager.loadGerbiczJSave();
-    if(jsave==0){
-        jsave = totalIters - 1;
-    }
+    // R4/R5 hold the last verified state: the state before iteration goodIter.
+    uint64_t goodIter = ri;
 
     uint64_t L = options.exponent;
     uint64_t B = (uint64_t)(std::sqrt((double)L));
@@ -268,11 +265,7 @@ int App::runPrpOrLlMarin()
         checkpasslevel=1;
     uint64_t resumeIter = ri;
     uint64_t startIter  = ri;
-    uint64_t lastIter   = ri ? ri - 1 : 0;
-    uint64_t lastJ      = p - 1 - ri;
     std::string res64_x;
-    (void) lastIter;
-    (void) lastJ;
     spinner.displayProgress(resumeIter, totalIters, 0.0, 0.0, options.wagstaff ? p / 2 : p, resumeIter, startIter, res64_x, guiServer_ ? guiServer_.get() : nullptr);
     bool errordone = false;
     if(options.wagstaff){
@@ -290,9 +283,19 @@ int App::runPrpOrLlMarin()
         std::cout << "M_"<< options.exponent <<" IS DIVISIBLE BY 9" << std::endl;
     }
 
-    for (uint64_t iter = resumeIter, j= totalIters-resumeIter-1; iter < totalIters; ++iter, --j) {
-        lastJ = j;
-        lastIter = iter;
+    const bool ll_mode = (options.mode == "ll");
+    const bool gl_blocks = (options.mode == "prp" && options.gerbiczli);
+    const bool proof_points = (options.mode == "prp" && options.proof);
+    // Squarings are issued in chunks that end at the next iteration needing host work
+    // (Gerbicz-Li block boundary, proof checkpoint, error injection, last iteration), so an
+    // engine with a batched squaring loop (Aevum: fused carry) keeps the data in the transform
+    // domain between squarings. chunk_max adapts to keep each chunk around a quarter second,
+    // which bounds the latency of the interrupt, backup and progress checks.
+    uint64_t chunk_max = 64;
+    constexpr uint64_t chunk_max_limit = 4096;
+
+    for (uint64_t iter = resumeIter; iter < totalIters; ) {
+        uint64_t j = totalIters - iter - 1;
         if (interrupted)
         {
             const double elapsed_time = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start_clock).count() + restored_time;
@@ -318,10 +321,31 @@ int App::runPrpOrLlMarin()
             std::cout << "\nBackup point done at iter + 1=" << iter + 1 << " done...." << std::endl;
             spinner.displayBackupInfo(iter + 1, totalIters, timer.elapsed(), res64_x);
         }
-        eng->square_mul(R0);
-        if (options.mode == "ll") {
-            eng->sub(R0, 2);
+
+        // The chunk runs iterations iter .. iter + n - 1; only its last iteration can need host work.
+        uint64_t n = std::min<uint64_t>(chunk_max, totalIters - iter);
+        if (gl_blocks) {
+            const uint64_t j_block = (j / B) * B;   // next j with j % B == 0; j == 0 is the last iteration
+            n = std::min<uint64_t>(n, j - j_block + 1);
         }
+        if (!errordone && options.erroriter > iter) {
+            n = std::min<uint64_t>(n, options.erroriter - iter);
+        }
+        if (proof_points) {
+            for (uint64_t k = 1; k < n; ++k) {
+                if (iter + k < totalIters && proofManagerMarin.shouldCheckpoint(static_cast<uint32_t>(iter + k))) { n = k; break; }
+            }
+        }
+
+        const auto chunk_start = std::chrono::high_resolution_clock::now();
+        eng->square_loop(R0, n, ll_mode);
+        if (n == chunk_max) {
+            const double chunk_seconds = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - chunk_start).count();
+            if (chunk_seconds < 0.25 && chunk_max < chunk_max_limit) chunk_max *= 2;
+            else if (chunk_seconds > 1.0 && chunk_max > 16) chunk_max /= 2;
+        }
+        iter += n - 1;
+        j = totalIters - iter - 1;
 
         if (options.erroriter > 0 && (iter + 1) == options.erroriter && !errordone) {
             errordone = true;
@@ -335,30 +359,26 @@ int App::runPrpOrLlMarin()
             }
         }
 
-        if (options.mode == "prp" && options.gerbiczli && ((j != 0 && (j % B == 0)) || iter == totalIters - 1)) {
+        if (gl_blocks && ((j != 0 && (j % B == 0)) || iter == totalIters - 1)) {
             checkpass += 1;
             eng->copy(R3, R1);
             eng->set_multiplicand(R2, R0);
             eng->mul(R1, R2);
             bool condcheck = !(checkpass != checkpasslevel && (iter != totalIters - 1));
-            
+
             if (condcheck) {
                     checkpass = 0;
                     uint64_t modB = (options.exponent % B == 0 ? B : options.exponent % B);
                     uint64_t loop_count = (B > modB ? B - modB - 1 : 0);
 
-                    for (uint64_t z = 0; z < loop_count; ++z) {
-                        eng->square_mul(R3);
-                    }
+                    eng->square_loop(R3, loop_count);
                     if(options.exponent % B == 0 ){
                         eng->mul(R3, RTMP);
                     }
                     else{
                         eng->square_mul(R3, 3);
                     }
-                    for (uint64_t z = 0; z < ((options.exponent % B == 0 ? B : options.exponent % B)); ++z) {
-                        eng->square_mul(R3);
-                    }
+                    eng->square_loop(R3, modB);
                     mpz_t z0, z1; mpz_inits(z0, z1, nullptr);
                     eng->get_mpz(z0, R3); eng->get_mpz(z1, R1);
                     mpz_class Mp = (mpz_class(1) << options.exponent) - 1;
@@ -372,26 +392,22 @@ int App::runPrpOrLlMarin()
                         //throw std::runtime_error("Gerbicz-Li error checking failed!"); 
                         std::cout << "[Gerbicz Li] Mismatch \n"
                             << "[Gerbicz Li] Check FAILED! iter=" << (iter + 1) << "\n"
-                            << "[Gerbicz Li] Restore iter=" << itersave << " (j=" << jsave << ")\n";
+                            << "[Gerbicz Li] Restore iter=" << goodIter << " (j=" << (totalIters - goodIter) << ")\n";
                         if (guiServer_) {
                             std::ostringstream oss;
                             oss << "[Gerbicz Li] Mismatch \n"
                             << "[Gerbicz Li] Check FAILED! iter=" << (iter + 1) << "\n"
-                            << "[Gerbicz Li] Restore iter=" << itersave << " (j=" << jsave << ")\n";
+                            << "[Gerbicz Li] Restore iter=" << goodIter << " (j=" << (totalIters - goodIter) << ")\n";
                             guiServer_->appendLog(oss.str());
                         }
-                        j = jsave;
-                        iter = itersave;
-                        lastIter = itersave;
-                        lastIter = iter;
-                        if (iter == 0) {
-                            iter = iter - 1;
-                            j = j + 1;
-                        }
+                        // Resume from the last verified state (the checkpoint state if no check
+                        // has passed since the start or resume of this run).
                         checkpass = 0;
                         options.gerbicz_error_count += 1;
                         eng->copy(R0, R4);
                         eng->copy(R1, R5);
+                        iter = goodIter;
+                        continue;
                     }
                     else{
                         std::cout << "[Gerbicz Li] Check passed! iter=" << (iter + 1) << "\n";
@@ -402,9 +418,7 @@ int App::runPrpOrLlMarin()
                         }
                         eng->copy(R4, R0);//Last correct state
                         eng->copy(R5, R1);//Last correct bufd
-                        itersave = iter;
-                        jsave = j;
-                        //cl_event postEvt;
+                        goodIter = iter + 1;
                     }
             }
             
@@ -431,11 +445,12 @@ int App::runPrpOrLlMarin()
             resumeIter = iter + 1;
         }
 
-        if (options.mode == "prp"  && options.proof && (iter + 1) < totalIters && proofManagerMarin.shouldCheckpoint(iter+1)) {
+        if (proof_points && (iter + 1) < totalIters && proofManagerMarin.shouldCheckpoint(static_cast<uint32_t>(iter + 1))) {
             engine::digit d(eng, R0);
-            proofManagerMarin.checkpointMarin(d, iter + 1);
+            proofManagerMarin.checkpointMarin(d, static_cast<uint32_t>(iter + 1));
         }
 
+        ++iter;
     }
 
     if (options.mode == "prp" && options.proof) {
