@@ -300,6 +300,8 @@ Run the built-in help for the exact option list supported by your binary:
 | `-aevum` | Force the Aevum `engine::Reg` backend |
 | `-engine-marin` | Force the Marin `engine::Reg` backend |
 | `-aevum-auto` | Explicitly request automatic Marin/Aevum selection |
+| `-aevum-fft <spec>` | Force Aevum with this FFT3161 shape, e.g. `1:512:8:512:202` |
+| `-aevum-use <list>` | Aevum kernel settings `KEY=VALUE,...`, e.g. from `tests/run_aevum_tune.sh` (also `AEVUM_USE`) |
 | `-marin` | Legacy option: use the internal PrMers NTT path |
 
 Automatic Marin/Aevum selection is the default when no backend option is supplied.
@@ -316,6 +318,7 @@ Automatic selection compares the native transform sizes for every engine creatio
 | `-factors <f1,f2,...>` | Test the remaining cofactor after known Mersenne factors |
 | `-gerbiczli` | Disable Gerbicz-Li checks, mainly for benchmarking |
 | `-checklevel <k>` | Tune Gerbicz-Li check frequency |
+| `-glblock <B>` | Gerbicz-Li block size for a new PRP test (default 1000, at most `sqrt(p)`; a resumed test keeps its own) |
 | `-erroriter <i>` | Inject an error at iteration `i` to test recovery |
 
 ### Lucas-Lehmer options
@@ -1026,6 +1029,15 @@ Run the GPU backend matrix with:
 ```bash
 AEVUM_TEST_DEVICE=0 make test-aevum-auto-gpu
 ```
+
+Tune Aevum for a GPU (the FFT shape and Aevum's kernel settings, every configuration checked against GMP), confirm the gain with PRP runs and check the result with Gerbicz-Li checks and a full PRP of `M3021377`:
+
+```bash
+tests/run_aevum_tune.sh 0
+./prmers 136279841 -config tests/aevum-tune/aevum-tuned.cfg
+```
+
+The tuned FFT shape applies to exponents of the same transform size (set `PRMERS_TUNE_EXPONENT` to tune another size). `tests/run_gpu_speedup_check.sh 0` checks the fused squaring loop, GPU proof generation and the Marin radix-5 kernels on a GPU and measures PRP throughput.
 
 Aevum is a customized GPLv3 derivative of GPUOwl/PRPLL, adapted by cherubrock-seb into a reusable register engine. Its external interface is modeled after the kind of opaque register operations used by Marin, while the Aevum arithmetic implementation remains derived from GPUOwl/PRPLL. Aevum is not an official upstream release.
 
