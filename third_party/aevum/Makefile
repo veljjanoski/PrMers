@@ -52,8 +52,11 @@ endif
 COMMON_FLAGS = -Wall $(CUDAFLAGS) -std=c++20
 ifneq ($(HOST_OS),Darwin)
  COMMON_FLAGS += -static-libstdc++ -static-libgcc
+ # A fully static link needs libOpenCL.a; MSYS2 ships only the import library libOpenCL.dll.a.
  ifeq ($(findstring MINGW,$(HOST_OS)),MINGW)
-  COMMON_FLAGS += -static
+  ifneq ($(wildcard $(shell $(CXX) -print-file-name=libOpenCL.a)),)
+   COMMON_FLAGS += -static
+  endif
  endif
 endif
 # -fext-numeric-literals
