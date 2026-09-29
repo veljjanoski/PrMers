@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # GPU check of Aevum's chained squarings (register lead cache) against GMP, GPU proof generation
-# and Marin 5*2^k transforms, plus PRP speed at the wavefront: the default Aevum engine, without
-# the lead cache (AEVUM_REG_LEAD_CACHE=0), on a single queue (AEVUM_TYPE4_MULTI_Q=0) and Marin.
+# and Marin 5*2^k transforms, plus PRP speed at the wavefront: the default Aevum engine, a pinned
+# plan with and without the lead cache (AEVUM_REG_LEAD_CACHE=0) and on a single queue
+# (AEVUM_TYPE4_MULTI_Q=0), and Marin.
 #
 # usage: tests/run_gpu_speedup_check.sh [device] [output-dir]
 #   PRMERS_CHECK_EXPONENT=<p>   exponent for the speed runs (default 136279841)
+#   PRMERS_CHECK_FFT=<spec>     pinned Aevum plan for the lead cache and queue comparisons
+#                               (default 1:512:8:512:202)
 #   PRMERS_CHECK_SECONDS=<s>    seconds per speed run (default 90)
 #   PRMERS_CHECK_QUICK=1        skip the full PRP of M6972593 and LL of M3021377
 #
@@ -45,17 +48,21 @@ else
 fi
 grep -E "ms/iter|MISMATCH" "$OUT/square_chain.log" | tee -a "$SUMMARY"
 
-# 2. PRP throughput at the wavefront: the default engine, without the register lead cache, on a
-#    single queue, and Marin for reference.
+# 2. PRP throughput at the wavefront: the default engine (automatic plan and kernel settings), then
+#    one pinned plan with the register lead cache and multi-queue on, without the lead cache and on
+#    a single queue (each of these settings bypasses Aevum's runtime autotuner, so the three pinned
+#    runs share a plan and differ only in the one setting), and Marin for reference.
+PINNED_FFT="${PRMERS_CHECK_FFT:-1:512:8:512:202}"
 ips_default="$(speed_run aevum_default -- -aevum)"
-ips_nolead="$(speed_run aevum_no_lead_cache AEVUM_REG_LEAD_CACHE=0 -- -aevum)"
-ips_singleq="$(speed_run aevum_single_queue AEVUM_TYPE4_MULTI_Q=0 -- -aevum)"
+ips_pinned="$(speed_run aevum_pinned PRMERS_AEVUM_PRP_FFT="$PINNED_FFT" -- -aevum)"
+ips_nolead="$(speed_run aevum_no_lead_cache PRMERS_AEVUM_PRP_FFT="$PINNED_FFT" AEVUM_REG_LEAD_CACHE=0 -- -aevum)"
+ips_singleq="$(speed_run aevum_single_queue PRMERS_AEVUM_PRP_FFT="$PINNED_FFT" AEVUM_TYPE4_MULTI_Q=0 -- -aevum)"
 ips_marin="$(speed_run marin -- -engine-marin)"
 grep -h -m1 "Running on device" "$OUT/speed_marin.log" | tee -a "$SUMMARY"
 grep -h -m1 "adapter active" "$OUT/speed_aevum_default.log" | tee -a "$SUMMARY"
-note "M$P_SPEED PRP iterations/s: Aevum default $ips_default, without lead cache $ips_nolead, single queue $ips_singleq, Marin $ips_marin"
-note "Lead cache speed-up: $(awk -v a="$ips_default" -v b="$ips_nolead" 'BEGIN {if (b > 0) printf "x%.3f", a / b; else print "n/a"}'), multi-queue speed-up: $(awk -v a="$ips_default" -v b="$ips_singleq" 'BEGIN {if (b > 0) printf "x%.3f", a / b; else print "n/a"}')"
-for label in aevum_default aevum_no_lead_cache aevum_single_queue; do
+note "M$P_SPEED PRP iterations/s: Aevum default $ips_default; pinned $PINNED_FFT $ips_pinned, without lead cache $ips_nolead, single queue $ips_singleq; Marin $ips_marin"
+note "Lead cache speed-up: $(awk -v a="$ips_pinned" -v b="$ips_nolead" 'BEGIN {if (b > 0) printf "x%.3f", a / b; else print "n/a"}'), multi-queue speed-up: $(awk -v a="$ips_pinned" -v b="$ips_singleq" 'BEGIN {if (b > 0) printf "x%.3f", a / b; else print "n/a"}')"
+for label in aevum_default aevum_pinned aevum_no_lead_cache aevum_single_queue; do
     fail_if "no Gerbicz-Li error ($label)" "$OUT/speed_$label.log" "Check FAILED"
 done
 
