@@ -5,7 +5,11 @@
 
 #include "../src/EngineApi.h"
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <dlfcn.h>
+#endif
 #include <gmp.h>
 
 #include <chrono>
@@ -18,9 +22,21 @@
 
 namespace {
 
+#if defined(_WIN32)
+void* open_library(const char* path) { return reinterpret_cast<void*>(LoadLibraryA(path)); }
+void* find_symbol(void* lib, const char* name) { return reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(lib), name)); }
+void close_library(void* lib) { FreeLibrary(static_cast<HMODULE>(lib)); }
+const char* library_error() { return "LoadLibrary failed"; }
+#else
+void* open_library(const char* path) { return dlopen(path, RTLD_NOW | RTLD_LOCAL); }
+void* find_symbol(void* lib, const char* name) { return dlsym(lib, name); }
+void close_library(void* lib) { dlclose(lib); }
+const char* library_error() { return dlerror(); }
+#endif
+
 template <class T>
 T load_symbol(void* lib, const char* name) {
-    void* symbol = dlsym(lib, name);
+    void* symbol = find_symbol(lib, name);
     if (!symbol) throw std::runtime_error(std::string("missing symbol: ") + name);
     return reinterpret_cast<T>(symbol);
 }
@@ -67,9 +83,9 @@ int main(int argc, char** argv) {
     // Long carry (1362763 at 256K words), then fused carry at several transform sizes.
     if (exponents.empty()) exponents = {{1362763, 100}, {2976221, 200}, {6972593, 200}, {13466917, 100}, {30402457, 50}};
 
-    void* lib = dlopen(library, RTLD_NOW | RTLD_LOCAL);
+    void* lib = open_library(library);
     if (!lib) {
-        std::fprintf(stderr, "%s\n", dlerror());
+        std::fprintf(stderr, "%s: %s\n", library, library_error());
         return 2;
     }
     Api api{};
@@ -171,7 +187,7 @@ int main(int argc, char** argv) {
     }
 
     mpz_clears(mp, expected, actual, exponent, three, nullptr);
-    dlclose(lib);
+    close_library(lib);
     std::printf("%s\n", failures ? "square_loop GPU test FAILED" : "square_loop GPU test passed");
     return failures ? 1 : 0;
 }
