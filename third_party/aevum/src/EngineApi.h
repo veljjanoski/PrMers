@@ -25,6 +25,18 @@ extern "C" {
 
 typedef void* aevum_engine_handle;
 
+// Keep numeric values aligned with PrMers engine::gpu_workload.  The old
+// create symbol remains ABI-compatible; create_ex is optional for older hosts.
+enum aevum_engine_workload {
+  AEVUM_WORKLOAD_GENERIC = 0,
+  AEVUM_WORKLOAD_PRP = 1,
+  AEVUM_WORKLOAD_LL = 2,
+  AEVUM_WORKLOAD_PM1 = 3,
+  AEVUM_WORKLOAD_PM1_LOWMEM = 4,
+  AEVUM_WORKLOAD_PM1_ULTRALOWMEM = 5,
+  AEVUM_WORKLOAD_ECM = 6
+};
+
 AEVUM_ENGINE_API const char* aevum_engine_version(void);
 AEVUM_ENGINE_API const char* aevum_engine_last_error(void);
 AEVUM_ENGINE_API int aevum_engine_resolve_fft(
@@ -32,10 +44,6 @@ AEVUM_ENGINE_API int aevum_engine_resolve_fft(
     const char* fft_spec,
     char* output,
     size_t output_size);
-
-/* Kernel settings for engines created afterwards, in Aevum's -use syntax "KEY=VALUE,...".
-   They override the AEVUM_USE environment variable; NULL or "" clears them. */
-AEVUM_ENGINE_API int aevum_engine_set_use(const char* settings);
 
 AEVUM_ENGINE_API aevum_engine_handle aevum_engine_create(
     uint32_t exponent,
@@ -45,10 +53,40 @@ AEVUM_ENGINE_API aevum_engine_handle aevum_engine_create(
     const char* fft_spec,
     const char* tune_dir);
 
+AEVUM_ENGINE_API aevum_engine_handle aevum_engine_create_ex(
+    uint32_t exponent,
+    size_t register_count,
+    uint32_t device,
+    int verbose,
+    const char* fft_spec,
+    const char* tune_dir,
+    uint32_t workload);
+
 AEVUM_ENGINE_API void aevum_engine_destroy(aevum_engine_handle handle);
 AEVUM_ENGINE_API size_t aevum_engine_transform_size(aevum_engine_handle handle);
 AEVUM_ENGINE_API size_t aevum_engine_word_count(aevum_engine_handle handle);
 AEVUM_ENGINE_API int aevum_engine_sync(aevum_engine_handle handle);
+
+// Opt-in production timing decomposition. Counters are inactive unless
+// AEVUM_TIMING_DECOMP=1, so normal production runs pay no clock-sampling cost.
+typedef struct aevum_engine_timing_stats {
+  uint64_t square_calls;
+  uint64_t pending_flush_calls;
+  uint64_t pending_flush_ns;
+  uint64_t queue_sync_calls;
+  uint64_t queue_sync_ns;
+  uint64_t copy_calls;
+  uint64_t copy_ns;
+  uint64_t equal_calls;
+  uint64_t equal_ns;
+  uint64_t readback_calls;
+  uint64_t readback_ns;
+} aevum_engine_timing_stats;
+AEVUM_ENGINE_API int aevum_engine_timing_reset(aevum_engine_handle handle);
+AEVUM_ENGINE_API int aevum_engine_timing_get(aevum_engine_handle handle, aevum_engine_timing_stats* stats);
+
+// Diagnostic: synchronize, optionally emit kernel event counters, then reset them.
+AEVUM_ENGINE_API int aevum_engine_profile_report(aevum_engine_handle handle, int emit);
 
 AEVUM_ENGINE_API int aevum_engine_set_u32(aevum_engine_handle handle, size_t dst, uint32_t value);
 AEVUM_ENGINE_API int aevum_engine_set_words(aevum_engine_handle handle, size_t dst, const uint32_t* words, size_t count);
@@ -56,14 +94,17 @@ AEVUM_ENGINE_API int aevum_engine_get_words(aevum_engine_handle handle, size_t s
 AEVUM_ENGINE_API int aevum_engine_copy(aevum_engine_handle handle, size_t dst, size_t src);
 AEVUM_ENGINE_API int aevum_engine_prepare(aevum_engine_handle handle, size_t dst, size_t src);
 AEVUM_ENGINE_API int aevum_engine_square_mul(aevum_engine_handle handle, size_t reg, uint32_t factor);
-/* count consecutive squarings of reg using the fused carry kernel between steps.
-   mode 0: reg := reg^2 (count times), mode 1: reg := reg^2 - 2 (Lucas-Lehmer steps). */
-AEVUM_ENGINE_API int aevum_engine_square_loop(aevum_engine_handle handle, size_t reg, uint64_t count, int mode);
 AEVUM_ENGINE_API int aevum_engine_mul(aevum_engine_handle handle, size_t dst, size_t src, uint32_t factor);
 AEVUM_ENGINE_API int aevum_engine_add(aevum_engine_handle handle, size_t dst, size_t src);
 AEVUM_ENGINE_API int aevum_engine_sub_reg(aevum_engine_handle handle, size_t dst, size_t src);
 AEVUM_ENGINE_API int aevum_engine_sub_u32(aevum_engine_handle handle, size_t dst, uint32_t value);
 AEVUM_ENGINE_API int aevum_engine_equal(aevum_engine_handle handle, size_t lhs, size_t rhs, int* equal_out);
+
+// Diagnostic only: hashes GF31/GF61 after fftP, middle-in, tail-square,
+// middle-out and fftW, followed by the final word-buffer hash and low word.
+// trace_count must be at least 12. The source register is preserved.
+AEVUM_ENGINE_API int aevum_engine_debug_square_trace(
+    aevum_engine_handle handle, size_t src, uint64_t* trace, size_t trace_count);
 
 #ifdef __cplusplus
 }

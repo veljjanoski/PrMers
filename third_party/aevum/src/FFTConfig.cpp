@@ -8,6 +8,7 @@
 
 #include <cmath>
 #include <cassert>
+#include <cctype>
 #include <vector>
 #include <algorithm>
 #include <string>
@@ -15,6 +16,8 @@
 #include <array>
 #include <map>
 #include <cinttypes>
+#include <cstdlib>
+#include <stdexcept>
 
 using namespace std;
 
@@ -28,6 +31,24 @@ map<string, array<float, NUM_BPW_ENTRIES>> BPW {
 };
 
 namespace {
+
+bool startsWith(const string& s, const string& prefix) { return s.rfind(prefix, 0) == 0; }
+
+double positiveEnv(const char* name, double fallback) {
+  const char* text = std::getenv(name);
+  if (!text || !*text) return fallback;
+  char* end = nullptr;
+  const double value = std::strtod(text, &end);
+  return end != text && *end == '\0' && value > 0.0 ? value : fallback;
+}
+
+u64 mersenne2ReferencePowerOfTwo(u64 exponent) {
+  for (u64 n = 256; n <= (u64(1) << 34); n <<= 1) {
+    const double safe = std::log2(double(n)) + 2.0 * (double(exponent) / double(n) + 1.0);
+    if (safe < 92.0) return n;
+  }
+  return 0;
+}
 
 u32 parseInt(const string& s) {
   // if (s.empty()) { return 1; }
@@ -133,6 +154,18 @@ FFTShape::FFTShape(enum FFT_TYPES t, u32 w, u32 m, u32 h) :
   // Un-initialized shape, don't set BPW
   if (w == 1 && m == 1 && h == 1) { return; }
 
+  // PFA replaces the power-of-two middle axis by a 3/9 Good-Thomas axis.
+  // Type 1 keeps the paired GF31/GF61 arithmetic.  Experimental type 4 adds
+  // the upstream FP32 residue plane and currently supports radix 9 only.
+  // Until dedicated tune data is collected, inherit the next stock
+  // power-of-two plan and keep a conservative capacity margin.
+  if ((t == FFT3161 && (m == 3 || m == 9)) || (t == FFT323161 && m == 9)) {
+    const u32 reference_middle = m == 3 ? 4 : 16;
+    bpw = FFTShape{t, w, reference_middle, h}.bpw;
+    for (float& value : bpw) value -= 0.20f;
+    return;
+  }
+
   string s = spec();
   if (auto it = BPW.find(s); it != BPW.end()) {
     bpw = it->second;
@@ -205,7 +238,15 @@ bool FFTShape::isFavoredShape() const {
          (width == 256 && middle >= 1));
 }
 
-FFTConfig::FFTConfig(const string& spec) {
+FFTConfig::FFTConfig(const string& input_spec) {
+  string spec = input_spec;
+  u32 requested_pfa = 0;
+  bool adaptive_type4 = false;
+  bool force_full_type4 = false;
+  if (startsWith(spec, "pfa3:")) { requested_pfa = 3; spec = spec.substr(5); }
+  else if (startsWith(spec, "pfa9full:")) { requested_pfa = 9; force_full_type4 = true; spec = spec.substr(9); }
+  else if (startsWith(spec, "pfa9fast:")) { requested_pfa = 9; adaptive_type4 = true; spec = spec.substr(9); }
+  else if (startsWith(spec, "pfa9:")) { requested_pfa = 9; spec = spec.substr(5); }
   auto v = split(spec, ':');
 
   enum FFT_TYPES fft_type = FFT3161;
@@ -224,7 +265,8 @@ FFTConfig::FFTConfig(const string& spec) {
       log("Width must be 256, 512, 1024, or 4096.\n");
       throw "Invalid FFT spec";
     }
-    if (m < 2 || m > 16) {
+    // Explicit PRP experimental MIDDLE=1 plans; auto shape enumeration is unchanged.
+    if (m < 1 || m > 16) {
       log("Middle must be between 1 and 16.\n");
       throw "Invalid FFT spec";
     }
@@ -232,8 +274,9 @@ FFTConfig::FFTConfig(const string& spec) {
       log("Height must be 256, 512, 1024.\n");
       throw "Invalid FFT spec";
     }
-    if (fft_type != FFT64 && fft_type != FFT32 && (m & (m - 1))) {
-      log("NTT middle must be a power of two.\n");
+    if (fft_type != FFT64 && fft_type != FFT32 && (m & (m - 1)) &&
+        !(requested_pfa && m == requested_pfa)) {
+      log("NTT middle must be a power of two unless an explicit pfa3:/pfa9: plan is used.\n");
       throw "Invalid FFT spec";
     }
   }
@@ -250,6 +293,23 @@ FFTConfig::FFTConfig(const string& spec) {
     *this = {FFTShape{fft_type, v[0], v[1], v[2]}, parseInt(v[3]), c == 0 ? CARRY_32 : CARRY_64};
   } else {
     throw "FFT spec";
+  }
+  if (requested_pfa) {
+    const bool paired_ntt = shape.fft_type == FFT3161 &&
+                            (requested_pfa == 3 || requested_pfa == 9);
+    const bool hybrid_fp32_crt = shape.fft_type == FFT323161 && requested_pfa == 9;
+    if ((!paired_ntt && !hybrid_fp32_crt) || shape.middle != requested_pfa)
+      throw std::runtime_error("PFA plans require FFT3161 middle 3/9 or FFT323161 middle 9");
+    pfa_radix = requested_pfa;
+    // A type-4 PFA9 request is capacity-adaptive by default.  The FP32 plane
+    // is mathematically redundant whenever the exact GF31*GF61 CRT limit is
+    // sufficient, so do not pay for a third transform unless pfa9full: is
+    // explicitly requested.  pfa9fast: remains a compatibility alias.
+    adaptive_type4_request = shape.fft_type == FFT323161 && !force_full_type4;
+    if (adaptive_type4 && shape.fft_type != FFT323161)
+      throw std::runtime_error("pfa9fast requires an FFT323161 type-4 request");
+    if (force_full_type4 && shape.fft_type != FFT323161)
+      throw std::runtime_error("pfa9full requires an FFT323161 type-4 request");
   }
 }
 
@@ -276,6 +336,7 @@ FFTConfig::FFTConfig(FFTShape shape, u32 variant, enum CARRY_KIND carry) :
 
 string FFTConfig::spec() const {
   string s = shape.spec() + ":" + to_string(variant_W(variant)) + to_string(variant_M(variant)) + to_string(variant_H(variant));
+  if (isPfa()) s = string("pfa") + to_string(pfa_radix) + ":" + s;
   return carry == CARRY_AUTO ? s : (s + (carry == CARRY_32 ? ":0" : ":1"));
 }
 
@@ -297,32 +358,410 @@ float FFTConfig::maxBpw() const {
   return (carry == CARRY_32 && (shape.fft_type == FFT64 || shape.fft_type == FFT3231)) ? std::min(shape.carry32BPW(), b) : b;
 }
 
+bool FFTConfig::knownUnsafeOrdinaryPrp(u64 exponent) const {
+  constexpr u64 kFirstReproducedBadExponent = 19121591u;
+
+  return exponent >= kFirstReproducedBadExponent &&
+         shape.fft_type == FFT3161 &&
+         shape.width == 256u &&
+         shape.middle == 4u &&
+         shape.height == 256u;
+}
+
+FFTConfig FFTConfig::promoteKnownUnsafeOrdinaryPrp(
+    const Args& args, u64 exponent) const {
+  if (!knownUnsafeOrdinaryPrp(exponent)) return *this;
+
+  // Both 1M variants were word-exact against Marin at p=19121591
+  // on RTX 3080 and Radeon VII. 101 is the deterministic baseline;
+  // the normal Aevum tuner can still benchmark 202 afterwards.
+  for (const char* spec : {
+           "1:512:4:256:101",
+           "1:512:4:256:202"
+       }) {
+    FFTConfig candidate{spec};
+
+    const double bpw =
+        double(exponent) / double(candidate.size());
+
+    if (bpw >= candidate.minBpw() &&
+        candidate.maxExp() * args.fftOverdrive >= exponent) {
+      return candidate;
+    }
+  }
+
+  // Defensive fallback for a manually forced 512K plan far outside
+  // the reproduced low-range case.
+  for (const FFTShape& shape2 : FFTShape::allShapes()) {
+    if (shape2.fft_type != FFT3161) continue;
+    if (shape2.size() <= shape.size()) continue;
+
+    for (u32 variant : {101u, 202u}) {
+      FFTConfig candidate{
+          shape2, variant, CARRY_AUTO};
+
+      const double bpw =
+          double(exponent) / double(candidate.size());
+
+      if (bpw < candidate.minBpw()) continue;
+
+      if (candidate.maxExp() * args.fftOverdrive >= exponent)
+        return candidate;
+    }
+  }
+
+  throw std::runtime_error(
+      "Aevum cannot promote unsafe ordinary-PRP "
+      "FFT3161 256x4x256 plan");
+}
+
 FFTConfig FFTConfig::bestFit(const Args& args, u64 E, const string& spec) {
+#if defined(__APPLE__)
+  // Apple exposes OpenCL 1.2 through a legacy compiler.  The staged FFT3161
+  // path is supported, while the monolithic Type-4 and native-PFA pipelines
+  // are not yet runtime-safe.  Reject explicit requests before kernel creation
+  // instead of failing later with CL_INVALID_KERNEL.
+  if (spec.rfind("4:", 0) == 0 || spec.rfind("pfa", 0) == 0) {
+    throw runtime_error("Apple OpenCL 1.2 supports only stock FFT3161 Aevum plans; Type4/PFA is disabled");
+  }
+#endif
+  // PRP-native AUTO specialization for the measured 4M window.
+  //
+  // This pseudo-selector is used only by PrMers' native PRP policy. It keeps
+  // tune.txt authoritative: compatible measured entries are replayed before
+  // the built-in geometry is considered. Explicit user FFT specs never enter
+  // this branch, and runtime autotuning remains on its existing path.
+  const bool native_prp_auto =
+      spec == "native-prp:auto" || spec == "native-prp:auto-amd";
+  if (native_prp_auto) {
+    for (const TuneEntry& tuned : TuneEntry::readTuneFile(args)) {
+      if (tuned.fft.shape.fft_type != FFT3161) continue;
+      const double bits_per_word = E / double(tuned.fft.size());
+      if (bits_per_word < tuned.fft.minBpw()) continue;
+      if (tuned.fft.maxExp() * args.fftOverdrive >= E) {
+        log("Aevum tuned PRP FFT: %s for exponent %" PRIu64 "\n",
+            tuned.fft.spec().c_str(), E);
+        return tuned.fft;
+      }
+    }
+
+    // Radeon VII high-range PRP measurements show the 8M 1K/radix-8 shape
+    // materially faster than generic AUTO. Runtime enters this internal alias
+    // only for AMD OpenCL devices. Preserve generic AUTO's variant/capacity.
+    constexpr u64 kPrpAmd8MMinExponent = 210000000u;
+    constexpr u64 kPrpAmd8MMaxExponent = 220000003u;
+    if (spec == "native-prp:auto-amd" &&
+        E >= kPrpAmd8MMinExponent && E <= kPrpAmd8MMaxExponent) {
+      FFTConfig stock = bestFit(args, E, "");
+      const string stock_spec = stock.spec();
+      const size_t variant_pos = stock_spec.rfind(':');
+      if (variant_pos != string::npos) {
+        const u32 variant =
+            static_cast<u32>(stoul(stock_spec.substr(variant_pos + 1)));
+        FFTConfig prp8m{
+            FFTShape{FFT3161, 1024u, 8u, 512u}, variant, CARRY_AUTO};
+        const double bits_per_word = E / double(prp8m.size());
+        if (bits_per_word >= prp8m.minBpw() &&
+            prp8m.maxExp() * args.fftOverdrive >= E) {
+          log("Aevum native AMD PRP FFT: %s for exponent %" PRIu64 "\n",
+              prp8m.spec().c_str(), E);
+          return prp8m;
+        }
+      }
+    }
+
+    // Word-exact paired A/B on Radeon VII and RTX 3080 shows this geometry
+    // materially faster than the stock 4M 1:1K:8:256:101 plan throughout the
+    // validated 130M-160M interval. Keep the gate to the measured interval;
+    // the 8M transition is handled by the existing native selector.
+    constexpr u64 kPrpFast4MMinExponent = 130000000u;
+    constexpr u64 kPrpFast4MMaxExponent = 160000003u;
+    if (E >= kPrpFast4MMinExponent && E <= kPrpFast4MMaxExponent) {
+      FFTConfig prp4m{FFTShape{FFT3161, 512u, 8u, 512u}, 202u, CARRY_AUTO};
+      const double bits_per_word = E / double(prp4m.size());
+      if (bits_per_word >= prp4m.minBpw() &&
+          prp4m.maxExp() * args.fftOverdrive >= E) {
+        log("Aevum native PRP FFT: %s for exponent %" PRIu64 "\n",
+            prp4m.spec().c_str(), E);
+        return prp4m;
+      }
+    }
+#if !defined(__APPLE__)
+    // Word-exact paired A/B on Radeon VII and RTX 3080 shows this Type4
+    // geometry faster than generic AUTO at 170M, 180M, 190M and 197M.
+    // Keep the gate to the measured bridge: below it RTX prefers the 4M
+    // Type1 path, while above it this Type4 plan exceeds its safe capacity.
+    constexpr u64 kPrpFastType4MinExponent = 170000000u;
+    constexpr u64 kPrpFastType4MaxExponent = 197000003u;
+    if (E >= kPrpFastType4MinExponent && E <= kPrpFastType4MaxExponent) {
+      return bestFit(args, E, "4:512:8:512:202");
+    }
+#endif
+    return bestFit(args, E, "");
+  }
+
+  // Workload-aware throughput selectors. Transform length alone is not a
+  // sufficient proxy: the fastest geometry depends on the operation mix.
+  //
+  // Calibrated and word-exact on RTX 3080:
+  //   PRP  -> 4:512:8:512:202
+  //   LL   -> 4:1K:2:1K:202
+  //   P-1  -> 4:256:16:256:202
+  //   ECM  -> stock Type1 until a repeatable gain is demonstrated.
+  //
+  // The selectors remain capacity-aware and environment-overridable. Explicit
+  // plans are always honored. The legacy throughput:auto selector retains the
+  // broad candidate set, including PFA diagnostics.
+  const bool throughput_selector =
+      spec == "throughput:auto" || spec == "pow2:auto" ||
+      spec == "throughput:prp" || spec == "throughput:ll" ||
+      spec == "throughput:pm1" || spec == "throughput:ecm";
+  if (throughput_selector) {
+    struct Candidate { FFTConfig fft; double score; const char* family; };
+    vector<Candidate> candidates;
+
+    const string selector =
+        spec == "throughput:prp" ? "prp" :
+        spec == "throughput:ll"  ? "ll"  :
+        spec == "throughput:pm1" ? "pm1" :
+        spec == "throughput:ecm" ? "ecm" : "generic";
+
+    auto envCost = [&](const char* suffix, double fallback) {
+      string upper = selector;
+      transform(upper.begin(), upper.end(), upper.begin(),
+                [](unsigned char c) { return char(std::toupper(c)); });
+      const string specific = "AEVUM_AUTO_" + upper + "_" + suffix;
+      return positiveEnv(specific.c_str(), fallback);
+    };
+
+    double stock_default = 1.00;
+    double type4_default = 1.00;
+    double target_w = 9.0;  // log2(512)
+    double target_m = 3.0;  // log2(8)
+    double target_h = 9.0;  // log2(512)
+
+    if (selector == "prp") {
+      type4_default = 0.90;
+    } else if (selector == "ll") {
+      type4_default = 0.90;
+      target_w = 10.0; target_m = 1.0; target_h = 10.0;
+    } else if (selector == "pm1") {
+      type4_default = 0.90;
+      target_w = 8.0; target_m = 4.0; target_h = 8.0;
+    } else if (selector == "ecm") {
+      // ECM's 51-register mixed-operation path showed no repeatable Type4
+      // advantage in the first audit. Keep Type1 unless a smaller transform
+      // overcomes this conservative cost margin.
+      type4_default = 1.12;
+      target_w = 8.0; target_m = 4.0; target_h = 8.0;
+    }
+
+    FFTConfig stock = bestFit(args, E, "");
+    candidates.push_back({
+        stock,
+        double(stock.size()) * envCost("STOCK_COST",
+            positiveEnv("AEVUM_AUTO_STOCK_COST", stock_default)),
+        "stock FFT3161"
+    });
+
+#if !defined(__APPLE__)
+    for (u32 width : {256u, 512u, 1024u, 4096u}) {
+      for (u32 height : {256u, 512u, 1024u}) {
+        if (width == 256u && height == 1024u) continue;
+        for (u32 middle : {2u, 4u, 8u, 16u}) {
+          FFTConfig hybrid{FFTShape{FFT323161, width, middle, height}, 202u, CARRY_AUTO};
+          const double bpw = E / double(hybrid.size());
+          if (bpw < hybrid.minBpw()) continue;
+          if (hybrid.maxExp() * args.fftOverdrive < E) continue;
+
+          const double geometry =
+              1.0 +
+              0.020 * std::abs(std::log2(double(width)) - target_w) +
+              0.020 * std::abs(std::log2(double(middle)) - target_m) +
+              0.020 * std::abs(std::log2(double(height)) - target_h);
+
+          candidates.push_back({
+              hybrid,
+              double(hybrid.size()) *
+                  envCost("TYPE4_COST",
+                      positiveEnv("AEVUM_AUTO_POW2_TYPE4_COST", type4_default)) *
+                  geometry,
+              "power-of-two FFT323161 lead-cache"
+          });
+        }
+      }
+    }
+#endif
+
+#if !defined(__APPLE__)
+    // PFA remains available in the legacy diagnostic selector, but is excluded
+    // from workload-specific defaults until its differential tests are exact.
+    if (spec == "throughput:auto") {
+      FFTConfig pfa = bestFit(args, E, "pfa:auto");
+      if (pfa.isPfa()) {
+        const double factor = pfa.pfa_radix == 9
+            ? positiveEnv("AEVUM_AUTO_PFA9_COST", 1.20)
+            : positiveEnv("AEVUM_AUTO_PFA3_COST", 1.10);
+        candidates.push_back({pfa, double(pfa.size()) * factor,
+                              pfa.pfa_radix == 9 ? "PFA9 FFT3161" : "PFA3 FFT3161"});
+      }
+    }
+#endif
+
+    sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+      if (a.score != b.score) return a.score < b.score;
+      return a.fft.size() < b.fft.size();
+    });
+    const Candidate& selected = candidates.front();
+    log("Aevum throughput auto: %s selected for exponent %" PRIu64
+        " (selector %s, family %s, score %.3fM, words %.3fM).\n",
+        selected.fft.spec().c_str(), E, selector.c_str(), selected.family,
+        selected.score / 1048576.0, double(selected.fft.size()) / 1048576.0);
+    for (size_t i = 1; i < candidates.size() && i < 6; ++i) {
+      log("Aevum throughput candidate: %s, selector %s, family %s, score %.3fM, words %.3fM.\n",
+          candidates[i].fft.spec().c_str(), selector.c_str(), candidates[i].family,
+          candidates[i].score / 1048576.0, double(candidates[i].fft.size()) / 1048576.0);
+    }
+    return selected.fft;
+  }
+  // Native Good-Thomas PFA selector. pfa:auto chooses an odd-radix plan only
+  // when the actual Aevum transform-size reduction is large enough to cover
+  // the odd-axis work. Forced pfa:3 and pfa:9 remain available for diagnostics.
+  if (spec == "pfa:auto" || spec == "pfa:3" || spec == "pfa:9") {
+    const u32 forced = spec == "pfa:3" ? 3u : spec == "pfa:9" ? 9u : 0u;
+    FFTConfig stock = bestFit(args, E, "");
+    // The optimized radix-9 path is selected directly from the real Aevum
+    // stock/PFA size ratio. Device tuning can still override tail variants,
+    // but is no longer required to enable pfa:auto.
+    vector<FFTConfig> candidates;
+    for (u32 radix : {9u, 3u}) {
+      if (forced && radix != forced) continue;
+      for (u32 width : {256u, 512u, 1024u, 4096u}) {
+        for (u32 height : {256u, 512u, 1024u}) {
+          if (width == 256 && height == 1024) continue;
+          // RTX 3080 measurements favor variant 202 for radix-9.  Keep
+          // radix-3 on the validated 101 pipeline.
+          const u32 variant = radix == 9 ? 202u : 101u;
+          FFTConfig c{FFTShape{FFT3161, width, radix, height}, variant, CARRY_AUTO};
+          c.pfa_radix = radix;
+          const double bpw = E / double(c.size());
+          if (bpw < c.minBpw()) continue;
+          if (c.maxExp() * args.fftOverdrive >= E) candidates.push_back(c);
+        }
+      }
+    }
+    if (candidates.empty()) {
+      if (forced) throw std::runtime_error("No admissible native PFA radix-3/9 plan");
+      log("Aevum PFA auto: no admissible odd-radix plan; stock %s retained.\n",
+          stock.spec().c_str());
+      return stock;
+    }
+    sort(candidates.begin(), candidates.end(), [](const FFTConfig& a, const FFTConfig& b) {
+      if (a.size() != b.size()) return a.size() < b.size();
+      return a.pfa_radix > b.pfa_radix;
+    });
+    FFTConfig selected = candidates.front();
+    const double ratio = double(stock.size()) / double(selected.size());
+
+    // PFA-9 is enabled automatically for the 1.778x reduction windows that
+    // have enough headroom to absorb the odd-axis work. PFA-3 is enabled for the 1.333x reduction windows after
+    // the RTX 3080 measurements confirmed a speed win.
+    const double minimum = selected.pfa_radix == 9 ? 1.60 : 1.30;
+    if (!forced && ratio < minimum) {
+      const u64 reference = mersenne2ReferencePowerOfTwo(E);
+      if (ratio < 1.0) {
+        log("Aevum PFA auto: stock %s (%" PRIu64 " words) retained; candidate %s (%" PRIu64
+            " words) is %.3fx larger than the actual Aevum stock plan.\n",
+            stock.spec().c_str(), stock.size(), selected.spec().c_str(), selected.size(), 1.0 / ratio);
+      } else {
+        log("Aevum PFA auto: stock %s (%" PRIu64 " words) retained; candidate %s (%" PRIu64
+            " words) reduces size by only %.3fx, below the current %.2fx overhead gate.\n",
+            stock.spec().c_str(), stock.size(), selected.spec().c_str(), selected.size(), ratio, minimum);
+      }
+      if (reference && reference != stock.size()) {
+        log("Aevum PFA note: the mersenne2 reference table compares against conservative power-of-two n=%" PRIu64
+            "; Aevum's tuned stock selector uses n=%" PRIu64 ".\n", reference, stock.size());
+      }
+      return stock;
+    }
+    log("Aevum native PFA: %s selected for exponent %" PRIu64
+        " (stock %s, actual Aevum transform reduction %.3fx; auto gate %.2fx).\n",
+        selected.spec().c_str(), E, stock.spec().c_str(), ratio, minimum);
+    return selected;
+  }
+
   // A FFT-spec was given, simply take the first FFT from the spec that can handle E
   if (!spec.empty()) {
     FFTConfig fft{spec};
-    if (fft.shape.fft_type != FFT3161) {
-      log("Aevum accepts only FFT type 1, GF(M31^2) x GF(M61^2).\n");
+
+    // FFT323161 only pays for itself when its FP32 plane is required to lift
+    // the coefficient range beyond the 92-bit GF31*GF61 CRT.  Every ordinary
+    // pfa9:4 request is therefore capacity-adaptive: if the exact paired NTT
+    // fits, execute the same requested shape/variant without the redundant
+    // FP32 plane.  Use pfa9full:4 only for the true three-plane diagnostic path.
+    if (fft.adaptive_type4_request) {
+      FFTConfig paired{FFTShape{FFT3161, fft.shape.width, fft.shape.middle, fft.shape.height},
+                       fft.variant, fft.carry};
+      paired.pfa_radix = fft.pfa_radix;
+      paired.adaptive_type4_request = true;
+      const double requested_bpw = E / double(fft.size());
+      const double paired_limit = paired.maxBpw() * args.fftOverdrive;
+      if (paired.maxExp() * args.fftOverdrive >= E) {
+        paired.adaptive_type4_elided = true;
+        log("Aevum optimized type-4 PFA9: FP32 plane elided at %.2f bpw; "
+            "exact FFT3161 limit %.2f bpw, executing %s.\n",
+            requested_bpw, paired_limit, paired.spec().c_str());
+        return paired;
+      }
+      log("Aevum optimized type-4 PFA9: %.2f bpw exceeds exact FFT3161 limit "
+          "%.2f bpw; retaining full FP32+GF31+GF61 plan %s.\n",
+          requested_bpw, paired_limit, fft.spec().c_str());
+    }
+
+    bool apple_diagnostic_plane = false;
+#if defined(__APPLE__)
+    if (const char* diagnostic = std::getenv("AEVUM_APPLE_DIAGNOSTIC_PLANES")) {
+      apple_diagnostic_plane = diagnostic[0] == '1' && diagnostic[1] == '\0' &&
+                               (fft.shape.fft_type == FFT31 || fft.shape.fft_type == FFT61);
+    }
+#endif
+    const bool supported_aevum_type = fft.shape.fft_type == FFT3161 ||
+                                      fft.shape.fft_type == FFT323161;
+    if (!supported_aevum_type && !apple_diagnostic_plane) {
+      log("Aevum accepts FFT type 1 or FFT type 4 (power-of-two or explicit PFA9).\n");
       throw "Aevum FFT type";
     }
+#if defined(__APPLE__)
+    if (apple_diagnostic_plane) {
+      log("Apple Aevum diagnostic: explicit single-plane FFT type %d enabled.\n",
+          static_cast<int>(fft.shape.fft_type));
+    }
+#endif
     if (fft.maxExp() * args.fftOverdrive < E) {
       log("Warning: %s (max %" PRIu64 ") may be too small for %" PRIu64 "\n", fft.spec().c_str(), fft.maxExp(), E);
     }
     return fft;
   }
 
-  // The standard GPUOwl tune file contains FP64 shapes, including non-power-of-two
-  // middle dimensions.  Aevum is NTT-only, so select directly from FFT3161 shapes.
-  // Within a size, width = height = 512 comes first: it is the reference wavefront NTT of Aevum's
-  // tuner, and on an RTX 3090 the 4M shape 512:8:512 ran 9% faster than 1K:8:256 and faster than
-  // every other 4M shape.
-  vector<FFTShape> shapes = FFTShape::allShapes();
-  auto square512 = [](const FFTShape& s) { return s.width == 512 && s.height == 512 && s.middle >= 4; };
-  std::stable_sort(shapes.begin(), shapes.end(), [&](const FFTShape& a, const FFTShape& b) {
-    if (a.size() != b.size()) { return a.size() < b.size(); }
-    return square512(a) && !square512(b);
-  });
-  for (const FFTShape& shape : shapes) {
+  // No explicit FFT spec: first reuse compatible Aevum tuning data.
+  // TuneEntry::readTuneFile rejects historical single-digit GPUOwl/PRPLL FP64
+  // records, accepts explicit Type1 records, and safely normalizes modern
+  // unprefixed three-digit WMH NTT records (for example 512:8:512:202).
+  // Entries are sorted by measured cost; the first safe entry is therefore
+  // the fastest measured compatible plan.
+  for (const TuneEntry& tuned : TuneEntry::readTuneFile(args)) {
+    if (tuned.fft.shape.fft_type != FFT3161) continue;
+    const double bits_per_word = E / double(tuned.fft.size());
+    if (bits_per_word < tuned.fft.minBpw()) continue;
+    if (tuned.fft.maxExp() * args.fftOverdrive >= E) {
+      log("Aevum tuned FFT: %s for exponent %" PRIu64 "\n",
+          tuned.fft.spec().c_str(), E);
+      return tuned.fft;
+    }
+  }
+
+  // No usable tuned entry: select directly from the built-in FFT3161 shapes.
+  for (const FFTShape& shape : FFTShape::allShapes()) {
     if (shape.fft_type != FFT3161) continue;
     for (u32 v : {101, 202}) {
       FFTConfig fft{shape, v, CARRY_AUTO};

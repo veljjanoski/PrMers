@@ -313,8 +313,8 @@ int App::runPrpOrLlMarin()
     const bool proof_points = (options.mode == "prp" && options.proof);
     // Squarings are issued in chunks that end at the next iteration needing host work
     // (Gerbicz-Li block boundary, proof checkpoint, error injection, last iteration), so an
-    // engine with a batched squaring loop (Aevum: fused carry) keeps the data in the transform
-    // domain between squarings. chunk_max adapts to keep each chunk around a quarter second,
+    // engine that chains squarings (Aevum: register lead cache through carryFused) keeps the data
+    // in the transform domain between them. chunk_max adapts to keep each chunk around a quarter second,
     // which bounds the latency of the interrupt, backup and progress checks.
     uint64_t chunk_max = 64;
     constexpr uint64_t chunk_max_limit = 4096;
@@ -614,6 +614,45 @@ int App::runPrpOrLlMarin()
         }
     }		
     logger.logEnd(elapsed_time);
+
+    // Persist a completed PRP/cofactor result before optional proof
+    // generation. Proof metadata is intentionally disabled here.
+    // The normal final path overwrites this JSON after proof success.
+    if (options.mode == "prp") {
+        auto provisionalOptions = options;
+        provisionalOptions.proof = false;
+        provisionalOptions.proofFile.clear();
+
+        std::string provisionalJson;
+
+        if (!provisionalOptions.knownFactors.empty()) {
+            auto [provisionalPrime,
+                  provisionalRes64,
+                  provisionalRes2048] =
+                io::JsonBuilder::computeResultMarin(
+                    d, provisionalOptions);
+
+            provisionalJson = io::JsonBuilder::generate(
+                provisionalOptions,
+                static_cast<int>(eng->get_size()),
+                provisionalPrime,
+                provisionalRes64,
+                provisionalRes2048);
+        } else {
+            provisionalJson = io::JsonBuilder::generate(
+                provisionalOptions,
+                static_cast<int>(eng->get_size()),
+                is_prp_prime,
+                res64_hex,
+                res2048_hex);
+        }
+
+        io::WorktodoManager provisionalWm(provisionalOptions);
+        provisionalWm.saveIndividualJson(
+            provisionalOptions.exponent,
+            provisionalOptions.mode,
+            provisionalJson);
+    }
 
     if (options.mode == "prp" && options.proof && (options.aevum || options.aevum_auto)) {
         try {

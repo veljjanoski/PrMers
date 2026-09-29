@@ -41,6 +41,14 @@ class App {
 public:
     App(int argc, char** argv);
     int runPrpOrLl();
+    int runGaussianMersenne();
+    int runGaussianMersennePM1();
+    int runGaussianMersennePM1Legacy();
+    int runGaussianMersenneECM();
+    // v99.97 keeps the v99.96 GM-ECM implementation available byte-for-byte
+    // as a private fallback implementation selected by the new wrapper.
+    int runGaussianMersenneECMLegacy();
+    int runGaussianMersenneECMOptimized();
     int runPrpOrLlMarin();
     int runLlSafeMarin();
     int runLlSafeMarinDoubling();
@@ -70,6 +78,7 @@ private:
   char** argv_;
   std::unique_ptr<io::WorktodoParser> worktodoParser_;
   bool hasWorktodoEntry_{false};
+  std::string activeWorktodoRawLine_;
   io::CliOptions                     options;
   prmers::ocl::Context                    context;
   math::Precompute                   precompute;

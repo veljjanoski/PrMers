@@ -13,6 +13,11 @@ struct WorktodoEntry {
     bool pm1Test   = false; 
     bool ecmTest   = false; 
     bool doubleCheck = false;        // Prime95 DoubleCheck= LL worktodo entry
+    bool gaussianMersenne = false;   // Native PrMers Gaussian-Mersenne worktodo entry
+    bool gmPrpOnly = false;          // GMPRP rather than deterministic GMPROTH
+    bool gmPipeline = false;         // GMCHAIN conditional P-1 -> optional ECM
+    std::string gmFamily = "GM";      // GM, GQ, or BOTH
+    bool gmPipelineProth = true;     // legacy default; false stops after factoring
     bool pminus1ed = true;           // Prime95 Test/DoubleCheck third field; informational for now
     uint32_t exponent = 0;
     std::string aid;
@@ -24,13 +29,21 @@ struct WorktodoEntry {
     uint64_t B1 = 0;                       
     uint64_t B2 = 0;
     uint64_t curves = 0;
+    uint32_t gmBase = 0;
+    uint64_t gmSieveLimit = 1'000'000ULL;
+    uint64_t gmFactorChunkBits = 0;
+    uint64_t gmEcmB1 = 0;
+    uint64_t gmEcmB2 = 0;
+    uint64_t gmEcmCurves = 0;
+    std::string sigma;
 };
 
 class WorktodoParser {
 public:
     explicit WorktodoParser(const std::string& filename);
     std::optional<WorktodoEntry> parse();
-    bool removeFirstProcessed();  // supprime la 1ʳᵉ entrée non vide et la sauvegarde
+    bool removeFirstProcessed();  // legacy: removes the first actionable entry and archives it
+    bool removeProcessedLine(const std::string& rawLine); // exact-line removal for native queues
 
 private:
     std::string filename_;

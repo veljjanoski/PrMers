@@ -2,7 +2,15 @@ name: Build Windows with OpenCL
 
 on:
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Exact commit SHA or tag to preflight; empty uses the workflow ref"
+        required: false
+        default: ""
+        type: string
   push:
+    branches:
+      - 'cherub-preflight/**'
     tags:
       - 'v*'
 
@@ -19,6 +27,14 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
+
+      - name: Audit Gaussian Windows portability
+        shell: powershell
+        run: |
+          python tests/gaussian_mersenne_windows_portability_test.py
+          python tests/gaussian_pair_tf_math_test.py
 
       - name: Install zip utility
         run: choco install zip --no-progress
@@ -28,6 +44,25 @@ jobs:
           curl.exe -L -o $env:RUNNER_TEMP/opencl.zip "https://github.com/KhronosGroup/OpenCL-SDK/releases/download/v${env:OPENCL_VERSION}/OpenCL-SDK-v${env:OPENCL_VERSION}-Win-x64.zip"
           mkdir $env:RUNNER_TEMP/opencl
           tar.exe -xf $env:RUNNER_TEMP/opencl.zip --strip-components=1 -C $env:RUNNER_TEMP/opencl
+
+      - name: Set up MSYS2 UCRT64 for Aevum
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make
+            diffutils
+            python
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-opencl-headers
+            mingw-w64-ucrt-x86_64-opencl-icd
+
+      - name: Test PRP ProofMarin host regression
+        shell: msys2 {0}
+        run: |
+          bash tests/test_proof_marin_padding.sh
+          python3 tests/proof_marin_source_regression_test.py
 
       - name: Clone and bootstrap vcpkg
         run: |
@@ -62,8 +97,142 @@ jobs:
             -DOpenCL_INCLUDE_DIR="$env:RUNNER_TEMP\opencl\include" `
             -DOpenCL_LIBRARY="$env:RUNNER_TEMP\opencl\lib\OpenCL.lib"
 
-      - name: Build
+      - name: Build PrMers
         run: cmake --build build --config Release
+
+      - name: Build and validate Aevum engine DLL
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+
+          make -C third_party/aevum clean
+
+          make -C third_party/aevum engine-lib -j"$(nproc)" \
+            CXX=g++ \
+            DL_LIBS= \
+            ENGINE_LINK_FLAGS="-shared -static-libstdc++ -static-libgcc"
+
+          DLL="third_party/aevum/build-engine/aevum_engine.dll"
+
+          cp third_party/aevum/build-engine/libaevum_engine.so "$DLL"
+          test -s "$DLL"
+
+          DEPS="$(objdump -p "$DLL" | sed -n 's/^[[:space:]]*DLL Name: //p')"
+
+          echo "Aevum DLL dependencies:"
+          printf '%s\n' "$DEPS"
+
+          if grep -Eqi '^libstdc\+\+-6\.dll$|^libgcc_s_.*\.dll$' <<<"$DEPS"; then
+            echo "::error::Aevum DLL still depends on dynamic GCC C++ runtimes"
+            exit 1
+          fi
+
+          if grep -qi '^libwinpthread-1\.dll$' <<<"$DEPS"; then
+            cp /ucrt64/bin/libwinpthread-1.dll \
+              third_party/aevum/build-engine/
+          fi
+
+          cat > aevum-dll-smoke.cpp <<'CPP'
+          #ifndef NOMINMAX
+          #define NOMINMAX
+          #endif
+
+          #include <windows.h>
+
+          #include <cstddef>
+          #include <cstdint>
+          #include <iostream>
+          #include <stdexcept>
+          #include <string>
+
+          int main(int argc, char** argv) {
+            if (argc != 2) {
+              std::cerr << "Usage: aevum-dll-smoke <dll>\n";
+              return 2;
+            }
+
+            HMODULE library = LoadLibraryA(argv[1]);
+            if (!library) {
+              std::cerr << "LoadLibrary failed: " << GetLastError() << '\n';
+              return 3;
+            }
+
+            const char* symbols[] = {
+              "aevum_engine_version",
+              "aevum_engine_last_error",
+              "aevum_engine_resolve_fft",
+              "aevum_engine_create",
+              "aevum_engine_destroy",
+              "aevum_engine_transform_size",
+              "aevum_engine_word_count",
+              "aevum_engine_sync",
+              "aevum_engine_set_u32",
+              "aevum_engine_set_words",
+              "aevum_engine_get_words",
+              "aevum_engine_copy",
+              "aevum_engine_prepare",
+              "aevum_engine_square_mul",
+              "aevum_engine_mul",
+              "aevum_engine_add",
+              "aevum_engine_sub_reg",
+              "aevum_engine_sub_u32",
+              "aevum_engine_equal"
+            };
+
+            for (const char* symbol : symbols) {
+              if (!GetProcAddress(library, symbol)) {
+                std::cerr << "Missing export: " << symbol << '\n';
+                FreeLibrary(library);
+                return 4;
+              }
+            }
+
+            using version_fn = const char* (*)();
+            using error_fn = const char* (*)();
+            using resolve_fn =
+              int (*)(std::uint32_t, const char*, char*, std::size_t);
+
+            const auto version = reinterpret_cast<version_fn>(
+              GetProcAddress(library, "aevum_engine_version"));
+            const auto error = reinterpret_cast<error_fn>(
+              GetProcAddress(library, "aevum_engine_last_error"));
+            const auto resolve = reinterpret_cast<resolve_fn>(
+              GetProcAddress(library, "aevum_engine_resolve_fft"));
+
+            char spec[64]{};
+
+            if (!resolve(136279841u, nullptr, spec, sizeof(spec))) {
+              std::cerr << "FFT resolution failed: " << error() << '\n';
+              FreeLibrary(library);
+              return 5;
+            }
+
+            std::cout << "Aevum DLL loaded, version=" << version()
+                      << ", FFT=" << spec << '\n';
+
+            FreeLibrary(library);
+            return 0;
+          }
+          CPP
+
+          g++ -std=c++20 -O2 \
+            -static-libstdc++ -static-libgcc \
+            aevum-dll-smoke.cpp \
+            -o aevum-dll-smoke.exe
+
+          ./aevum-dll-smoke.exe "$DLL"
+
+          file "$DLL"
+
+          objdump -p "$DLL" > aevum-dll-objdump.txt
+
+          if ! grep -q 'aevum_engine_version' aevum-dll-objdump.txt; then
+            echo "::error::aevum_engine_version is absent from the DLL export table"
+            sed -n '/Export Table/,$p' aevum-dll-objdump.txt
+            exit 1
+          fi
+
+          echo "Aevum DLL export table validation passed."
 
       - name: Generate code signing certificate
         shell: powershell
@@ -97,12 +266,52 @@ jobs:
       - name: Package
         shell: powershell
         run: |
-          mkdir prmers_package; mkdir prmers_package\kernels
+          New-Item -ItemType Directory -Force `
+            -Path prmers_package, prmers_package\kernels | Out-Null
+
           Copy-Item build\Release\prmers.exe prmers_package\
           Copy-Item kernels\prmers.cl prmers_package\kernels\
           Copy-Item vcpkg\installed\x64-windows\bin\*.dll prmers_package\
+
+          Copy-Item `
+            third_party\aevum\build-engine\aevum_engine.dll `
+            prmers_package\
+
+          Copy-Item third_party\aevum\tune.txt prmers_package\
+
+          if (Test-Path `
+                third_party\aevum\build-engine\libwinpthread-1.dll) {
+            Copy-Item `
+              third_party\aevum\build-engine\libwinpthread-1.dll `
+              prmers_package\
+          }
+
+          $required = @(
+            "prmers_package\prmers.exe",
+            "prmers_package\aevum_engine.dll",
+            "prmers_package\tune.txt",
+            "prmers_package\kernels\prmers.cl"
+          )
+
+          foreach ($file in $required) {
+            if (-not (Test-Path $file)) {
+              throw "Missing Windows release file: $file"
+            }
+          }
+
           Compress-Archive -Path prmers_package\* `
             -DestinationPath prmers-windows.zip
+
+          $entries = tar.exe -tf prmers-windows.zip
+          $entries | Write-Host
+
+          if (-not ($entries -match "aevum_engine.dll")) {
+            throw "aevum_engine.dll is absent from prmers-windows.zip"
+          }
+
+          if (-not ($entries -match "tune.txt")) {
+            throw "tune.txt is absent from prmers-windows.zip"
+          }
 
       - name: Calculate SHA256 checksum
         shell: powershell
@@ -110,9 +319,29 @@ jobs:
           $h = Get-FileHash -Algorithm SHA256 -Path prmers-windows.zip
           $h.Hash | Out-File -Encoding ASCII -NoNewline prmers-windows.zip.sha256
 
+      - name: Upload Windows package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: prmers-windows
+          path: |
+            prmers-windows.zip
+            prmers-windows.zip.sha256
+          if-no-files-found: error
+
       - name: Upload release to GitHub
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          body: |
+            PrMers production release built from immutable tag `${{ github.ref_name }}`.
+            - PrMers source SHA: `${{ github.sha }}`
+            - Workflow run: `${{ github.run_id }}`
+            - Standalone Aevum tag: `v0.3.86-pass5-prp-max`
+            - Standalone Aevum source SHA: `affba4d777275df4d5670ad59e5e5c5f024e4379`
+            - Validated PRP speedup near p≈170M: Radeon VII +13.527%; RTX 3080 +8.646%.
+            - Supported release architectures: Linux x86_64, Windows x86_64, macOS x86_64 and arm64.
+            - Correctness and release preflight: PASS before tagging.
+            Platform artifacts include SHA256 checksum files for verification.
           files: |
             prmers-windows.zip
             prmers-windows.zip.sha256

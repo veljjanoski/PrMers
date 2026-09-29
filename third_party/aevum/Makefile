@@ -11,7 +11,8 @@
 # make all DEBUG=1 CXX=g++-12
 
 HOST_OS = $(shell uname -s)
-AEVUM_VERSION ?= v0.3.4
+AEVUM_VERSION ?= v0.3.87-pass5-prp-max
+MACOSX_DEPLOYMENT_TARGET ?= 12.0
 
 # Use the platform default C++20 compiler.  On macOS, /usr/bin/c++ is
 # AppleClang and is fully supported by the engine build.
@@ -20,10 +21,15 @@ CXX ?= c++
 DL_LIBS = -ldl
 ENGINE_LINK_FLAGS = -shared -Wl,-Bsymbolic
 EXAMPLE_RPATH = -Wl,-rpath,'$$ORIGIN/../$(ENGINE_BIN)'
+TEST_SECTION_FLAGS = -ffunction-sections -fdata-sections
+TEST_GC_LINK = -Wl,--gc-sections
 ifeq ($(HOST_OS), Darwin)
+export MACOSX_DEPLOYMENT_TARGET
+DARWIN_MIN_FLAGS = -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET)
 DL_LIBS =
-ENGINE_LINK_FLAGS = -dynamiclib
+ENGINE_LINK_FLAGS = -dynamiclib -Wl,-install_name,@rpath/libaevum_engine.so $(DARWIN_MIN_FLAGS)
 EXAMPLE_RPATH = -Wl,-rpath,@loader_path/../$(ENGINE_BIN)
+TEST_GC_LINK = -Wl,-dead_strip
 endif
 # Programs that load the engine with dlopen() need DL_LIBS, except on Windows where
 # LoadLibrary is used and MinGW has no libdl. The engine library itself never calls dlopen.
@@ -49,15 +55,9 @@ else
  endif
 endif
 
-COMMON_FLAGS = -Wall $(CUDAFLAGS) -std=c++20
+COMMON_FLAGS = -Wall $(CUDAFLAGS) -std=c++20 $(DARWIN_MIN_FLAGS)
 ifneq ($(HOST_OS),Darwin)
  COMMON_FLAGS += -static-libstdc++ -static-libgcc
- # A fully static link needs libOpenCL.a; MSYS2 ships only the import library libOpenCL.dll.a.
- ifeq ($(findstring MINGW,$(HOST_OS)),MINGW)
-  ifneq ($(wildcard $(shell $(CXX) -print-file-name=libOpenCL.a)),)
-   COMMON_FLAGS += -static
-  endif
- endif
 endif
 # -fext-numeric-literals
 
@@ -74,7 +74,7 @@ STRIP=-s
 
 endif
 
-SRCS1 = fs.cpp Trig.cpp TuneEntry.cpp Primes.cpp tune.cpp CycleFile.cpp TrigBufCache.cpp Event.cpp Queue.cpp TimeInfo.cpp Profile.cpp bundle.cpp Saver.cpp KernelCompiler.cpp Kernel.cpp gpuid.cpp File.cpp Proof.cpp log.cpp Worktodo.cpp common.cpp main.cpp Gpu.cpp clwrap.cpp Task.cpp timeutil.cpp Args.cpp state.cpp Signal.cpp FFTConfig.cpp AllocTrac.cpp sha3.cpp md5.cpp version.cpp EngineApi.cpp
+SRCS1 = fs.cpp Trig.cpp TuneEntry.cpp Primes.cpp tune.cpp CycleFile.cpp TrigBufCache.cpp Event.cpp Queue.cpp TimeInfo.cpp Profile.cpp bundle.cpp OpenCLSourceBuilder.cpp Saver.cpp KernelCompiler.cpp Kernel.cpp gpuid.cpp File.cpp Proof.cpp log.cpp Worktodo.cpp common.cpp main.cpp Gpu.cpp clwrap.cpp Task.cpp timeutil.cpp Args.cpp state.cpp Signal.cpp FFTConfig.cpp AllocTrac.cpp sha3.cpp md5.cpp version.cpp RuntimeAutotune.cpp PrpUseTune.cpp EngineApi.cpp
 
 SRCS2 = test.cpp
 
@@ -94,7 +94,7 @@ ENGINE_BIN = build-engine
 ENGINE_SRCS = $(filter-out main.cpp,$(SRCS1))
 ENGINE_OBJS = $(ENGINE_SRCS:%.cpp=$(ENGINE_BIN)/%.o)
 ENGINE_DEPDIR := $(ENGINE_BIN)/.d
-ENGINE_FLAGS = -O3 -DNDEBUG -Wall -std=c++20 -fPIC -fvisibility=hidden -DAEVUM_ENGINE_LIBRARY
+ENGINE_FLAGS = -O3 -DNDEBUG -Wall -std=c++20 $(DARWIN_MIN_FLAGS) -fPIC -fvisibility=hidden -DAEVUM_ENGINE_LIBRARY
 ENGINE_LIB = $(ENGINE_BIN)/libaevum_engine.so
 
 .PHONY: engine-lib
@@ -123,22 +123,16 @@ $(BIN)/aevum-amd: ${OBJS}
 
 .PHONY: test-small-factor-gpu
 test-small-factor-gpu: engine-lib
-	$(CXX) -O2 -std=c++20 tests/engine_small_factor_gpu_test.cpp $(DL_LIBS) -o build-tests/aevum-engine-small-factor-gpu-test
+	$(CXX) -O2 -std=c++20 $(DARWIN_MIN_FLAGS) tests/engine_small_factor_gpu_test.cpp $(DL_LIBS) -o build-tests/aevum-engine-small-factor-gpu-test
 	build-tests/aevum-engine-small-factor-gpu-test build-engine/libaevum_engine.so $${AEVUM_TEST_DEVICE:-0} .
 
-# Checks aevum_engine_square_loop (fused carry) against GMP and reports its speed-up.
+# Checks chained aevum_engine_square_mul calls (carryFused lead cache) and Lucas-Lehmer steps
+# against GMP and reports the time per squaring.
 .PHONY: test-square-loop-gpu
 test-square-loop-gpu: engine-lib
 	@mkdir -p build-tests
 	$(CXX) -O2 -std=c++20 tests/engine_square_loop_gpu_test.cpp $(LOADER_LIBS) -lgmp -o build-tests/aevum-engine-square-loop-gpu-test
 	build-tests/aevum-engine-square-loop-gpu-test build-engine/libaevum_engine.so $${AEVUM_TEST_DEVICE:-0} . $${AEVUM_TEST_EXPONENTS:-}
-
-# Times the FFT3161 shapes and kernel settings for an exponent (see tests/run_aevum_tune.sh at the top level).
-.PHONY: tune-gpu
-tune-gpu: engine-lib
-	@mkdir -p build-tests
-	$(CXX) -O2 -std=c++20 tests/engine_tune_gpu.cpp $(LOADER_LIBS) -lgmp -o build-tests/aevum-engine-tune-gpu
-	build-tests/aevum-engine-tune-gpu build-engine/libaevum_engine.so $${AEVUM_TEST_DEVICE:-0} . $${AEVUM_TUNE_EXPONENT:-136279841} $${AEVUM_TUNE_MODE:-full}
 
 clean:
 	rm -rf build-debug build-release build-cuda build-engine build-tests build-examples
@@ -181,6 +175,7 @@ include $(wildcard $(patsubst %,$(DEPDIR)/%.d,$(basename $(SRCS1))))
 
 
 ENGINE_API_TEST := build-tests/aevum-engine-api-load-test
+WORKLOAD_PLAN_AUDIT := build-tests/aevum-workload-plan-audit
 
 .PHONY: test-engine-api
 test-engine-api: engine-lib $(ENGINE_API_TEST)
@@ -188,30 +183,90 @@ test-engine-api: engine-lib $(ENGINE_API_TEST)
 
 $(ENGINE_API_TEST): tests/engine_api_load_test.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) -O2 -std=c++20 $< $(DL_LIBS) -o $@
+	$(CXX) -O2 -std=c++20 $(DARWIN_MIN_FLAGS) $< $(DL_LIBS) -o $@
+
+.PHONY: workload-plan-audit-build
+workload-plan-audit-build: engine-lib $(WORKLOAD_PLAN_AUDIT)
+
+$(WORKLOAD_PLAN_AUDIT): tests/workload_plan_audit.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) -O2 -std=c++20 $(DARWIN_MIN_FLAGS) -Wall -Wextra $< $(DL_LIBS) -o $@
 
 HOST_TEST := build-tests/aevum-host-gf-test
 STATE_TEST := build-tests/aevum-state-compact-test
+OPENCL_STANDARD_TEST := build-tests/aevum-opencl-standard-test
+MONOLITHIC_SOURCE_TEST := build-tests/aevum-opencl-monolithic-source-test
+TYPE4_PLAN_TEST := build-tests/aevum-type4-pfa9-plan-test
+AUTOTUNE_CACHE_TEST := build-tests/aevum-runtime-autotune-cache-test
 
-.PHONY: test test-host test-gpu
+.PHONY: test test-host test-gpu test-pfa9-lead-bridge-gpu
 
 test: test-host
 
-test-host: $(HOST_TEST) $(STATE_TEST)
+$(MONOLITHIC_SOURCE_TEST): tests/opencl_monolithic_source_test.cpp src/OpenCLSourceBuilder.cpp src/OpenCLSourceBuilder.h
+	@mkdir -p build-tests
+	$(CXX) -O2 -std=c++20 $(DARWIN_MIN_FLAGS) -Wall -Wextra tests/opencl_monolithic_source_test.cpp src/OpenCLSourceBuilder.cpp -o $@
+
+test-host: $(MONOLITHIC_SOURCE_TEST) $(HOST_TEST) $(STATE_TEST) $(OPENCL_STANDARD_TEST) $(TYPE4_PLAN_TEST) $(AUTOTUNE_CACHE_TEST)
+	$(MONOLITHIC_SOURCE_TEST)
+	bash tests/opencl12_syntax_test.sh
+	bash tests/pow2_type4_opencl_syntax.sh
+	python3 tests/pfa9_lead_bridge_source_test.py
+	bash tests/apple_opencl12_kernel_matrix_syntax.sh
+	python3 tests/apple_gf61_ffthin_staging_test.py
+	python3 tests/apple_gf31_width_staging_test.py
+	python3 tests/apple_fused_fftp_test.py
+	python3 tests/apple_gf61_scalar_mapping_test.py
+	python3 tests/apple_gf61_width_staging_test.py
+	python3 tests/apple_gf61_middlein_staging_test.py
+	python3 tests/apple_gf61_middlein_restrict_alias_test.py
+	python3 tests/apple_gf61_tail_two_kernel_policy_test.py
+	python3 tests/apple_gf61_tailzero_staging_test.py
+	python3 tests/apple_gf61_maintail_staging_test.py
+	python3 tests/apple_gf61_fftw_staging_test.py
+	python3 tests/apple_gf61_tailmul_staging_test.py
+	python3 tests/apple_prepared_tailmullow_staging_test.py
+	python3 tests/apple_gf61_middleout_staging_test.py
+	python3 tests/apple_readchecked_double_sync_test.py
+	python3 tests/apple_queue_marker_flush_test.py
+	python3 tests/apple_generic_mul_safety_test.py
+	python3 tests/apple_global_transpose_test.py
+	python3 tests/apple_canonical_set_u32_test.py
 	bash tests/source_audit.sh
+	python3 tests/gpu_init_order_test.py
+	python3 tests/engine_lead_cache_test.py
+	python3 tests/native_tune_compat_source_test.py
 	$(HOST_TEST)
 	$(STATE_TEST)
+	$(OPENCL_STANDARD_TEST)
+	$(TYPE4_PLAN_TEST)
+	$(AUTOTUNE_CACHE_TEST)
+
+$(AUTOTUNE_CACHE_TEST): tests/runtime_autotune_cache_test.cpp src/RuntimeAutotune.cpp src/RuntimeAutotune.h
+	@mkdir -p build-tests
+	$(CXX) -O2 -std=c++20 $(DARWIN_MIN_FLAGS) -Wall -Wextra -Isrc tests/runtime_autotune_cache_test.cpp src/RuntimeAutotune.cpp -o $@
+
+$(TYPE4_PLAN_TEST): tests/type4_pfa9_plan_test.cpp src/FFTConfig.cpp src/FFTConfig.h src/Args.cpp src/TuneEntry.cpp src/common.cpp src/fs.cpp src/File.cpp src/timeutil.cpp
+	@mkdir -p build-tests
+	$(CXX) -O2 -std=c++20 $(DARWIN_MIN_FLAGS) -Wall -Wextra $(TEST_SECTION_FLAGS) -Isrc \
+		tests/type4_pfa9_plan_test.cpp src/PrpUseTune.cpp src/RuntimeAutotune.cpp src/FFTConfig.cpp src/Args.cpp src/TuneEntry.cpp src/common.cpp src/fs.cpp src/File.cpp src/timeutil.cpp \
+		$(TEST_GC_LINK) -o $@
 
 $(HOST_TEST): tests/host_gf_test.cpp
 	@mkdir -p build-tests
-	$(CXX) -O3 -std=c++20 -Wall -Wextra $< -o $@
+	$(CXX) -O3 -std=c++20 $(DARWIN_MIN_FLAGS) -Wall -Wextra $< -o $@
 
 $(STATE_TEST): tests/state_compact_wrap_test.cpp src/state.cpp
 	@mkdir -p build-tests
-	$(CXX) -O2 -std=c++20 -Wall -Wextra -Isrc $^ -o $@
+	$(CXX) -O2 -std=c++20 $(DARWIN_MIN_FLAGS) -Wall -Wextra -Isrc $^ -o $@
+
+$(OPENCL_STANDARD_TEST): tests/opencl_standard_test.cpp src/OpenCLStandard.h
+	@mkdir -p build-tests
+	$(CXX) -O2 -std=c++20 $(DARWIN_MIN_FLAGS) -Wall -Wextra -Isrc $< -o $@
 
 test-gpu: $(BIN)/aevum
 	bash tests/gpu_prp_smoke.sh $(BIN)/aevum
+
 
 -include $(wildcard $(ENGINE_DEPDIR)/*.d)
 
@@ -224,9 +279,32 @@ examples: $(EXAMPLE_TARGETS)
 
 $(EXAMPLE_BIN)/%: examples/%.cpp examples/example_common.h src/EngineApi.h $(ENGINE_LIB)
 	@mkdir -p $(EXAMPLE_BIN)
-	$(CXX) -O2 -std=c++20 -Isrc $< $(ENGINE_LIB) $(EXAMPLE_RPATH) -o $@
+	$(CXX) -O2 -std=c++20 $(DARWIN_MIN_FLAGS) -Isrc $< $(ENGINE_LIB) $(EXAMPLE_RPATH) -o $@
 
 test-examples-gpu: examples
 	$(EXAMPLE_BIN)/fft_plans
 	$(EXAMPLE_BIN)/register_ops $${AEVUM_TEST_DEVICE:-0} .
 	$(EXAMPLE_BIN)/power_chain $${AEVUM_TEST_DEVICE:-0} .
+
+.PHONY: native-pfa-host-test native-pfa-build native-pfa-gpu-test
+native-pfa-host-test:
+	python3 tools/native_pfa_reference_test.py
+	python3 tools/native_pfa_source_audit.py
+	bash tests/native_pfa_opencl_syntax.sh
+
+native-pfa-build: engine-lib
+	python3 tools/native_pfa_plan_test.py build-engine/libaevum_engine.so
+	@mkdir -p build-tests
+	$(CXX) -O2 -std=c++20 -Wall -Wextra tests/native_pfa_engine_compare.cpp $(DL_LIBS) -o build-tests/native-pfa-engine-compare
+
+native-pfa-gpu-test: native-pfa-build native-pfa-host-test
+	bash scripts/test_native_pfa_gpu.sh $${AEVUM_TEST_DEVICE:-0} $${AEVUM_PFA_TEST_ITERS:-1}
+
+
+test-pfa9-lead-bridge-gpu: engine-lib
+	bash scripts/test_pfa9_lead_bridge_ubuntu.sh $${AEVUM_TEST_DEVICE:-1} $${AEVUM_TEST_EXPONENT:-175000039}
+
+.PHONY: test-prp-use
+test-prp-use: $(ENGINE_LIB)
+	$(CXX) -O2 -std=c++20 -Isrc tests/prp_use_test.cpp $(ENGINE_OBJS) $(OPENCL_LIBS) $(DL_LIBS) -o $(ENGINE_BIN)/prp-use-test
+	$(ENGINE_BIN)/prp-use-test

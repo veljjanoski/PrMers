@@ -17,6 +17,23 @@ void spin() {
 #endif
 }
 
+// PRPLL normally builds these kernels as OpenCL C 2.0 and uses C11-style
+// device-scope atomics. Apple exposes OpenCL C 1.2, where the equivalent
+// 32-bit global atomics use the legacy API. These macros expand back to the
+// original operations on OpenCL C 2.0, avoiding any non-Apple code-generation
+// or performance change. The existing surrounding memory fences are retained.
+#if __OPENCL_C_VERSION__ >= 200
+#define AEVUM_READY_STORE(ptr) \
+  atomic_store((atomic_uint *) (ptr), 1u)
+#define AEVUM_READY_LOAD(ptr) \
+  atomic_load_explicit((atomic_uint *) (ptr), memory_order_relaxed, memory_scope_device)
+#else
+#define AEVUM_READY_STORE(ptr) \
+  atomic_xchg((volatile global uint *) (ptr), 1u)
+#define AEVUM_READY_LOAD(ptr) \
+  atomic_add((volatile global uint *) (ptr), 0u)
+#endif
+
 // Increasing WMUL to 2 reduces carryShuttle activity.  This led to a 1% speedup on Titan V.  Testing on other GPUs is needed.
 #ifndef WMUL
 #define WMUL 2
@@ -220,12 +237,12 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
     // work_group_barrier(CLK_GLOBAL_MEM_FENCE, memory_scope_device);
     write_mem_fence(CLK_GLOBAL_MEM_FENCE);
     bar(G_W);
-    if (lowMe == 0) { atomic_store((atomic_uint *) &ready[gr], 1); }
+    if (lowMe == 0) { AEVUM_READY_STORE(&ready[gr]); }
 #else
     write_mem_fence(CLK_GLOBAL_MEM_FENCE);
     if (lowMe % WAVEFRONT == 0) {
       u32 pos = gr * (G_W / WAVEFRONT) + lowMe / WAVEFRONT;
-      atomic_store((atomic_uint *) &ready[pos], 1);
+      AEVUM_READY_STORE(&ready[pos]);
     }
 #endif
   }
@@ -252,7 +269,7 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
   // Wait until our carries are ready
   if (me < G_W) {
 #if OLD_FENCE
-    if (me == 0) { do { spin(); } while(!atomic_load_explicit((atomic_uint *) &ready[gr - 1], memory_order_relaxed, memory_scope_device)); }
+    if (me == 0) { do { spin(); } while(!AEVUM_READY_LOAD(&ready[gr - 1])); }
     // work_group_barrier(CLK_GLOBAL_MEM_FENCE, memory_scope_device);
     bar();
     read_mem_fence(CLK_GLOBAL_MEM_FENCE);
@@ -261,7 +278,7 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
 #else
     u32 pos = (gr - 1) * (G_W / WAVEFRONT) + me / WAVEFRONT;
     if (me % WAVEFRONT == 0) {
-      do { spin(); } while(atomic_load_explicit((atomic_uint *) &ready[pos], memory_order_relaxed, memory_scope_device) == 0);
+      do { spin(); } while(AEVUM_READY_LOAD(&ready[pos]) == 0);
     }
     mem_fence(CLK_GLOBAL_MEM_FENCE);
     // Clear carry ready flag for next iteration
@@ -296,18 +313,27 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
     }
   }
 
-  // Apply each 32 or 64 bit carry to the 2 words
+  // Apply each 32 or 64 bit carry to the 2 words.  Then apply the weights -- or if FUSE_WEIGHT_BUTTERFLY apply weights only for the "low" i indices.
   for (i32 i = 0; i < NW; ++i) {
     bool biglit0 = frac_bits <= FRAC_BPW_HI;
     wu[i] = carryFinal(wu[i], carry[i], biglit0);
-    u[i] = U2(u[i].x * wu[i].x, u[i].y * wu[i].y);
-
+    if (!FUSE_WEIGHT_BUTTERFLY || i < NW/2) u[i] = U2(u[i].x * wu[i].x, u[i].y * wu[i].y);
     // Generate frac_bits for next pair
     frac_bits += frac_bits_bigstep;
   }
 
+  // To save a few F64 ops we do the first butterfly of the radix-4 or radix-8 step here using FMA to apply half of the weights.
+  if (FUSE_WEIGHT_BUTTERFLY) {
+    for (i32 i = 0; i < NW/2; ++i) {
+      T2 weights = u[i + NW/2];                                     // The weights are still in the high half of u
+      u[i + NW/2] = U2((T) wu[i + NW/2].x, (T) wu[i + NW/2].y);     // The FFT values to apply the weights to are in wu.
+      X2ad(u[i], u[i + NW/2], weights);                             // Compute u[i] +/- weights * u[i+NW/2]
+    }
+   }
+
   dependentLaunch();   // Next kernel will be fftMiddleInFP64
 
+  // fft_WIDTH2 itself knows (via its callnum) to skip the first radix butterfly when FUSE_WEIGHT_BUTTERFLY is set.
   fft_WIDTH2(lds, u, smallTrig, WMUL, lowMe);
   writeCarryFusedLine(u, out, line, lowMe);
 }
@@ -432,12 +458,12 @@ KERNEL(G_W * WMUL) carryFused(P(F2) out, CP(F2) in, u32 posROE, P(i64) carryShut
     // work_group_barrier(CLK_GLOBAL_MEM_FENCE, memory_scope_device);
     write_mem_fence(CLK_GLOBAL_MEM_FENCE);
     bar(G_W);
-    if (lowMe == 0) { atomic_store((atomic_uint *) &ready[gr], 1); }
+    if (lowMe == 0) { AEVUM_READY_STORE(&ready[gr]); }
 #else
     write_mem_fence(CLK_GLOBAL_MEM_FENCE);
     if (lowMe % WAVEFRONT == 0) { 
       u32 pos = gr * (G_W / WAVEFRONT) + lowMe / WAVEFRONT;
-      atomic_store((atomic_uint *) &ready[pos], 1);
+      AEVUM_READY_STORE(&ready[pos]);
     }
 #endif
   }
@@ -456,7 +482,7 @@ KERNEL(G_W * WMUL) carryFused(P(F2) out, CP(F2) in, u32 posROE, P(i64) carryShut
   // Wait until our carries are ready
   if (me < G_W) {
 #if OLD_FENCE
-    if (me == 0) { do { spin(); } while(!atomic_load_explicit((atomic_uint *) &ready[gr - 1], memory_order_relaxed, memory_scope_device)); }
+    if (me == 0) { do { spin(); } while(!AEVUM_READY_LOAD(&ready[gr - 1])); }
     // work_group_barrier(CLK_GLOBAL_MEM_FENCE, memory_scope_device);
     bar();
     read_mem_fence(CLK_GLOBAL_MEM_FENCE);
@@ -465,7 +491,7 @@ KERNEL(G_W * WMUL) carryFused(P(F2) out, CP(F2) in, u32 posROE, P(i64) carryShut
 #else
     u32 pos = (gr - 1) * (G_W / WAVEFRONT) + me / WAVEFRONT;
     if (me % WAVEFRONT == 0) {
-      do { spin(); } while(atomic_load_explicit((atomic_uint *) &ready[pos], memory_order_relaxed, memory_scope_device) == 0);
+      do { spin(); } while(AEVUM_READY_LOAD(&ready[pos]) == 0);
     }
     mem_fence(CLK_GLOBAL_MEM_FENCE);
     // Clear carry ready flag for next iteration
@@ -576,7 +602,7 @@ KERNEL(G_W * WMUL) carryFused(P(GF31) out, CP(GF31) in, u32 posROE, P(i64) carry
   // Weight is 2^[ceil(qj / n) - qj/n] where j is the word index, q is the Mersenne exponent, and n is the number of words.
   // Weights can be applied with shifts because 2 is the 60th root GF31.
   // Let s be the shift amount for word 1.  The shift amount for word x is ceil(x * (s - 1) + num_big_words_less_than_x) % 31.
-  const u32 log2_root_two = (u32) (((1ULL << 30) / NWORDS) % 31);
+  const u32 log2_root_two = M31_LOG2_ROOT_TWO;
   const u32 bigword_weight_shift = (NWORDS - EXP % NWORDS) * log2_root_two % 31;
   const u32 bigword_weight_shift_minus1 = (bigword_weight_shift + 30) % 31;
 
@@ -595,7 +621,7 @@ KERNEL(G_W * WMUL) carryFused(P(GF31) out, CP(GF31) in, u32 posROE, P(i64) carry
 
   // We also adjust shift amount for the fact that NTT returns results multiplied by 2*NWORDS.
   const u32 log2_NWORDS = (WIDTH == 256 ? 8 : WIDTH == 512 ? 9 : WIDTH == 1024 ? 10 : 12) +
-                          (MIDDLE == 1 ? 0 : MIDDLE == 2 ? 1 : MIDDLE == 4 ? 2 : MIDDLE == 8 ? 3 : 4) +
+                          (PFA_RADIX ? 0 : (MIDDLE == 1 ? 0 : MIDDLE == 2 ? 1 : MIDDLE == 4 ? 2 : MIDDLE == 8 ? 3 : 4)) +
                           (SMALL_HEIGHT == 256 ? 8 : SMALL_HEIGHT == 512 ? 9 : SMALL_HEIGHT == 1024 ? 10 : 12) + 1;
   weight_shift = weight_shift + log2_NWORDS + 1;
   if (weight_shift > 31) weight_shift -= 31;
@@ -650,12 +676,12 @@ KERNEL(G_W * WMUL) carryFused(P(GF31) out, CP(GF31) in, u32 posROE, P(i64) carry
     // work_group_barrier(CLK_GLOBAL_MEM_FENCE, memory_scope_device);
     write_mem_fence(CLK_GLOBAL_MEM_FENCE);
     bar(G_W);
-    if (lowMe == 0) { atomic_store((atomic_uint *) &ready[gr], 1); }
+    if (lowMe == 0) { AEVUM_READY_STORE(&ready[gr]); }
 #else
     write_mem_fence(CLK_GLOBAL_MEM_FENCE);
     if (lowMe % WAVEFRONT == 0) { 
       u32 pos = gr * (G_W / WAVEFRONT) + lowMe / WAVEFRONT;
-      atomic_store((atomic_uint *) &ready[pos], 1);
+      AEVUM_READY_STORE(&ready[pos]);
     }
 #endif
   }
@@ -674,7 +700,7 @@ KERNEL(G_W * WMUL) carryFused(P(GF31) out, CP(GF31) in, u32 posROE, P(i64) carry
   // Wait until our carries are ready
   if (me < G_W) {
 #if OLD_FENCE
-    if (me == 0) { do { spin(); } while(!atomic_load_explicit((atomic_uint *) &ready[gr - 1], memory_order_relaxed, memory_scope_device)); }
+    if (me == 0) { do { spin(); } while(!AEVUM_READY_LOAD(&ready[gr - 1])); }
     // work_group_barrier(CLK_GLOBAL_MEM_FENCE, memory_scope_device);
     bar();
     read_mem_fence(CLK_GLOBAL_MEM_FENCE);
@@ -683,7 +709,7 @@ KERNEL(G_W * WMUL) carryFused(P(GF31) out, CP(GF31) in, u32 posROE, P(i64) carry
 #else
     u32 pos = (gr - 1) * (G_W / WAVEFRONT) + me / WAVEFRONT;
     if (me % WAVEFRONT == 0) {
-      do { spin(); } while(atomic_load_explicit((atomic_uint *) &ready[pos], memory_order_relaxed, memory_scope_device) == 0);
+      do { spin(); } while(AEVUM_READY_LOAD(&ready[pos]) == 0);
     }
     mem_fence(CLK_GLOBAL_MEM_FENCE);
     // Clear carry ready flag for next iteration
@@ -798,7 +824,7 @@ KERNEL(G_W * WMUL) carryFused(P(GF61) out, CP(GF61) in, u32 posROE, P(i64) carry
   // Weight is 2^[ceil(qj / n) - qj/n] where j is the word index, q is the Mersenne exponent, and n is the number of words.
   // Weights can be applied with shifts because 2 is the 60th root GF61.
   // Let s be the shift amount for word 1.  The shift amount for word x is ceil(x * (s - 1) + num_big_words_less_than_x) % 61.
-  const u32 log2_root_two = (u32) (((1ULL << 60) / NWORDS) % 61);
+  const u32 log2_root_two = M61_LOG2_ROOT_TWO;
   const u32 bigword_weight_shift = (NWORDS - EXP % NWORDS) * log2_root_two % 61;
   const u32 bigword_weight_shift_minus1 = (bigword_weight_shift + 60) % 61;
 
@@ -817,7 +843,7 @@ KERNEL(G_W * WMUL) carryFused(P(GF61) out, CP(GF61) in, u32 posROE, P(i64) carry
 
   // We also adjust shift amount for the fact that NTT returns results multiplied by 2*NWORDS.
   const u32 log2_NWORDS = (WIDTH == 256 ? 8 : WIDTH == 512 ? 9 : WIDTH == 1024 ? 10 : 12) +
-                          (MIDDLE == 1 ? 0 : MIDDLE == 2 ? 1 : MIDDLE == 4 ? 2 : MIDDLE == 8 ? 3 : 4) +
+                          (PFA_RADIX ? 0 : (MIDDLE == 1 ? 0 : MIDDLE == 2 ? 1 : MIDDLE == 4 ? 2 : MIDDLE == 8 ? 3 : 4)) +
                           (SMALL_HEIGHT == 256 ? 8 : SMALL_HEIGHT == 512 ? 9 : SMALL_HEIGHT == 1024 ? 10 : 12) + 1;
   weight_shift = weight_shift + log2_NWORDS + 1;
   if (weight_shift > 61) weight_shift -= 61;
@@ -872,12 +898,12 @@ KERNEL(G_W * WMUL) carryFused(P(GF61) out, CP(GF61) in, u32 posROE, P(i64) carry
     // work_group_barrier(CLK_GLOBAL_MEM_FENCE, memory_scope_device);
     write_mem_fence(CLK_GLOBAL_MEM_FENCE);
     bar(G_W);
-    if (lowMe == 0) { atomic_store((atomic_uint *) &ready[gr], 1); }
+    if (lowMe == 0) { AEVUM_READY_STORE(&ready[gr]); }
 #else
     write_mem_fence(CLK_GLOBAL_MEM_FENCE);
     if (lowMe % WAVEFRONT == 0) { 
       u32 pos = gr * (G_W / WAVEFRONT) + lowMe / WAVEFRONT;
-      atomic_store((atomic_uint *) &ready[pos], 1);
+      AEVUM_READY_STORE(&ready[pos]);
     }
 #endif
   }
@@ -896,7 +922,7 @@ KERNEL(G_W * WMUL) carryFused(P(GF61) out, CP(GF61) in, u32 posROE, P(i64) carry
   // Wait until our carries are ready
   if (me < G_W) {
 #if OLD_FENCE
-    if (me == 0) { do { spin(); } while(!atomic_load_explicit((atomic_uint *) &ready[gr - 1], memory_order_relaxed, memory_scope_device)); }
+    if (me == 0) { do { spin(); } while(!AEVUM_READY_LOAD(&ready[gr - 1])); }
     // work_group_barrier(CLK_GLOBAL_MEM_FENCE, memory_scope_device);
     bar();
     read_mem_fence(CLK_GLOBAL_MEM_FENCE);
@@ -905,7 +931,7 @@ KERNEL(G_W * WMUL) carryFused(P(GF61) out, CP(GF61) in, u32 posROE, P(i64) carry
 #else
     u32 pos = (gr - 1) * (G_W / WAVEFRONT) + me / WAVEFRONT;
     if (me % WAVEFRONT == 0) {
-      do { spin(); } while(atomic_load_explicit((atomic_uint *) &ready[pos], memory_order_relaxed, memory_scope_device) == 0);
+      do { spin(); } while(AEVUM_READY_LOAD(&ready[pos]) == 0);
     }
     mem_fence(CLK_GLOBAL_MEM_FENCE);
     // Clear carry ready flag for next iteration
@@ -1033,7 +1059,7 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
 
   // Weight is 2^[ceil(qj / n) - qj/n] where j is the word index, q is the Mersenne exponent, and n is the number of words.
   // Let s be the shift amount for word 1.  The shift amount for word x is ceil(x * (s - 1) + num_big_words_less_than_x) % 31.
-  const u32 log2_root_two = (u32) (((1ULL << 30) / NWORDS) % 31);
+  const u32 log2_root_two = M31_LOG2_ROOT_TWO;
   const u32 bigword_weight_shift = (NWORDS - EXP % NWORDS) * log2_root_two % 31;
   const u32 bigword_weight_shift_minus1 = (bigword_weight_shift + 30) % 31;
 
@@ -1052,7 +1078,7 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
 
   // We also adjust shift amount for the fact that NTT returns results multiplied by 2*NWORDS.
   const u32 log2_NWORDS = (WIDTH == 256 ? 8 : WIDTH == 512 ? 9 : WIDTH == 1024 ? 10 : 12) +
-                          (MIDDLE == 1 ? 0 : MIDDLE == 2 ? 1 : MIDDLE == 4 ? 2 : MIDDLE == 8 ? 3 : 4) +
+                          (PFA_RADIX ? 0 : (MIDDLE == 1 ? 0 : MIDDLE == 2 ? 1 : MIDDLE == 4 ? 2 : MIDDLE == 8 ? 3 : 4)) +
                           (SMALL_HEIGHT == 256 ? 8 : SMALL_HEIGHT == 512 ? 9 : SMALL_HEIGHT == 1024 ? 10 : 12) + 1;
   weight_shift = weight_shift + log2_NWORDS + 1;
   if (weight_shift > 31) weight_shift -= 31;
@@ -1109,12 +1135,12 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
     // work_group_barrier(CLK_GLOBAL_MEM_FENCE, memory_scope_device);
     write_mem_fence(CLK_GLOBAL_MEM_FENCE);
     bar(G_W);
-    if (lowMe == 0) { atomic_store((atomic_uint *) &ready[gr], 1); }
+    if (lowMe == 0) { AEVUM_READY_STORE(&ready[gr]); }
 #else
     write_mem_fence(CLK_GLOBAL_MEM_FENCE);
     if (lowMe % WAVEFRONT == 0) { 
       u32 pos = gr * (G_W / WAVEFRONT) + lowMe / WAVEFRONT;
-      atomic_store((atomic_uint *) &ready[pos], 1);
+      AEVUM_READY_STORE(&ready[pos]);
     }
 #endif
   }
@@ -1141,7 +1167,7 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
   // Wait until our carries are ready
   if (me < G_W) {
 #if OLD_FENCE
-    if (me == 0) { do { spin(); } while(!atomic_load_explicit((atomic_uint *) &ready[gr - 1], memory_order_relaxed, memory_scope_device)); }
+    if (me == 0) { do { spin(); } while(!AEVUM_READY_LOAD(&ready[gr - 1])); }
     // work_group_barrier(CLK_GLOBAL_MEM_FENCE, memory_scope_device);
     bar();
     read_mem_fence(CLK_GLOBAL_MEM_FENCE);
@@ -1150,7 +1176,7 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
 #else
     u32 pos = (gr - 1) * (G_W / WAVEFRONT) + me / WAVEFRONT;
     if (me % WAVEFRONT == 0) {
-      do { spin(); } while(atomic_load_explicit((atomic_uint *) &ready[pos], memory_order_relaxed, memory_scope_device) == 0);
+      do { spin(); } while(AEVUM_READY_LOAD(&ready[pos]) == 0);
     }
     mem_fence(CLK_GLOBAL_MEM_FENCE);
     // Clear carry ready flag for next iteration
@@ -1297,7 +1323,7 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
 
   // Weight is 2^[ceil(qj / n) - qj/n] where j is the word index, q is the Mersenne exponent, and n is the number of words.
   // Let s be the shift amount for word 1.  The shift amount for word x is ceil(x * (s - 1) + num_big_words_less_than_x) % 31.
-  const u32 log2_root_two = (u32) (((1ULL << 30) / NWORDS) % 31);
+  const u32 log2_root_two = M31_LOG2_ROOT_TWO;
   const u32 bigword_weight_shift = (NWORDS - EXP % NWORDS) * log2_root_two % 31;
   const u32 bigword_weight_shift_minus1 = (bigword_weight_shift + 30) % 31;
 
@@ -1316,7 +1342,7 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
 
   // We also adjust shift amount for the fact that NTT returns results multiplied by 2*NWORDS.
   const u32 log2_NWORDS = (WIDTH == 256 ? 8 : WIDTH == 512 ? 9 : WIDTH == 1024 ? 10 : 12) +
-                          (MIDDLE == 1 ? 0 : MIDDLE == 2 ? 1 : MIDDLE == 4 ? 2 : MIDDLE == 8 ? 3 : 4) +
+                          (PFA_RADIX ? 0 : (MIDDLE == 1 ? 0 : MIDDLE == 2 ? 1 : MIDDLE == 4 ? 2 : MIDDLE == 8 ? 3 : 4)) +
                           (SMALL_HEIGHT == 256 ? 8 : SMALL_HEIGHT == 512 ? 9 : SMALL_HEIGHT == 1024 ? 10 : 12) + 1;
   weight_shift = weight_shift + log2_NWORDS + 1;
   if (weight_shift > 31) weight_shift -= 31;
@@ -1373,12 +1399,12 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
     // work_group_barrier(CLK_GLOBAL_MEM_FENCE, memory_scope_device);
     write_mem_fence(CLK_GLOBAL_MEM_FENCE);
     bar(G_W);
-    if (lowMe == 0) { atomic_store((atomic_uint *) &ready[gr], 1); }
+    if (lowMe == 0) { AEVUM_READY_STORE(&ready[gr]); }
 #else
     write_mem_fence(CLK_GLOBAL_MEM_FENCE);
     if (lowMe % WAVEFRONT == 0) { 
       u32 pos = gr * (G_W / WAVEFRONT) + lowMe / WAVEFRONT;
-      atomic_store((atomic_uint *) &ready[pos], 1);
+      AEVUM_READY_STORE(&ready[pos]);
     }
 #endif
   }
@@ -1397,7 +1423,7 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
   // Wait until our carries are ready
   if (me < G_W) {
 #if OLD_FENCE
-    if (me == 0) { do { spin(); } while(!atomic_load_explicit((atomic_uint *) &ready[gr - 1], memory_order_relaxed, memory_scope_device)); }
+    if (me == 0) { do { spin(); } while(!AEVUM_READY_LOAD(&ready[gr - 1])); }
     // work_group_barrier(CLK_GLOBAL_MEM_FENCE, memory_scope_device);
     bar();
     read_mem_fence(CLK_GLOBAL_MEM_FENCE);
@@ -1406,7 +1432,7 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
 #else
     u32 pos = (gr - 1) * (G_W / WAVEFRONT) + me / WAVEFRONT;
     if (me % WAVEFRONT == 0) {
-      do { spin(); } while(atomic_load_explicit((atomic_uint *) &ready[pos], memory_order_relaxed, memory_scope_device) == 0);
+      do { spin(); } while(AEVUM_READY_LOAD(&ready[pos]) == 0);
     }
     mem_fence(CLK_GLOBAL_MEM_FENCE);
     // Clear carry ready flag for next iteration
@@ -1556,7 +1582,7 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
 
   // Weight is 2^[ceil(qj / n) - qj/n] where j is the word index, q is the Mersenne exponent, and n is the number of words.
   // Let s be the shift amount for word 1.  The shift amount for word x is ceil(x * (s - 1) + num_big_words_less_than_x) % 61.
-  const u32 log2_root_two = (u32) (((1ULL << 60) / NWORDS) % 61);
+  const u32 log2_root_two = M61_LOG2_ROOT_TWO;
   const u32 bigword_weight_shift = (NWORDS - EXP % NWORDS) * log2_root_two % 61;
   const u32 bigword_weight_shift_minus1 = (bigword_weight_shift + 60) % 61;
 
@@ -1575,7 +1601,7 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
 
   // We also adjust shift amount for the fact that NTT returns results multiplied by 2*NWORDS.
   const u32 log2_NWORDS = (WIDTH == 256 ? 8 : WIDTH == 512 ? 9 : WIDTH == 1024 ? 10 : 12) +
-                          (MIDDLE == 1 ? 0 : MIDDLE == 2 ? 1 : MIDDLE == 4 ? 2 : MIDDLE == 8 ? 3 : 4) +
+                          (PFA_RADIX ? 0 : (MIDDLE == 1 ? 0 : MIDDLE == 2 ? 1 : MIDDLE == 4 ? 2 : MIDDLE == 8 ? 3 : 4)) +
                           (SMALL_HEIGHT == 256 ? 8 : SMALL_HEIGHT == 512 ? 9 : SMALL_HEIGHT == 1024 ? 10 : 12) + 1;
   weight_shift = weight_shift + log2_NWORDS + 1;
   if (weight_shift > 61) weight_shift -= 61;
@@ -1633,12 +1659,12 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
     // work_group_barrier(CLK_GLOBAL_MEM_FENCE, memory_scope_device);
     write_mem_fence(CLK_GLOBAL_MEM_FENCE);
     bar(G_W);
-    if (lowMe == 0) { atomic_store((atomic_uint *) &ready[gr], 1); }
+    if (lowMe == 0) { AEVUM_READY_STORE(&ready[gr]); }
 #else
     write_mem_fence(CLK_GLOBAL_MEM_FENCE);
     if (lowMe % WAVEFRONT == 0) { 
       u32 pos = gr * (G_W / WAVEFRONT) + lowMe / WAVEFRONT;
-      atomic_store((atomic_uint *) &ready[pos], 1);
+      AEVUM_READY_STORE(&ready[pos]);
     }
 #endif
   }
@@ -1657,7 +1683,7 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
   // Wait until our carries are ready
   if (me < G_W) {
 #if OLD_FENCE
-    if (me == 0) { do { spin(); } while(!atomic_load_explicit((atomic_uint *) &ready[gr - 1], memory_order_relaxed, memory_scope_device)); }
+    if (me == 0) { do { spin(); } while(!AEVUM_READY_LOAD(&ready[gr - 1])); }
     // work_group_barrier(CLK_GLOBAL_MEM_FENCE, memory_scope_device);
     bar();
     read_mem_fence(CLK_GLOBAL_MEM_FENCE);
@@ -1666,7 +1692,7 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
 #else
     u32 pos = (gr - 1) * (G_W / WAVEFRONT) + me / WAVEFRONT;
     if (me % WAVEFRONT == 0) {
-      do { spin(); } while(atomic_load_explicit((atomic_uint *) &ready[pos], memory_order_relaxed, memory_scope_device) == 0);
+      do { spin(); } while(AEVUM_READY_LOAD(&ready[pos]) == 0);
     }
     mem_fence(CLK_GLOBAL_MEM_FENCE);
     // Clear carry ready flag for next iteration
@@ -1797,10 +1823,10 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
 
   // Weight is 2^[ceil(qj / n) - qj/n] where j is the word index, q is the Mersenne exponent, and n is the number of words.
   // Let s be the shift amount for word 1.  The shift amount for word x is ceil(x * (s - 1) + num_big_words_less_than_x) % 31.
-  const u32 m31_log2_root_two = (u32) (((1ULL << 30) / NWORDS) % 31);
+  const u32 m31_log2_root_two = M31_LOG2_ROOT_TWO;
   const u32 m31_bigword_weight_shift = (NWORDS - EXP % NWORDS) * m31_log2_root_two % 31;
   const u32 m31_bigword_weight_shift_minus1 = (m31_bigword_weight_shift + 30) % 31;
-  const u32 m61_log2_root_two = (u32) (((1ULL << 60) / NWORDS) % 61);
+  const u32 m61_log2_root_two = M61_LOG2_ROOT_TWO;
   const u32 m61_bigword_weight_shift = (NWORDS - EXP % NWORDS) * m61_log2_root_two % 61;
   const u32 m61_bigword_weight_shift_minus1 = (m61_bigword_weight_shift + 60) % 61;
 
@@ -1826,7 +1852,7 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
 
   // We also adjust shift amount for the fact that NTT returns results multiplied by 2*NWORDS.
   const u32 log2_NWORDS = (WIDTH == 256 ? 8 : WIDTH == 512 ? 9 : WIDTH == 1024 ? 10 : 12) +
-                          (MIDDLE == 1 ? 0 : MIDDLE == 2 ? 1 : MIDDLE == 4 ? 2 : MIDDLE == 8 ? 3 : 4) +
+                          (PFA_RADIX ? 0 : (MIDDLE == 1 ? 0 : MIDDLE == 2 ? 1 : MIDDLE == 4 ? 2 : MIDDLE == 8 ? 3 : 4)) +
                           (SMALL_HEIGHT == 256 ? 8 : SMALL_HEIGHT == 512 ? 9 : SMALL_HEIGHT == 1024 ? 10 : 12) + 1;
   m31_weight_shift = adjust_m31_weight_shift(m31_weight_shift + log2_NWORDS + 1);
   m61_weight_shift = adjust_m61_weight_shift(m61_weight_shift + log2_NWORDS + 1);
@@ -1888,12 +1914,12 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
     // work_group_barrier(CLK_GLOBAL_MEM_FENCE, memory_scope_device);
     write_mem_fence(CLK_GLOBAL_MEM_FENCE);
     bar(G_W);
-    if (lowMe == 0) { atomic_store((atomic_uint *) &ready[gr], 1); }
+    if (lowMe == 0) { AEVUM_READY_STORE(&ready[gr]); }
 #else
     write_mem_fence(CLK_GLOBAL_MEM_FENCE);
     if (lowMe % WAVEFRONT == 0) {
       u32 pos = gr * (G_W / WAVEFRONT) + lowMe / WAVEFRONT;
-      atomic_store((atomic_uint *) &ready[pos], 1);
+      AEVUM_READY_STORE(&ready[pos]);
     }
 #endif
   }
@@ -1912,7 +1938,7 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
   // Wait until our carries are ready
   if (me < G_W) {
 #if OLD_FENCE
-    if (me == 0) { do { spin(); } while(!atomic_load_explicit((atomic_uint *) &ready[gr - 1], memory_order_relaxed, memory_scope_device)); }
+    if (me == 0) { do { spin(); } while(!AEVUM_READY_LOAD(&ready[gr - 1])); }
     // work_group_barrier(CLK_GLOBAL_MEM_FENCE, memory_scope_device);
     bar();
     read_mem_fence(CLK_GLOBAL_MEM_FENCE);
@@ -1921,7 +1947,7 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
 #else
     u32 pos = (gr - 1) * (G_W / WAVEFRONT) + me / WAVEFRONT;
     if (me % WAVEFRONT == 0) {
-      do { spin(); } while(atomic_load_explicit((atomic_uint *) &ready[pos], memory_order_relaxed, memory_scope_device) == 0);
+      do { spin(); } while(AEVUM_READY_LOAD(&ready[pos]) == 0);
     }
     mem_fence(CLK_GLOBAL_MEM_FENCE);
     // Clear carry ready flag for next iteration
@@ -2082,10 +2108,10 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
 
   // Weight is 2^[ceil(qj / n) - qj/n] where j is the word index, q is the Mersenne exponent, and n is the number of words.
   // Let s be the shift amount for word 1.  The shift amount for word x is ceil(x * (s - 1) + num_big_words_less_than_x) % 31.
-  const u32 m31_log2_root_two = (u32) (((1ULL << 30) / NWORDS) % 31);
+  const u32 m31_log2_root_two = M31_LOG2_ROOT_TWO;
   const u32 m31_bigword_weight_shift = (NWORDS - EXP % NWORDS) * m31_log2_root_two % 31;
   const u32 m31_bigword_weight_shift_minus1 = (m31_bigword_weight_shift + 30) % 31;
-  const u32 m61_log2_root_two = (u32) (((1ULL << 60) / NWORDS) % 61);
+  const u32 m61_log2_root_two = M61_LOG2_ROOT_TWO;
   const u32 m61_bigword_weight_shift = (NWORDS - EXP % NWORDS) * m61_log2_root_two % 61;
   const u32 m61_bigword_weight_shift_minus1 = (m61_bigword_weight_shift + 60) % 61;
 
@@ -2111,7 +2137,7 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
 
   // We also adjust shift amount for the fact that NTT returns results multiplied by 2*NWORDS.
   const u32 log2_NWORDS = (WIDTH == 256 ? 8 : WIDTH == 512 ? 9 : WIDTH == 1024 ? 10 : 12) +
-                          (MIDDLE == 1 ? 0 : MIDDLE == 2 ? 1 : MIDDLE == 4 ? 2 : MIDDLE == 8 ? 3 : 4) +
+                          (PFA_RADIX ? 0 : (MIDDLE == 1 ? 0 : MIDDLE == 2 ? 1 : MIDDLE == 4 ? 2 : MIDDLE == 8 ? 3 : 4)) +
                           (SMALL_HEIGHT == 256 ? 8 : SMALL_HEIGHT == 512 ? 9 : SMALL_HEIGHT == 1024 ? 10 : 12) + 1;
   m31_weight_shift = adjust_m31_weight_shift(m31_weight_shift + log2_NWORDS + 1);
   m61_weight_shift = adjust_m61_weight_shift(m61_weight_shift + log2_NWORDS + 1);
@@ -2175,12 +2201,12 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
     // work_group_barrier(CLK_GLOBAL_MEM_FENCE, memory_scope_device);
     write_mem_fence(CLK_GLOBAL_MEM_FENCE);
     bar(G_W);
-    if (lowMe == 0) { atomic_store((atomic_uint *) &ready[gr], 1); }
+    if (lowMe == 0) { AEVUM_READY_STORE(&ready[gr]); }
 #else
     write_mem_fence(CLK_GLOBAL_MEM_FENCE);
     if (lowMe % WAVEFRONT == 0) { 
       u32 pos = gr * (G_W / WAVEFRONT) + lowMe / WAVEFRONT;
-      atomic_store((atomic_uint *) &ready[pos], 1);
+      AEVUM_READY_STORE(&ready[pos]);
     }
 #endif
   }
@@ -2199,7 +2225,7 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
   // Wait until our carries are ready
   if (me < G_W) {
 #if OLD_FENCE
-    if (me == 0) { do { spin(); } while(!atomic_load_explicit((atomic_uint *) &ready[gr - 1], memory_order_relaxed, memory_scope_device)); }
+    if (me == 0) { do { spin(); } while(!AEVUM_READY_LOAD(&ready[gr - 1])); }
     // work_group_barrier(CLK_GLOBAL_MEM_FENCE, memory_scope_device);
     bar();
     read_mem_fence(CLK_GLOBAL_MEM_FENCE);
@@ -2208,7 +2234,7 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
 #else
     u32 pos = (gr - 1) * (G_W / WAVEFRONT) + me / WAVEFRONT;
     if (me % WAVEFRONT == 0) {
-      do { spin(); } while(atomic_load_explicit((atomic_uint *) &ready[pos], memory_order_relaxed, memory_scope_device) == 0);
+      do { spin(); } while(AEVUM_READY_LOAD(&ready[pos]) == 0);
     }
     mem_fence(CLK_GLOBAL_MEM_FENCE);
     // Clear carry ready flag for next iteration

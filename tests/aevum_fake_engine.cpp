@@ -10,11 +10,9 @@ struct FakeRuntime {
     std::uint32_t exponent;
     std::uint64_t modulus;
     std::vector<std::uint64_t> regs;
-    std::size_t transform;
 };
 
 static thread_local std::string last_error;
-static std::string use_settings;   // from aevum_engine_set_use
 
 static FakeRuntime* checked(void* handle, std::size_t reg) {
     auto* rt = static_cast<FakeRuntime*>(handle);
@@ -38,13 +36,6 @@ int aevum_engine_resolve_fft(std::uint32_t exponent, const char*, char* output, 
     return 1;
 }
 
-#ifndef AEVUM_FAKE_LEGACY   // older plugins export neither set_use nor square_loop
-int aevum_engine_set_use(const char* settings) {
-    use_settings = settings ? settings : "";
-    return 1;
-}
-#endif
-
 void* aevum_engine_create(std::uint32_t exponent, std::size_t register_count,
                           std::uint32_t, int, const char*, const char*) {
     if (exponent < 3 || exponent > 62 || register_count == 0) return nullptr;
@@ -52,14 +43,11 @@ void* aevum_engine_create(std::uint32_t exponent, std::size_t register_count,
     rt->exponent = exponent;
     rt->modulus = (std::uint64_t(1) << exponent) - 1;
     rt->regs.assign(register_count, 0);
-    // A FAKE_TRANSFORM=<n> kernel setting shows the test that -aevum-use reached the plugin.
-    const std::size_t pos = use_settings.find("FAKE_TRANSFORM=");
-    rt->transform = pos == std::string::npos ? 8 : std::stoul(use_settings.substr(pos + 15));
     return rt;
 }
 
 void aevum_engine_destroy(void* handle) { delete static_cast<FakeRuntime*>(handle); }
-std::size_t aevum_engine_transform_size(void* handle) { return static_cast<FakeRuntime*>(handle)->transform; }
+std::size_t aevum_engine_transform_size(void*) { return 8; }
 std::size_t aevum_engine_word_count(void*) { return 1; }
 int aevum_engine_sync(void*) { return 1; }
 
@@ -87,17 +75,6 @@ int aevum_engine_square_mul(void* handle, std::size_t reg, std::uint32_t factor)
     const unsigned __int128 v = static_cast<unsigned __int128>(rt->regs[reg]) * rt->regs[reg] * factor;
     rt->regs[reg] = static_cast<std::uint64_t>(v % rt->modulus); return 1;
 }
-#ifndef AEVUM_FAKE_LEGACY
-int aevum_engine_square_loop(void* handle, std::size_t reg, std::uint64_t count, int mode) {
-    auto* rt = checked(handle, reg); if (!rt || (mode != 0 && mode != 1)) return 0;
-    for (std::uint64_t i = 0; i < count; ++i) {
-        const unsigned __int128 v = static_cast<unsigned __int128>(rt->regs[reg]) * rt->regs[reg];
-        rt->regs[reg] = static_cast<std::uint64_t>(v % rt->modulus);
-        if (mode == 1) rt->regs[reg] = (rt->regs[reg] + rt->modulus - 2) % rt->modulus;
-    }
-    return 1;
-}
-#endif
 int aevum_engine_mul(void* handle, std::size_t dst, std::size_t src, std::uint32_t factor) {
     auto* rt = checked(handle, dst); if (!rt || !checked(handle, src)) return 0;
     const unsigned __int128 v = static_cast<unsigned __int128>(rt->regs[dst]) * rt->regs[src] * factor;

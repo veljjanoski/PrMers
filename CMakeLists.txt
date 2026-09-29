@@ -1,4 +1,9 @@
 cmake_minimum_required(VERSION 3.10)
+
+if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+  set(CMAKE_OSX_DEPLOYMENT_TARGET "12.0" CACHE STRING "Minimum supported macOS version" FORCE)
+endif()
+
 project(PrMers LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -12,6 +17,23 @@ pkg_check_modules(GMPXX REQUIRED IMPORTED_TARGET gmpxx)
 
 file(GLOB_RECURSE SOURCES src/*.cpp)
 add_executable(prmers ${SOURCES})
+
+# v99.97+ GM-ECM legacy symbol remap: keep CMake/MSVC linkage identical to the Unix Makefile.
+# The historical implementation remains in RunGaussianMersenneFactor.cpp, but
+# is compiled as runGaussianMersenneECMLegacy(). The public wrapper lives in
+# RunGaussianMersenneEcmFast.cpp. Without this per-source forced include,
+# Windows gets LNK2005 + LNK2019 at link time.
+if(MSVC)
+  set_source_files_properties(
+    src/modes/RunGaussianMersenneFactor.cpp
+    PROPERTIES COMPILE_OPTIONS "/FI${PROJECT_SOURCE_DIR}/include/core/GmEcmLegacyRename.hpp;/FI${PROJECT_SOURCE_DIR}/include/core/GmPm1LegacyRename.hpp"
+  )
+else()
+  set_source_files_properties(
+    src/modes/RunGaussianMersenneFactor.cpp
+    PROPERTIES COMPILE_OPTIONS "-include;${PROJECT_SOURCE_DIR}/include/core/GmEcmLegacyRename.hpp;-include;${PROJECT_SOURCE_DIR}/include/core/GmPm1LegacyRename.hpp"
+  )
+endif()
 
 target_include_directories(prmers PRIVATE
   ${PROJECT_SOURCE_DIR}/include

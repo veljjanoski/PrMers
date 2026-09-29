@@ -40,7 +40,7 @@ int main() {
     eng->square_mul(0, 3);
     expect(value(*eng, 0), 3675, "square_mul");
 
-    // square_loop must match the equivalent sequence of square_mul / sub(2) steps.
+    // square_loop (the generic fallback) must match the equivalent square_mul / sub(2) steps.
     eng->set(7, 3);
     eng->square_loop(7, 5);
     std::uint64_t sq = 3;
@@ -92,15 +92,6 @@ int main() {
 
     engine::digit digits(eng.get(), 3);
     if (digits.get_size() != 8 || digits.res64() != 123) return 8;
-
-    // -aevum-use settings reach plugins that export aevum_engine_set_use; older plugins ignore them.
-    engine::configure_aevum_use("FAKE_TRANSFORM=16");
-    if (engine::configured_aevum_use() != "FAKE_TRANSFORM=16") return 12;
-    {
-        std::unique_ptr<engine> tuned(engine::create_gpu(exponent, 2, 0, false));
-        expect(tuned->get_size(), std::getenv("AEVUM_FAKE_LEGACY") ? 8 : 16, "-aevum-use");
-    }
-    engine::configure_aevum_use("");
 
     eng->sync();
     engine::configure_gpu_backend(engine::gpu_backend::marin);

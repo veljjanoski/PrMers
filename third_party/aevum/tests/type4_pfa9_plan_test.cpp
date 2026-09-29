@@ -1,0 +1,178 @@
+#include "FFTConfig.h"
+#include "Args.h"
+#include <cstdarg>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <stdexcept>
+
+// Minimal host-only stubs needed by FFTConfig.cpp.  Unused policy functions are
+// removed by --gc-sections in the test target.
+void log(const char*, ...) {}
+std::vector<std::string> split(const std::string& text, char delimiter) {
+  std::vector<std::string> result;
+  std::stringstream stream(text);
+  std::string part;
+  while (std::getline(stream, part, delimiter)) result.push_back(part);
+  return result;
+}
+
+int main() {
+  Args args(true);
+  FFTConfig plan("pfa9:4:512:9:512:202");
+  if (plan.shape.fft_type != FFT323161 || plan.pfa_radix != 9 ||
+      plan.shape.width != 512 || plan.shape.middle != 9 ||
+      plan.shape.height != 512 || plan.variant != 202 ||
+      plan.size() != 4718592 || plan.spec() != "pfa9:4:512:9:512:202") {
+    throw std::runtime_error("FFT323161 PFA9 plan resolution mismatch");
+  }
+#if defined(__APPLE__)
+  bool appleType4Rejected = false;
+  try { (void) FFTConfig::bestFit(args, 175000039, "4:512:8:512:202"); }
+  catch (const std::runtime_error&) { appleType4Rejected = true; }
+  if (!appleType4Rejected)
+    throw std::runtime_error("Apple explicit Type4 plan must be rejected before kernel creation");
+#else
+  FFTConfig pow2 = FFTConfig::bestFit(args, 175000039, "4:512:8:512:202");
+  if (pow2.shape.fft_type != FFT323161 || pow2.isPfa() ||
+      pow2.shape.width != 512 || pow2.shape.middle != 8 ||
+      pow2.shape.height != 512 || pow2.variant != 202 ||
+      pow2.size() != 4194304 || pow2.spec() != "4:512:8:512:202") {
+    throw std::runtime_error("power-of-two FFT323161 plan resolution mismatch");
+  }
+#endif
+
+  bool rejected = false;
+  try { FFTConfig invalid("pfa3:4:512:3:512:202"); (void) invalid; }
+  catch (...) { rejected = true; }
+  if (!rejected) throw std::runtime_error("FFT323161 radix-3 must be rejected");
+#if defined(__APPLE__)
+  bool applePfaRejected = false;
+  try { (void) FFTConfig::bestFit(args, 175000039, "pfa:9"); }
+  catch (const std::runtime_error&) { applePfaRejected = true; }
+  if (!applePfaRejected)
+    throw std::runtime_error("Apple native PFA plan must be rejected before kernel creation");
+#else
+  FFTConfig adaptive = FFTConfig::bestFit(args, 175000039, "pfa9:4:512:9:512:202");
+  if (adaptive.shape.fft_type != FFT3161 || adaptive.pfa_radix != 9 ||
+      adaptive.variant != 202 || adaptive.size() != 4718592 || !adaptive.adaptive_type4_elided)
+    throw std::runtime_error("adaptive type-4 PFA9 did not select exact paired-NTT fast path");
+
+  FFTConfig full = FFTConfig::bestFit(args, 175000039, "pfa9full:4:512:9:512:202");
+  if (full.shape.fft_type != FFT323161 || full.adaptive_type4_elided)
+    throw std::runtime_error("full type-4 PFA9 plan was unexpectedly elided");
+
+  FFTConfig auto9 = FFTConfig::bestFit(args, 175000039, "pfa:9");
+  if (auto9.pfa_radix != 9 || auto9.variant != 202)
+    throw std::runtime_error("forced radix-9 did not select optimized variant 202");
+#endif
+
+  FFTConfig throughput = FFTConfig::bestFit(args, 175000039, "throughput:auto");
+#if defined(__APPLE__)
+  // Apple excludes both Type4 and native-PFA runtime paths.  throughput:auto
+  // must therefore retain the staged stock FFT3161 plan.
+  FFTConfig appleStock = FFTConfig::bestFit(args, 175000039, "");
+  if (throughput.isPfa() ||
+      throughput.spec() != appleStock.spec() ||
+      throughput.size() != appleStock.size()) {
+    std::cerr << "macOS throughput selected " << throughput.spec()
+              << " size=" << throughput.size()
+              << ", expected stock " << appleStock.spec()
+              << " size=" << appleStock.size() << std::endl;
+    throw std::runtime_error(
+        "macOS throughput selector did not retain the stock FFT3161 plan");
+  }
+#else
+  if (throughput.spec() != "4:512:8:512:202" ||
+      throughput.size() != 4194304) {
+    std::cerr << "throughput selected " << throughput.spec()
+              << " size=" << throughput.size() << std::endl;
+    throw std::runtime_error(
+        "throughput selector did not choose the measured 4M FFT323161 lead-cache plan");
+  }
+#endif
+
+
+  FFTConfig selectorPrp = FFTConfig::bestFit(args, 175000039, "throughput:prp");
+  FFTConfig selectorLl = FFTConfig::bestFit(args, 175000039, "throughput:ll");
+  FFTConfig selectorPm1 = FFTConfig::bestFit(args, 55050557, "throughput:pm1");
+  FFTConfig selectorEcm = FFTConfig::bestFit(args, 55050557, "throughput:ecm");
+#if defined(__APPLE__)
+  if (selectorPrp.spec() != appleStock.spec() ||
+      selectorLl.spec() != appleStock.spec() ||
+      selectorPm1.shape.fft_type != FFT3161 ||
+      selectorEcm.shape.fft_type != FFT3161) {
+    throw std::runtime_error("Apple workload selectors must retain stock FFT3161");
+  }
+#else
+  if (selectorPrp.spec() != "4:512:8:512:202")
+    throw std::runtime_error("PRP selector did not choose 4:512:8:512:202");
+  if (selectorLl.spec() != "4:1K:2:1K:202")
+    throw std::runtime_error("LL selector did not choose 4:1K:2:1K:202");
+  if (selectorPm1.spec() != "4:256:16:256:202")
+    throw std::runtime_error("P-1 selector did not choose 4:256:16:256:202");
+  FFTConfig ecmStock = FFTConfig::bestFit(args, 55050557, "");
+  if (selectorEcm.spec() != ecmStock.spec())
+    throw std::runtime_error("ECM selector must remain on stock Type1 until a gain is proven");
+#endif
+
+  FFTConfig pow2auto = FFTConfig::bestFit(args, 175000039, "pow2:auto");
+#if defined(__APPLE__)
+  // pow2:auto falls back to the normal stock plan when Apple excludes the
+  // experimental FFT323161 lead-cache family.
+  if (pow2auto.isPfa() ||
+      pow2auto.spec() != appleStock.spec() ||
+      pow2auto.size() != appleStock.size()) {
+    std::cerr << "macOS pow2:auto selected " << pow2auto.spec()
+              << " size=" << pow2auto.size()
+              << ", expected stock " << appleStock.spec()
+              << " size=" << appleStock.size() << std::endl;
+    throw std::runtime_error(
+        "macOS power-of-two selector did not retain the stock plan");
+  }
+#else
+  if (pow2auto.spec() != "4:512:8:512:202")
+    throw std::runtime_error(
+        "power-of-two selector did not choose the measured FFT323161 plan");
+#endif
+
+  // Issue #36: tune.txt produced by Aevum must be reused automatically.
+  // Explicit -fft remains higher priority.  An unprefixed legacy GPUOwl entry
+  // is legacy GPUOwl data and must not leak into the stock Aevum NTT selector.
+  namespace fs = std::filesystem;
+  const fs::path savedCwd = fs::current_path();
+  const fs::path tuneDir = fs::temp_directory_path() / "aevum-issue36-tune-selection";
+  fs::remove_all(tuneDir);
+  fs::create_directories(tuneDir);
+  fs::current_path(tuneDir);
+
+  {
+    std::ofstream f("tune.txt");
+    f << "203.0 1:512:8:512:202 # RTX5090 issue36 measured plan\n";
+  }
+  FFTConfig tuned = FFTConfig::bestFit(args, 147000001, "");
+  if (tuned.spec() != "1:512:8:512:202") {
+    std::cerr << "tune.txt selected " << tuned.spec() << std::endl;
+    throw std::runtime_error("Aevum did not reuse compatible FFT3161 tune.txt entry");
+  }
+
+  FFTConfig forced = FFTConfig::bestFit(args, 147000001, "1:512:8:512:101");
+  if (forced.spec() != "1:512:8:512:101")
+    throw std::runtime_error("explicit -fft did not override tune.txt");
+
+  {
+    std::ofstream f("tune.txt", std::ios::trunc);
+    f << "100.0 512:8:512:3:0 # legacy GPUOwl entry with historical H=3 variant\n";
+    f << "101.0 1K:9:512:1:1 # legacy GPUOwl 1K entry must not look like type 1\n";
+  }
+  FFTConfig filtered = FFTConfig::bestFit(args, 147000001, "");
+  if (filtered.shape.fft_type != FFT3161)
+    throw std::runtime_error("legacy unprefixed GPUOwl tune entry leaked into Aevum NTT selection");
+
+  fs::current_path(savedCwd);
+  fs::remove_all(tuneDir);
+
+  std::cout << "Aevum workload-aware throughput selectors, Apple stock safety and PFA9 plan test passed" << std::endl;
+  return 0;
+}

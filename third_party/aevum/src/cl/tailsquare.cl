@@ -1,9 +1,24 @@
 // Copyright (C) Mihai Preda and George Woltman
 
+// The separate PRP specialization uses the existing double-wide, one-kernel tail.
+#if AEVUM_PRP_MIDDLE1
+#undef TAIL_KERNELS
+#define TAIL_KERNELS 2
+#endif
+
 #include "base.cl"
 #include "fftheight.cl"
 #include "tailutil.cl"
 #include "middle.cl"
+
+#if AEVUM_PRP_MIDDLE1
+#include "prp_middle1.cl"
+#define AEVUM_PRP_TRIG_ARG , Trig middleTrig
+#define readTailFusedLine(in,u,line,me) prpReadMiddle1(in,u,line,me,middleTrig)
+#define writeTailFusedLine(u,out,line,me) prpWriteMiddle1(u,out,line,me,middleTrig)
+#else
+#define AEVUM_PRP_TRIG_ARG
+#endif
 
 #if FFT_FP64
 
@@ -55,7 +70,7 @@ void OVERLOAD pairSq(u32 N, T2 *u, T2 *v, T2 base_squared, bool special) {
 #if !SINGLE_KERNEL
 // The kernel tailSquareZero handles the special cases in tailSquare, i.e. the lines 0 and H/2
 // This kernel is launched with 2 workgroups (handling line 0, resp. H/2)
-KERNEL(G_H) tailSquareZero(P(T2) out, CP(T2) in, Trig smallTrig) {
+KERNEL(G_H) tailSquareZero(P(T2) out, CP(T2) in, Trig smallTrig AEVUM_PRP_TRIG_ARG) {
   local T2 lds[LDS_BYTES / sizeof(T2)];
   T2 u[NH];
   u32 H = ND / SMALL_HEIGHT;
@@ -94,7 +109,7 @@ KERNEL(G_H) tailSquareZero(P(T2) out, CP(T2) in, Trig smallTrig) {
 
 #if SINGLE_WIDE
 
-KERNEL(G_H) tailSquare(P(T2) out, CP(T2) in, Trig smallTrig) {
+KERNEL(G_H) tailSquare(P(T2) out, CP(T2) in, Trig smallTrig AEVUM_PRP_TRIG_ARG) {
   local T2 lds[LDS_BYTES / sizeof(T2)];
 
   T2 u[NH], v[NH];
@@ -207,7 +222,7 @@ void OVERLOAD pairSq2_special(T2 *u, T2 base_squared) {
   }
 }
 
-KERNEL(G_H * 2) tailSquare(P(T2) out, CP(T2) in, Trig smallTrig) {
+KERNEL(G_H * 2) tailSquare(P(T2) out, CP(T2) in, Trig smallTrig AEVUM_PRP_TRIG_ARG) {
   local T2 lds[2 * LDS_BYTES / sizeof(T2)];
 
   T2 u[NH];
@@ -345,7 +360,7 @@ void OVERLOAD pairSq(u32 N, F2 *u, F2 *v, F2 base_squared, bool special) {
 #if !SINGLE_KERNEL
 // The kernel tailSquareZero handles the special cases in tailSquare, i.e. the lines 0 and H/2
 // This kernel is launched with 2 workgroups (handling line 0, resp. H/2)
-KERNEL(G_H) tailSquareZero(P(T2) out, CP(T2) in, Trig smallTrig) {
+KERNEL(G_H) tailSquareZero(P(T2) out, CP(T2) in, Trig smallTrig AEVUM_PRP_TRIG_ARG) {
   local F2 lds[LDS_BYTES / sizeof(F2)];
   F2 u[NH];
   u32 H = ND / SMALL_HEIGHT;
@@ -354,11 +369,21 @@ KERNEL(G_H) tailSquareZero(P(T2) out, CP(T2) in, Trig smallTrig) {
   P(F2) outF2 = (P(F2)) out;
   TrigFP32 smallTrigF2 = (TrigFP32) smallTrig;
 
-  // This kernel in executed in two workgroups.
-  u32 which = get_group_id(0);
+#if PFA_RADIX
+  const u32 which = get_group_id(0);
+  const u32 row = which >> 1;
+  const bool upper = (which & 1u) != 0;
+  assert(row < PFA_RADIX);
+  const u32 binary_line = upper ? (WIDTH / 2u) : 0u;
+  const u32 line = row * WIDTH + binary_line;
+  const bool bump = !upper;
+#else
+  const u32 which = get_group_id(0);
   assert(which < 2);
-
-  u32 line = which ? (H/2) : 0;
+  const u32 line = which ? (H/2) : 0;
+  const u32 binary_line = line;
+  const bool bump = !which;
+#endif
   u32 me = get_local_id(0);
 
   dependentLaunch();       // Next kernel will be tailSquareFP32 which must dependentLaunchWait before reading data from fftMiddleInFP32
@@ -366,12 +391,17 @@ KERNEL(G_H) tailSquareZero(P(T2) out, CP(T2) in, Trig smallTrig) {
 
   readTailFusedLine(inF2, u, line, me);
 
+#if PFA_RADIX
+  F2 trig = slowTrig_N(binary_line + me * WIDTH,
+                        (WIDTH * SMALL_HEIGHT) / NH);
+#else
   F2 trig = slowTrig_N(line + me * H, ND / NH);
+#endif
 
   fft_HEIGHT1(lds, u, smallTrigF2, 1, me);
-  reverse(lds, u + NH/2, !which);
-  pairSq(NH/2, u,   u + NH/2, trig, !which);
-  reverse(lds, u + NH/2, !which);
+  reverse(lds, u + NH/2, bump);
+  pairSq(NH/2, u,   u + NH/2, trig, bump);
+  reverse(lds, u + NH/2, bump);
 
   fft_HEIGHT1(lds, u, smallTrigF2, 1, me);
   writeTailFusedLine(u, outF2, transPos(line, MIDDLE, WIDTH), me);
@@ -380,7 +410,7 @@ KERNEL(G_H) tailSquareZero(P(T2) out, CP(T2) in, Trig smallTrig) {
 
 #if SINGLE_WIDE
 
-KERNEL(G_H) tailSquare(P(T2) out, CP(T2) in, Trig smallTrig) {
+KERNEL(G_H) tailSquare(P(T2) out, CP(T2) in, Trig smallTrig AEVUM_PRP_TRIG_ARG) {
   local F2 lds[LDS_BYTES / sizeof(F2)];
 
   CP(F2) inF2 = (CP(F2)) in;
@@ -391,12 +421,21 @@ KERNEL(G_H) tailSquare(P(T2) out, CP(T2) in, Trig smallTrig) {
 
   u32 H = ND / SMALL_HEIGHT;
 
-#if SINGLE_KERNEL
+#if PFA_RADIX
+  const u32 per_row = WIDTH / 2u - 1u;
+  const u32 group = get_group_id(0);
+  const u32 row = group / per_row;
+  const u32 binary_line = group - row * per_row + 1u;
+  const u32 line1 = row * WIDTH + binary_line;
+  const u32 line2 = row * WIDTH + (WIDTH - binary_line);
+#elif SINGLE_KERNEL
   u32 line1 = get_group_id(0);
   u32 line2 = line1 ? H - line1 : (H / 2);
+  const u32 binary_line = line1;
 #else
   u32 line1 = get_group_id(0) + 1;
   u32 line2 = H - line1;
+  const u32 binary_line = line1;
 #endif
   u32 memline1 = transPos(line1, MIDDLE, WIDTH);
   u32 memline2 = transPos(line2, MIDDLE, WIDTH);
@@ -414,7 +453,12 @@ KERNEL(G_H) tailSquare(P(T2) out, CP(T2) in, Trig smallTrig) {
 
   // Compute trig values from scratch.  Good on GPUs with high FP throughput.
 #if TAIL_TRIGS32 == 2
+#if PFA_RADIX
+  F2 trig = slowTrig_N(binary_line + me * WIDTH,
+                        (WIDTH * SMALL_HEIGHT) / NH);
+#else
   F2 trig = slowTrig_N(line1 + me * H, ND / NH);
+#endif
 
   // Do a little bit of memory access and a little bit of FP math.
 #elif TAIL_TRIGS32 == 1
@@ -423,7 +467,7 @@ KERNEL(G_H) tailSquare(P(T2) out, CP(T2) in, Trig smallTrig) {
   u32 height_trigs = SMALL_HEIGHT*5;
   // Read a hopefully cached line of data and one non-cached F2 per line
   F2 trig = TFLOAD(&smallTrigF2[height_trigs + me]);                    // Trig values for line zero, should be cached
-  F2 mult = TSLOAD(&smallTrigF2[height_trigs + G_H + line1]);           // Line multiplier
+  F2 mult = TSLOAD(&smallTrigF2[height_trigs + G_H + binary_line]);           // Line multiplier
   trig = cmulFancy(trig, mult);
 
   // On consumer-grade GPUs, it is likely beneficial to read all trig values.
@@ -432,7 +476,7 @@ KERNEL(G_H) tailSquare(P(T2) out, CP(T2) in, Trig smallTrig) {
   // The trig values used here are pre-computed and stored after the fft_HEIGHT trig values.
   u32 height_trigs = SMALL_HEIGHT*5;
   // Read pre-computed trig values
-  F2 trig = TOLOAD(&smallTrigF2[height_trigs + line1*G_H + me]);
+  F2 trig = TOLOAD(&smallTrigF2[height_trigs + binary_line*G_H + me]);
 #endif
 
 #if SINGLE_KERNEL
@@ -489,7 +533,7 @@ void OVERLOAD pairSq2_special(F2 *u, F2 base_squared) {
   }
 }
 
-KERNEL(G_H * 2) tailSquare(P(T2) out, CP(T2) in, Trig smallTrig) {
+KERNEL(G_H * 2) tailSquare(P(T2) out, CP(T2) in, Trig smallTrig AEVUM_PRP_TRIG_ARG) {
   local F2 lds[2 * LDS_BYTES / sizeof(F2)];
 
   CP(F2) inF2 = (CP(F2)) in;
@@ -627,7 +671,7 @@ void OVERLOAD pairSq(u32 N, GF31 *u, GF31 *v, GF31 base_squared, bool special) {
 #if !SINGLE_KERNEL
 // The kernel tailSquareZero handles the special cases in tailSquare, i.e. the lines 0 and H/2
 // This kernel is launched with 2 workgroups (handling line 0, resp. H/2)
-KERNEL(G_H) tailSquareZeroGF31(P(T2) out, CP(T2) in, Trig smallTrig) {
+KERNEL(G_H) tailSquareZeroGF31(P(T2) out, CP(T2) in, Trig smallTrig AEVUM_PRP_TRIG_ARG) {
   local GF31 lds[LDS_BYTES / sizeof(GF31)];
 
   CP(GF31) in31 = (CP(GF31)) (in + DISTGF31);
@@ -637,11 +681,21 @@ KERNEL(G_H) tailSquareZeroGF31(P(T2) out, CP(T2) in, Trig smallTrig) {
   GF31 u[NH];
   u32 H = ND / SMALL_HEIGHT;
 
-  // This kernel in executed in two workgroups.
-  u32 which = get_group_id(0);
+#if PFA_RADIX
+  const u32 which = get_group_id(0);
+  const u32 row = which >> 1;
+  const bool upper = (which & 1u) != 0;
+  assert(row < PFA_RADIX);
+  const u32 binary_line = upper ? (WIDTH / 2u) : 0u;
+  const u32 line = row * WIDTH + binary_line;
+  const bool bump = !upper;
+#else
+  const u32 which = get_group_id(0);
   assert(which < 2);
-
-  u32 line = which ? (H/2) : 0;
+  const u32 line = which ? (H/2) : 0;
+  const u32 binary_line = line;
+  const bool bump = !which;
+#endif
   u32 me = get_local_id(0);
 
   dependentLaunch();       // Next kernel will be tailSquareGF31 which must dependentLaunchWait before reading data from fftMiddleInGF31
@@ -655,23 +709,23 @@ KERNEL(G_H) tailSquareZeroGF31(P(T2) out, CP(T2) in, Trig smallTrig) {
 #if TAIL_TRIGS31 >= 1
   GF31 trig = TFLOAD(&smallTrig31[height_trigs + me]);
 #if SINGLE_WIDE
-  GF31 mult = TSLOAD(&smallTrig31[height_trigs + G_H + line]);
+  GF31 mult = TSLOAD(&smallTrig31[height_trigs + G_H + binary_line]);
 #else
   GF31 mult = TSLOAD(&smallTrig31[height_trigs + G_H + which]);
 #endif
   trig = cmul(trig, mult);
 #else
 #if SINGLE_WIDE
-  GF31 trig = TOLOAD(&smallTrig31[height_trigs + line*G_H + me]);
+  GF31 trig = TOLOAD(&smallTrig31[height_trigs + binary_line*G_H + me]);
 #else
   GF31 trig = TOLOAD(&smallTrig31[height_trigs + which*G_H + me]);
 #endif
 #endif
 
   fft_HEIGHT1(lds, u, smallTrig31, 1, me);
-  reverse(lds, u + NH/2, !which);
-  pairSq(NH/2, u,   u + NH/2, trig, !which);
-  reverse(lds, u + NH/2, !which);
+  reverse(lds, u + NH/2, bump);
+  pairSq(NH/2, u,   u + NH/2, trig, bump);
+  reverse(lds, u + NH/2, bump);
 
   fft_HEIGHT2(lds, u, smallTrig31, 1, me);
   writeTailFusedLine(u, out31, transPos(line, MIDDLE, WIDTH), me);
@@ -680,7 +734,7 @@ KERNEL(G_H) tailSquareZeroGF31(P(T2) out, CP(T2) in, Trig smallTrig) {
 
 #if SINGLE_WIDE
 
-KERNEL(G_H) tailSquareGF31(P(T2) out, CP(T2) in, Trig smallTrig) {
+KERNEL(G_H) tailSquareGF31(P(T2) out, CP(T2) in, Trig smallTrig AEVUM_PRP_TRIG_ARG) {
   local GF31 lds[LDS_BYTES / sizeof(GF31)];
 
   CP(GF31) in31 = (CP(GF31)) (in + DISTGF31);
@@ -691,12 +745,21 @@ KERNEL(G_H) tailSquareGF31(P(T2) out, CP(T2) in, Trig smallTrig) {
 
   u32 H = ND / SMALL_HEIGHT;
 
-#if SINGLE_KERNEL
+#if PFA_RADIX
+  const u32 per_row = WIDTH / 2u - 1u;
+  const u32 group = get_group_id(0);
+  const u32 row = group / per_row;
+  const u32 binary_line = group - row * per_row + 1u;
+  const u32 line1 = row * WIDTH + binary_line;
+  const u32 line2 = row * WIDTH + (WIDTH - binary_line);
+#elif SINGLE_KERNEL
   u32 line1 = get_group_id(0);
   u32 line2 = line1 ? H - line1 : (H / 2);
+  const u32 binary_line = line1;
 #else
   u32 line1 = get_group_id(0) + 1;
   u32 line2 = H - line1;
+  const u32 binary_line = line1;
 #endif
   u32 memline1 = transPos(line1, MIDDLE, WIDTH);
   u32 memline2 = transPos(line2, MIDDLE, WIDTH);
@@ -719,7 +782,7 @@ KERNEL(G_H) tailSquareGF31(P(T2) out, CP(T2) in, Trig smallTrig) {
   u32 height_trigs = SMALL_HEIGHT*1;
   // Read a hopefully cached line of data and one non-cached GF31 per line
   GF31 trig = TFLOAD(&smallTrig31[height_trigs + me]);                    // Trig values for line zero, should be cached
-  GF31 mult = TSLOAD(&smallTrig31[height_trigs + G_H + line1]);           // Line multiplier
+  GF31 mult = TSLOAD(&smallTrig31[height_trigs + G_H + binary_line]);           // Line multiplier
   trig = cmul(trig, mult);
 
   // On consumer-grade GPUs, it is likely beneficial to read all trig values.
@@ -728,7 +791,7 @@ KERNEL(G_H) tailSquareGF31(P(T2) out, CP(T2) in, Trig smallTrig) {
   // The trig values used here are pre-computed and stored after the fft_HEIGHT trig values.
   u32 height_trigs = SMALL_HEIGHT*1;
   // Read pre-computed trig values
-  GF31 trig = TOLOAD(&smallTrig31[height_trigs + line1*G_H + me]);
+  GF31 trig = TOLOAD(&smallTrig31[height_trigs + binary_line*G_H + me]);
 #endif
 
 #if SINGLE_KERNEL
@@ -784,7 +847,7 @@ void OVERLOAD pairSq2_special(GF31 *u, GF31 base_squared) {
   }
 }
 
-KERNEL(G_H * 2) tailSquareGF31(P(T2) out, CP(T2) in, Trig smallTrig) {
+KERNEL(G_H * 2) tailSquareGF31(P(T2) out, CP(T2) in, Trig smallTrig AEVUM_PRP_TRIG_ARG) {
   local GF31 lds[2 * LDS_BYTES / sizeof(GF31)];
 
   CP(GF31) in31 = (CP(GF31)) (in + DISTGF31);
@@ -976,7 +1039,7 @@ void OVERLOAD pairSq(u32 N, GF61 *u, GF61 *v, GF61 base_squared, bool special) {
 #if !SINGLE_KERNEL
 // The kernel tailSquareZero handles the special cases in tailSquare, i.e. the lines 0 and H/2
 // This kernel is launched with 2 workgroups (handling line 0, resp. H/2)
-KERNEL(G_H) tailSquareZeroGF61(P(T2) out, CP(T2) in, Trig smallTrig) {
+KERNEL(G_H) tailSquareZeroGF61(P(T2) out, CP(T2) in, Trig smallTrig AEVUM_PRP_TRIG_ARG) {
   local GF61 lds[LDS_BYTES / sizeof(GF61)];
 
   CP(GF61) in61 = (CP(GF61)) (in + DISTGF61);
@@ -986,11 +1049,21 @@ KERNEL(G_H) tailSquareZeroGF61(P(T2) out, CP(T2) in, Trig smallTrig) {
   GF61 u[NH];
   u32 H = ND / SMALL_HEIGHT;
 
-  // This kernel in executed in two workgroups.
-  u32 which = get_group_id(0);
+#if PFA_RADIX
+  const u32 which = get_group_id(0);
+  const u32 row = which >> 1;
+  const bool upper = (which & 1u) != 0;
+  assert(row < PFA_RADIX);
+  const u32 binary_line = upper ? (WIDTH / 2u) : 0u;
+  const u32 line = row * WIDTH + binary_line;
+  const bool bump = !upper;
+#else
+  const u32 which = get_group_id(0);
   assert(which < 2);
-
-  u32 line = which ? (H/2) : 0;
+  const u32 line = which ? (H/2) : 0;
+  const u32 binary_line = line;
+  const bool bump = !which;
+#endif
   u32 me = get_local_id(0);
 
   dependentLaunch();       // Next kernel will be tailSquareGF61 which must dependentLaunchWait before reading data from fftMiddleInGF61
@@ -1004,32 +1077,559 @@ KERNEL(G_H) tailSquareZeroGF61(P(T2) out, CP(T2) in, Trig smallTrig) {
 #if TAIL_TRIGS61 >= 1
   GF61 trig = TFLOAD(&smallTrig61[height_trigs + me]);
 #if SINGLE_WIDE
-  GF61 mult = TSLOAD(&smallTrig61[height_trigs + G_H + line]);
+  GF61 mult = TSLOAD(&smallTrig61[height_trigs + G_H + binary_line]);
 #else
   GF61 mult = TSLOAD(&smallTrig61[height_trigs + G_H + which]);
 #endif
   trig = cmul(trig, mult);
 #else
 #if SINGLE_WIDE
-  GF61 trig = TOLOAD(&smallTrig61[height_trigs + line*G_H + me]);
+  GF61 trig = TOLOAD(&smallTrig61[height_trigs + binary_line*G_H + me]);
 #else
   GF61 trig = TOLOAD(&smallTrig61[height_trigs + which*G_H + me]);
 #endif
 #endif
 
   fft_HEIGHT1(lds, u, smallTrig61, 1, me);
-  reverse(lds, u + NH/2, !which);
-  pairSq(NH/2, u,   u + NH/2, trig, !which);
-  reverse(lds, u + NH/2, !which);
+  reverse(lds, u + NH/2, bump);
+  pairSq(NH/2, u,   u + NH/2, trig, bump);
+  reverse(lds, u + NH/2, bump);
 
   fft_HEIGHT2(lds, u, smallTrig61, 1, me);
   writeTailFusedLine(u, out61, transPos(line, MIDDLE, WIDTH), me);
 }
+
+
+#if defined(AEVUM_APPLE_OPENCL12)
+// Apple OpenCL translates kernels to Metal at clCreateKernel time.  The stock
+// tailSquareZeroGF61 combines load, two height FFTs, reversals, pair squaring
+// and the final write in one pipeline.  Keep the exact arithmetic, but stage
+// the two exceptional lines (0 and H/2) through a tiny ping-pong scratch.
+//
+// Apple Metal also rejects a single GF61 radix/twiddle/LDS-shuffle stage.  The
+// special-line height FFT therefore uses three deliberately small pipelines:
+//   1. one private radix per lane,
+//   2. one scalar twiddle multiply per value,
+//   3. the exact logical shufl permutation through the second global bank.
+// This global permutation is limited to the two exceptional lines.  The main
+// double-wide tail kernel, reverse kernels, middle transforms and carry path
+// retain their original LDS algorithms.
+//
+// Scratch layout: two banks, each holding two complete special lines.  A GF61
+// value owned by line `which`, private slot `i` and lane `me` is stored at
+//   bank * (2 * SMALL_HEIGHT) + which * SMALL_HEIGHT + i * G_H + me.
+// The complete allocation is 4 * SMALL_HEIGHT GF61 values.
+inline u32 appleTailZeroGF61BankIndex(u32 bank, u32 which, u32 i, u32 me) {
+  return bank * (2 * SMALL_HEIGHT) + which * SMALL_HEIGHT + i * G_H + me;
+}
+
+inline u32 appleTailZeroGF61Index(u32 which, u32 i, u32 me) {
+  return appleTailZeroGF61BankIndex(0, which, i, me);
+}
+
+void appleTailZeroGF61ScratchLoadBank(CP(GF61) scratch, GF61 *u,
+                                      u32 bank, u32 which, u32 me) {
+  for (u32 i = 0; i < NH; ++i) {
+    u[i] = scratch[appleTailZeroGF61BankIndex(bank, which, i, me)];
+  }
+}
+
+void appleTailZeroGF61ScratchStoreBank(P(GF61) scratch, GF61 *u,
+                                       u32 bank, u32 which, u32 me) {
+  for (u32 i = 0; i < NH; ++i) {
+    scratch[appleTailZeroGF61BankIndex(bank, which, i, me)] = u[i];
+  }
+}
+
+void appleTailZeroGF61ScratchLoad(CP(GF61) scratch, GF61 *u, u32 which, u32 me) {
+  appleTailZeroGF61ScratchLoadBank(scratch, u, 0, which, me);
+}
+
+void appleTailZeroGF61ScratchStore(P(GF61) scratch, GF61 *u, u32 which, u32 me) {
+  appleTailZeroGF61ScratchStoreBank(scratch, u, 0, which, me);
+}
+
+KERNEL(G_H) tailSquareZeroGF61LoadApple(P(GF61) scratch, CP(T2) in) {
+  CP(GF61) in61 = (CP(GF61)) (in + DISTGF61);
+  const u32 which = get_group_id(0);
+  const u32 me = get_local_id(0);
+  const u32 H = ND / SMALL_HEIGHT;
+  const u32 line = which ? H / 2 : 0;
+  GF61 u[NH];
+  readTailFusedLine(in61, u, line, me);
+  appleTailZeroGF61ScratchStoreBank(scratch, u, 0, which, me);
+}
+
+// One radix per lane, entirely in private registers.  No LDS and no twiddle
+// lookup are present in this pipeline.
+KERNEL(G_H) tailSquareZeroGF61FftRadixApple(P(GF61) scratch, u32 bank) {
+  const u32 which = get_group_id(0);
+  const u32 me = get_local_id(0);
+  GF61 u[NH];
+  appleTailZeroGF61ScratchLoadBank(scratch, u, bank, which, me);
+  fft_RADIX(u);
+  appleTailZeroGF61ScratchStoreBank(scratch, u, bank, which, me);
+}
+
+// Scalarized equivalent of tabMul().  Workgroup `group` selects one private
+// vector slot, so every work-item performs at most one GF61 multiply.
+KERNEL(G_H) tailSquareZeroGF61FftTwiddleApple(P(GF61) scratch, Trig smallTrig,
+                                              u32 bank, u32 f) {
+  TrigGF61 smallTrig61 = (TrigGF61) (smallTrig + DISTHTRIGGF61);
+  const u32 group = get_group_id(0);
+  const u32 which = group / NH;
+  const u32 i = group - which * NH;
+  const u32 me = get_local_id(0);
+  if (i == 0) return;
+
+  const u32 p = me & ~(f - 1);
+  const u32 index = appleTailZeroGF61BankIndex(bank, which, i, me);
+  GF61 value = scratch[index];
+#if TABMUL_CHAIN61
+  GF61 w = TFLOAD(&smallTrig61[p]);
+  GF61 multiplier = w;
+  for (u32 j = 1; j < i; ++j) multiplier = cmul(multiplier, w);
+  value = cmul(value, multiplier);
+#else
+  value = cmul(value, TFLOAD(&smallTrig61[(i - 1) * G_H + p]));
+#endif
+  scratch[index] = value;
+}
+
+// Global-memory form of the logical shufl permutation.  The source mapping is
+// the inverse of the stock LDS write/read pair:
+//   L = out_i * G_H + out_me
+//   src_i  = (L / f) % RADIX
+//   src_me = (L / (f * RADIX)) * f + (L % f)
+// A distinct destination bank makes the permutation race-free.
+KERNEL(G_H) tailSquareZeroGF61FftShuffleApple(P(GF61) scratch,
+                                              u32 srcBank, u32 dstBank, u32 f) {
+  const u32 group = get_group_id(0);
+  const u32 which = group / NH;
+  const u32 outI = group - which * NH;
+  const u32 outMe = get_local_id(0);
+  const u32 logical = outI * G_H + outMe;
+  const u32 remainder = logical & (f - 1);
+  const u32 srcI = (logical / f) % RADIX;
+  const u32 srcMe = (logical / (f * RADIX)) * f + remainder;
+
+  scratch[appleTailZeroGF61BankIndex(dstBank, which, outI, outMe)] =
+      scratch[appleTailZeroGF61BankIndex(srcBank, which, srcI, srcMe)];
+}
+
+// Apply the final radix and normalize the result back into bank zero.  Reading
+// and writing bank zero is safe because each lane owns a disjoint private
+// vector; when srcBank is one this also performs the final bank copy.
+KERNEL(G_H) tailSquareZeroGF61FftFinalApple(P(GF61) scratch, u32 srcBank) {
+  const u32 which = get_group_id(0);
+  const u32 me = get_local_id(0);
+  GF61 u[NH];
+  appleTailZeroGF61ScratchLoadBank(scratch, u, srcBank, which, me);
+  fft_RADIX(u);
+  appleTailZeroGF61ScratchStoreBank(scratch, u, 0, which, me);
+}
+
+// Global-memory equivalent of reverse(lds, u + NH/2, !which).  A distinct
+// destination bank makes the permutation race-free and keeps the stock
+// bump semantics for line zero.  One workgroup handles one vector slot.
+KERNEL(G_H) tailSquareZeroGF61ReverseGlobalApple(P(GF61) scratch,
+                                                 u32 srcBank, u32 dstBank) {
+  const u32 group = get_group_id(0);
+  const u32 which = group / NH;
+  const u32 slot = group - which * NH;
+  const u32 me = get_local_id(0);
+  const u32 halfN = NH / 2;
+
+  u32 dstSlot = slot;
+  u32 dstMe = me;
+  if (slot >= halfN) {
+    const u32 j = slot - halfN;
+    const u32 bump = which == 0 ? 1u : 0u;
+    const u32 revMe = G_H - 1 - me + bump;
+    const u32 logical = (revMe + (halfN - 1 - j) * G_H) % (halfN * G_H);
+    dstSlot = halfN + logical / G_H;
+    dstMe = logical % G_H;
+  }
+
+  scratch[appleTailZeroGF61BankIndex(dstBank, which, dstSlot, dstMe)] =
+      scratch[appleTailZeroGF61BankIndex(srcBank, which, slot, me)];
+}
+
+// One workgroup per (special line, pair slot).  This scalarizes pairSq: each
+// lane owns only the two GF61 values consumed by one onePairSq invocation.
+KERNEL(G_H) tailSquareZeroGF61PairApple(P(GF61) scratch, Trig smallTrig, u32 bank) {
+  TrigGF61 smallTrig61 = (TrigGF61) (smallTrig + DISTHTRIGGF61);
+  const u32 pairSlots = NH / 2;
+  const u32 group = get_group_id(0);
+  const u32 which = group / pairSlots;
+  const u32 slot = group - which * pairSlots;
+  const u32 quarter = NH / 4;
+  const u32 i = slot % quarter;
+  const u32 type = slot / quarter; // 0 or 1, matching pairSq's t_squared_type
+  const u32 me = get_local_id(0);
+  const u32 aIndex = i + type * quarter;
+  const u32 bIndex = aIndex + NH / 2;
+
+  u32 height_trigs = SMALL_HEIGHT;
+#if TAIL_TRIGS61 >= 1
+  GF61 trig = TFLOAD(&smallTrig61[height_trigs + me]);
+  GF61 mult = TSLOAD(&smallTrig61[height_trigs + G_H + which]);
+  trig = cmul(trig, mult);
+#else
+  GF61 trig = TOLOAD(&smallTrig61[height_trigs + which * G_H + me]);
+#endif
+  for (u32 j = 0; j < i; ++j) trig = mul_t8(trig);
+
+  GF61 a = scratch[appleTailZeroGF61BankIndex(bank, which, aIndex, me)];
+  GF61 b = scratch[appleTailZeroGF61BankIndex(bank, which, bIndex, me)];
+  if (which == 0 && type == 0 && i == 0 && me == 0) {
+    a = SWAP_XY(mul2(foo(a)));
+    b = SWAP_XY(shl(csq(b), 2));
+  } else {
+    onePairSq(&a, &b, trig, type);
+  }
+  scratch[appleTailZeroGF61BankIndex(bank, which, aIndex, me)] = a;
+  scratch[appleTailZeroGF61BankIndex(bank, which, bIndex, me)] = b;
+}
+
+
+// Direct final write for one exceptional GF61 line.  The host launches this
+// kernel twice and supplies already-resolved scratch/output bases.  Keeping
+// the pipeline to one GF61 load and one GF61 store avoids transPos, pointer
+// casts, helper overloads, branches and private arrays in Apple Metal.
+KERNEL(G_H) tailSquareZeroGF61WriteDirectApple(P(GF61) out61, CP(GF61) scratch,
+                                                u32 scratchBase, u32 outBase) {
+  const u32 i = get_group_id(0);
+  const u32 me = get_local_id(0);
+  const u32 offset = i * G_H + me;
+  out61[DISTGF61 + outBase + offset] = scratch[scratchBase + offset];
+}
+
+
+// Apple-only staged path for the normal GF61 tail-square line pairs.  The
+// stock double-wide kernel combines two private vectors, two height FFTs,
+// cross-line LDS reversals, pair squaring and the final write.  Apple Metal
+// rejects that pipeline at clCreateKernel.  The staged path keeps identical
+// arithmetic and line pairing while reusing the already allocated output and
+// input GF61 planes as ping-pong banks.  Apple forces INPLACE=0 and PAD=0, so
+// the old input plane is free after this first scalar load completes.
+//
+// Normal-line ordinal mapping excludes the two exceptional lines 0 and H/2:
+//   ordinal 0..H/2-2   -> line 1..H/2-1
+//   ordinal H/2-1..H-3 -> line H/2+1..H-1
+inline u32 appleTailGF61NormalLine(u32 ordinal) {
+  const u32 H = ND / SMALL_HEIGHT;
+  const u32 halfH = H / 2;
+  return ordinal < halfH - 1 ? ordinal + 1 : ordinal + 2;
+}
+
+inline u32 appleTailGF61LineBase(u32 line) {
+  return transPos(line, MIDDLE, WIDTH) * SMALL_HEIGHT;
+}
+
+inline u32 appleTailGF61LineIndex(u32 line, u32 slot, u32 me) {
+  return appleTailGF61LineBase(line) + slot * G_H + me;
+}
+
+// Scalar equivalent of one readTailFusedLine iteration for PAD=0.  One
+// workgroup handles one private-vector slot of one normal line and writes it
+// directly into bank zero (the output GF61 plane) in final tail layout.
+KERNEL(G_H) tailSquareGF61LoadScalarApple(P(T2) out, CP(T2) in) {
+#if PAD_SIZE != 0
+#error Apple staged GF61 main-tail load requires PAD_SIZE=0
+#endif
+  P(GF61) out61 = (P(GF61)) (out + DISTGF61);
+  CP(GF61) in61 = (CP(GF61)) (in + DISTGF61);
+  const u32 group = get_group_id(0);
+  const u32 ordinal = group / NH;
+  const u32 slot = group - ordinal * NH;
+  const u32 line = appleTailGF61NormalLine(ordinal);
+  const u32 me = get_local_id(0);
+  const u32 sizeY = IN_WG / IN_SIZEX;
+
+  const u32 x = line % WIDTH;
+  const u32 chunkX = x / IN_SIZEX;
+  const u32 xWithin = x % IN_SIZEX;
+  const u32 middleI = line / WIDTH;
+  const u32 y = slot * G_H + me;
+  const u32 chunkY = y / sizeY;
+  const u32 src = chunkX * (SMALL_HEIGHT * MIDDLE * IN_SIZEX) +
+                  xWithin * sizeY + middleI * IN_WG + (me % sizeY) +
+                  chunkY * (MIDDLE * IN_WG);
+  out61[appleTailGF61LineIndex(line, slot, me)] = in61[src];
+}
+
+// One private radix per normal line.  The host passes whichever existing GF61
+// plane is the current ping-pong bank.
+KERNEL(G_H) tailSquareGF61FftRadixApple(P(T2) data) {
+  P(GF61) data61 = (P(GF61)) (data + DISTGF61);
+  const u32 line = appleTailGF61NormalLine(get_group_id(0));
+  const u32 me = get_local_id(0);
+  GF61 u[NH];
+  for (u32 i = 0; i < NH; ++i) u[i] = data61[appleTailGF61LineIndex(line, i, me)];
+  fft_RADIX(u);
+  for (u32 i = 0; i < NH; ++i) data61[appleTailGF61LineIndex(line, i, me)] = u[i];
+}
+
+// Scalar tabMul equivalent for one slot of one normal line.
+KERNEL(G_H) tailSquareGF61FftTwiddleApple(P(T2) data, Trig smallTrig, u32 f) {
+  P(GF61) data61 = (P(GF61)) (data + DISTGF61);
+  TrigGF61 smallTrig61 = (TrigGF61) (smallTrig + DISTHTRIGGF61);
+  const u32 group = get_group_id(0);
+  const u32 ordinal = group / NH;
+  const u32 i = group - ordinal * NH;
+  if (i == 0) return;
+  const u32 line = appleTailGF61NormalLine(ordinal);
+  const u32 me = get_local_id(0);
+  const u32 p = me & ~(f - 1);
+  const u32 index = appleTailGF61LineIndex(line, i, me);
+  GF61 value = data61[index];
+#if TABMUL_CHAIN61
+  GF61 w = TFLOAD(&smallTrig61[p]);
+  GF61 multiplier = w;
+  for (u32 j = 1; j < i; ++j) multiplier = cmul(multiplier, w);
+  value = cmul(value, multiplier);
+#else
+  value = cmul(value, TFLOAD(&smallTrig61[(i - 1) * G_H + p]));
+#endif
+  data61[index] = value;
+}
+
+// Race-free global form of shufl.  The host passes the current and next
+// existing transform buffers, so no transform-sized allocation is added.
+KERNEL(G_H) tailSquareGF61FftShuffleApple(CP(T2) src, P(T2) dst, u32 f) {
+  CP(GF61) src61 = (CP(GF61)) (src + DISTGF61);
+  P(GF61) dst61 = (P(GF61)) (dst + DISTGF61);
+  const u32 group = get_group_id(0);
+  const u32 ordinal = group / NH;
+  const u32 outI = group - ordinal * NH;
+  const u32 line = appleTailGF61NormalLine(ordinal);
+  const u32 outMe = get_local_id(0);
+  const u32 logical = outI * G_H + outMe;
+  const u32 remainder = logical & (f - 1);
+  const u32 srcI = (logical / f) % RADIX;
+  const u32 srcMe = (logical / (f * RADIX)) * f + remainder;
+  dst61[appleTailGF61LineIndex(line, outI, outMe)] =
+      src61[appleTailGF61LineIndex(line, srcI, srcMe)];
+}
+
+// Final radix.  It always normalizes the result into the output plane, which
+// is also the exact final fftMiddleOut input layout.
+KERNEL(G_H) tailSquareGF61FftFinalApple(CP(T2) src, P(T2) out) {
+  CP(GF61) src61 = (CP(GF61)) (src + DISTGF61);
+  P(GF61) out61 = (P(GF61)) (out + DISTGF61);
+  const u32 line = appleTailGF61NormalLine(get_group_id(0));
+  const u32 me = get_local_id(0);
+  GF61 u[NH];
+  for (u32 i = 0; i < NH; ++i) u[i] = src61[appleTailGF61LineIndex(line, i, me)];
+  fft_RADIX(u);
+  for (u32 i = 0; i < NH; ++i) out61[appleTailGF61LineIndex(line, i, me)] = u[i];
+}
+
+// Global equivalent of revCrossLine.  The first half of each line is copied
+// unchanged; the second half is reversed in both slot and lane and crossed to
+// its paired line H-line.  Distinct source/destination planes make it race-free.
+KERNEL(G_H) tailSquareGF61ReverseCrossApple(CP(T2) src, P(T2) dst) {
+  CP(GF61) src61 = (CP(GF61)) (src + DISTGF61);
+  P(GF61) dst61 = (P(GF61)) (dst + DISTGF61);
+  const u32 group = get_group_id(0);
+  const u32 ordinal = group / NH;
+  const u32 slot = group - ordinal * NH;
+  const u32 line = appleTailGF61NormalLine(ordinal);
+  const u32 me = get_local_id(0);
+  u32 dstLine = line;
+  u32 dstSlot = slot;
+  u32 dstMe = me;
+  if (slot >= NH / 2) {
+    const u32 H = ND / SMALL_HEIGHT;
+    const u32 j = slot - NH / 2;
+    dstLine = H - line;
+    dstSlot = NH / 2 + (NH / 2 - 1 - j);
+    dstMe = G_H - 1 - me;
+  }
+  dst61[appleTailGF61LineIndex(dstLine, dstSlot, dstMe)] =
+      src61[appleTailGF61LineIndex(line, slot, me)];
+}
+
+// Scalar pairSq coverage for all normal lines.  Each workgroup owns exactly
+// one onePairSq pair in one line; trig indexing is identical to the two halves
+// of the stock double-wide kernel.
+KERNEL(G_H) tailSquareGF61PairApple(P(T2) data, Trig smallTrig) {
+  P(GF61) data61 = (P(GF61)) (data + DISTGF61);
+  TrigGF61 smallTrig61 = (TrigGF61) (smallTrig + DISTHTRIGGF61);
+  const u32 pairSlots = NH / 2;
+  const u32 group = get_group_id(0);
+  const u32 ordinal = group / pairSlots;
+  const u32 pairSlot = group - ordinal * pairSlots;
+  const u32 line = appleTailGF61NormalLine(ordinal);
+  const u32 H = ND / SMALL_HEIGHT;
+  const u32 side = line > H / 2 ? 1u : 0u;
+  const u32 lineU = side ? H - line : line;
+  const u32 quarter = NH / 4;
+  const u32 i = pairSlot % quarter;
+  const u32 type = pairSlot / quarter;
+  const u32 aSlot = i + type * quarter;
+  const u32 bSlot = aSlot + NH / 2;
+  const u32 me = get_local_id(0);
+  const u32 heightTrigs = SMALL_HEIGHT;
+#if TAIL_TRIGS61 >= 1
+  GF61 trig = TFLOAD(&smallTrig61[heightTrigs + me]);
+  GF61 mult = TSLOAD(&smallTrig61[heightTrigs + G_H + lineU * 2 + side]);
+  trig = cmul(trig, mult);
+#else
+  GF61 trig = TOLOAD(&smallTrig61[heightTrigs + lineU * G_H * 2 + side * G_H + me]);
+#endif
+  for (u32 j = 0; j < i; ++j) trig = mul_t8(trig);
+  const u32 aIndex = appleTailGF61LineIndex(line, aSlot, me);
+  const u32 bIndex = appleTailGF61LineIndex(line, bSlot, me);
+  GF61 a = data61[aIndex];
+  GF61 b = data61[bIndex];
+  onePairSq(&a, &b, trig, type);
+  data61[aIndex] = a;
+  data61[bIndex] = b;
+}
+
+
+// Fused Apple main-tail stage.  This is the exact composition of the legacy
+// radix, scalar twiddle and global shufl kernels, but each source lane scatters
+// its NH radix outputs directly to their unique shuffled destinations.  No
+// LDS or cross-work-item barrier is used, so the kernel remains compatible
+// with Apple's OpenCL 1.2 to Metal compiler while eliminating two full GF61
+// global-memory round trips per height stage.
+inline GF61 appleTailGF61TwiddleFused(GF61 value, TrigGF61 smallTrig61,
+                                      u32 i, u32 me, u32 f) {
+  if (i == 0) return value;
+  const u32 p = me & ~(f - 1);
+#if TABMUL_CHAIN61
+  GF61 w = TFLOAD(&smallTrig61[p]);
+  GF61 multiplier = w;
+  for (u32 j = 1; j < i; ++j) multiplier = cmul(multiplier, w);
+  return cmul(value, multiplier);
+#else
+  return cmul(value, TFLOAD(&smallTrig61[(i - 1) * G_H + p]));
+#endif
+}
+
+inline void appleTailGF61ScatterFused(P(GF61) dst61, u32 line,
+                                      GF61 value, u32 i, u32 me, u32 f) {
+  const u32 remainder = me & (f - 1);
+  const u32 logical = ((me / f) * RADIX + i) * f + remainder;
+  const u32 outI = logical / G_H;
+  const u32 outMe = logical - outI * G_H;
+  dst61[appleTailGF61LineIndex(line, outI, outMe)] = value;
+}
+
+// First normal-line height stage: scalar transpose load + radix + twiddle +
+// exact shufl permutation.  Apple forces INPLACE=0 and PAD=0 for FFT3161, so
+// source and destination are distinct and every scatter destination is unique.
+KERNEL(G_H) tailSquareGF61LoadStageFusedApple(P(T2) dst, CP(T2) in,
+                                              Trig smallTrig, u32 f) {
+#if PAD_SIZE != 0
+#error Apple fused GF61 main-tail load requires PAD_SIZE=0
+#endif
+  P(GF61) dst61 = (P(GF61)) (dst + DISTGF61);
+  CP(GF61) in61 = (CP(GF61)) (in + DISTGF61);
+  TrigGF61 smallTrig61 = (TrigGF61) (smallTrig + DISTHTRIGGF61);
+  const u32 line = appleTailGF61NormalLine(get_group_id(0));
+  const u32 me = get_local_id(0);
+  const u32 sizeY = IN_WG / IN_SIZEX;
+  const u32 x = line % WIDTH;
+  const u32 chunkX = x / IN_SIZEX;
+  const u32 xWithin = x % IN_SIZEX;
+  const u32 middleI = line / WIDTH;
+  GF61 u[NH];
+  for (u32 i = 0; i < NH; ++i) {
+    const u32 y = i * G_H + me;
+    const u32 chunkY = y / sizeY;
+    const u32 srcIndex = chunkX * (SMALL_HEIGHT * MIDDLE * IN_SIZEX) +
+                         xWithin * sizeY + middleI * IN_WG + (me % sizeY) +
+                         chunkY * (MIDDLE * IN_WG);
+    u[i] = in61[srcIndex];
+  }
+  fft_RADIX(u);
+  for (u32 i = 0; i < NH; ++i) {
+    GF61 value = appleTailGF61TwiddleFused(u[i], smallTrig61, i, me, f);
+    appleTailGF61ScatterFused(dst61, line, value, i, me, f);
+  }
+}
+
+// Subsequent normal-line height stage.  It is algebraically identical to
+// tailSquareGF61FftRadixApple + tailSquareGF61FftTwiddleApple +
+// tailSquareGF61FftShuffleApple, with distinct source/destination planes.
+KERNEL(G_H) tailSquareGF61StageFusedApple(CP(T2) src, P(T2) dst,
+                                          Trig smallTrig, u32 f) {
+  CP(GF61) src61 = (CP(GF61)) (src + DISTGF61);
+  P(GF61) dst61 = (P(GF61)) (dst + DISTGF61);
+  TrigGF61 smallTrig61 = (TrigGF61) (smallTrig + DISTHTRIGGF61);
+  const u32 line = appleTailGF61NormalLine(get_group_id(0));
+  const u32 me = get_local_id(0);
+  GF61 u[NH];
+  for (u32 i = 0; i < NH; ++i) u[i] = src61[appleTailGF61LineIndex(line, i, me)];
+  fft_RADIX(u);
+  for (u32 i = 0; i < NH; ++i) {
+    GF61 value = appleTailGF61TwiddleFused(u[i], smallTrig61, i, me, f);
+    appleTailGF61ScatterFused(dst61, line, value, i, me, f);
+  }
+}
+
+// Exact R * pairSq * R composition for the normal lines.  The first element
+// remains in (line,aSlot,me); the reversed second element lives directly at
+// (H-line,NH-1-aSlot,G_H-1-me).  Reading one plane and writing the other makes
+// this race-free and replaces two global permutations plus the in-place pair
+// kernel with a single pass.
+KERNEL(G_H) tailSquareGF61PairCrossFusedApple(CP(T2) src, P(T2) dst,
+                                              Trig smallTrig) {
+  CP(GF61) src61 = (CP(GF61)) (src + DISTGF61);
+  P(GF61) dst61 = (P(GF61)) (dst + DISTGF61);
+  TrigGF61 smallTrig61 = (TrigGF61) (smallTrig + DISTHTRIGGF61);
+  const u32 pairSlots = NH / 2;
+  const u32 group = get_group_id(0);
+  const u32 ordinal = group / pairSlots;
+  const u32 pairSlot = group - ordinal * pairSlots;
+  const u32 line = appleTailGF61NormalLine(ordinal);
+  const u32 H = ND / SMALL_HEIGHT;
+  const u32 side = line > H / 2 ? 1u : 0u;
+  const u32 lineU = side ? H - line : line;
+  const u32 quarter = NH / 4;
+  const u32 i = pairSlot % quarter;
+  const u32 type = pairSlot / quarter;
+  const u32 aSlot = i + type * quarter;
+  const u32 crossLine = H - line;
+  const u32 crossSlot = NH - 1 - aSlot;
+  const u32 me = get_local_id(0);
+  const u32 crossMe = G_H - 1 - me;
+  const u32 heightTrigs = SMALL_HEIGHT;
+#if TAIL_TRIGS61 >= 1
+  GF61 trig = TFLOAD(&smallTrig61[heightTrigs + me]);
+  GF61 mult = TSLOAD(&smallTrig61[heightTrigs + G_H + lineU * 2 + side]);
+  trig = cmul(trig, mult);
+#else
+  GF61 trig = TOLOAD(&smallTrig61[heightTrigs + lineU * G_H * 2 + side * G_H + me]);
+#endif
+  for (u32 j = 0; j < i; ++j) trig = mul_t8(trig);
+  const u32 aIndex = appleTailGF61LineIndex(line, aSlot, me);
+  const u32 bIndex = appleTailGF61LineIndex(crossLine, crossSlot, crossMe);
+  GF61 a = src61[aIndex];
+  GF61 b = src61[bIndex];
+  onePairSq(&a, &b, trig, type);
+  dst61[aIndex] = a;
+  dst61[bIndex] = b;
+}
+
+// The stock member is still present in the C++ object for non-Apple builds.
+// On Apple it is initialized with this signature-compatible no-op so Metal is
+// never asked to create the rejected monolithic tailSquareGF61 pipeline.
+KERNEL(G_H) tailSquareGF61ApplePlaceholder(P(T2) out, CP(T2) in, Trig smallTrig) {
+  (void) out;
+  (void) in;
+  (void) smallTrig;
+}
+#endif
 #endif
 
 #if SINGLE_WIDE
 
-KERNEL(G_H) tailSquareGF61(P(T2) out, CP(T2) in, Trig smallTrig) {
+KERNEL(G_H) tailSquareGF61(P(T2) out, CP(T2) in, Trig smallTrig AEVUM_PRP_TRIG_ARG) {
   local GF61 lds[LDS_BYTES / sizeof(GF61)];
 
   CP(GF61) in61 = (CP(GF61)) (in + DISTGF61);
@@ -1040,12 +1640,21 @@ KERNEL(G_H) tailSquareGF61(P(T2) out, CP(T2) in, Trig smallTrig) {
 
   u32 H = ND / SMALL_HEIGHT;
 
-#if SINGLE_KERNEL
+#if PFA_RADIX
+  const u32 per_row = WIDTH / 2u - 1u;
+  const u32 group = get_group_id(0);
+  const u32 row = group / per_row;
+  const u32 binary_line = group - row * per_row + 1u;
+  const u32 line1 = row * WIDTH + binary_line;
+  const u32 line2 = row * WIDTH + (WIDTH - binary_line);
+#elif SINGLE_KERNEL
   u32 line1 = get_group_id(0);
   u32 line2 = line1 ? H - line1 : (H / 2);
+  const u32 binary_line = line1;
 #else
   u32 line1 = get_group_id(0) + 1;
   u32 line2 = H - line1;
+  const u32 binary_line = line1;
 #endif
   u32 memline1 = transPos(line1, MIDDLE, WIDTH);
   u32 memline2 = transPos(line2, MIDDLE, WIDTH);
@@ -1068,7 +1677,7 @@ KERNEL(G_H) tailSquareGF61(P(T2) out, CP(T2) in, Trig smallTrig) {
   u32 height_trigs = SMALL_HEIGHT*1;
   // Read a hopefully cached line of data and one non-cached GF61 per line
   GF61 trig = TFLOAD(&smallTrig61[height_trigs + me]);                    // Trig values for line zero, should be cached
-  GF61 mult = TSLOAD(&smallTrig61[height_trigs + G_H + line1]);           // Line multiplier
+  GF61 mult = TSLOAD(&smallTrig61[height_trigs + G_H + binary_line]);           // Line multiplier
   trig = cmul(trig, mult);
 
   // On consumer-grade GPUs, it is likely beneficial to read all trig values.
@@ -1077,7 +1686,7 @@ KERNEL(G_H) tailSquareGF61(P(T2) out, CP(T2) in, Trig smallTrig) {
   // The trig values used here are pre-computed and stored after the fft_HEIGHT trig values.
   u32 height_trigs = SMALL_HEIGHT*1;
   // Read pre-computed trig values
-  GF61 trig = TOLOAD(&smallTrig61[height_trigs + line1*G_H + me]);
+  GF61 trig = TOLOAD(&smallTrig61[height_trigs + binary_line*G_H + me]);
 #endif
 
 #if SINGLE_KERNEL
@@ -1133,7 +1742,7 @@ void OVERLOAD pairSq2_special(GF61 *u, GF61 base_squared) {
   }
 }
 
-KERNEL(G_H * 2) tailSquareGF61(P(T2) out, CP(T2) in, Trig smallTrig) {
+KERNEL(G_H * 2) tailSquareGF61(P(T2) out, CP(T2) in, Trig smallTrig AEVUM_PRP_TRIG_ARG) {
   local GF61 lds[2 * LDS_BYTES / sizeof(GF61)];
 
   CP(GF61) in61 = (CP(GF61)) (in + DISTGF61);

@@ -33,6 +33,7 @@
 #include "io/WorktodoParser.hpp"
 #include "io/WorktodoManager.hpp"
 #include "marin/engine.h"
+#include "aevum/AutoPolicy.hpp"
 #include "marin/file.h"
 #include "ui/WebGuiServer.hpp"
 #include "core/Version.hpp"
@@ -53,6 +54,7 @@
 # include <windows.h>
 #endif
 #include <csignal>
+#include <cstdlib>
 #include <chrono>
 #include <vector>
 #include <iomanip>
@@ -155,6 +157,66 @@ static int askExponentInteractively() {
     }
   #endif
 }
+static engine::gpu_backend gaussian_selected_backend(const io::CliOptions& options) {
+#if defined(__APPLE__)
+    return (!options.marin || options.force_engine_marin)
+        ? engine::gpu_backend::marin
+        : (options.aevum ? engine::gpu_backend::aevum : engine::gpu_backend::marin);
+#else
+    return (!options.marin || options.force_engine_marin)
+        ? engine::gpu_backend::marin
+        : (options.aevum ? engine::gpu_backend::aevum : engine::gpu_backend::auto_select);
+#endif
+}
+
+static std::string gaussian_workload_fft_spec(const io::CliOptions& options,
+                                               const engine::gpu_workload workload) {
+    if (options.aevum_fft_spec_explicit) return options.aevum_fft_spec;
+#if defined(__APPLE__)
+    if (workload == engine::gpu_workload::prp || workload == engine::gpu_workload::ll)
+        return "pow2:auto";
+    return {};
+#else
+    const char* override_value = nullptr;
+    const char* fallback = nullptr;
+    switch (workload) {
+        case engine::gpu_workload::prp:
+            override_value = std::getenv("PRMERS_AEVUM_PRP_FFT");
+            // Device-neutral default: delegate to the native Aevum auto selector.
+            // The old PRP workload fallback was calibrated on RTX 3080 and can
+            // choose a much slower Type4 plan on other GPUs (issue #36 / RTX 5090).
+            fallback = "";
+            break;
+        case engine::gpu_workload::pm1:
+        case engine::gpu_workload::pm1_lowmem:
+            override_value = std::getenv("PRMERS_AEVUM_PM1_FFT");
+            // Empty delegates to the Pass-4 workload-aware runtime tuner.
+            fallback = "";
+            break;
+        case engine::gpu_workload::ecm:
+            override_value = std::getenv("PRMERS_AEVUM_ECM_FFT");
+            fallback = "";
+            break;
+        default:
+            return options.aevum_fft_spec;
+    }
+    return override_value && *override_value ? override_value : fallback;
+#endif
+}
+
+static void configure_gaussian_phase_backend(io::CliOptions& options,
+                                              const engine::gpu_workload workload,
+                                              const char* phase) {
+    const std::string fft_spec = gaussian_workload_fft_spec(options, workload);
+    engine::configure_gpu_backend(gaussian_selected_backend(options), fft_spec, workload);
+    options.aevum_fft_spec = fft_spec;
+    std::cout << "[Gaussian backend policy] " << phase
+              << " workload=" << aevum_workload_name(workload)
+              << " backend=" << engine::configured_gpu_backend_name();
+    if (!fft_spec.empty()) std::cout << " fft=" << fft_spec;
+    std::cout << "\n";
+}
+
 void App::tuneIterforce() {
     double maxTestSeconds = 60.0;
     uint64_t defaultTestIters = 1024;
@@ -274,12 +336,41 @@ App::App(int argc, char** argv)
     auto o = io::CliParser::parse(static_cast<int>(merged.size()), c_argv.data());
 
     io::WorktodoParser wp{o.worktodo_path};
-    if (auto e = wp.parse()) {
+    // An explicit Gaussian-Mersenne command is self-contained and must not be
+    // replaced by an unrelated default worktodo entry.
+    std::optional<io::WorktodoEntry> worktodo_entry;
+    if (!o.gaussian_mersenne) worktodo_entry = wp.parse();
+    if (auto e = worktodo_entry) {
         o.exponent     = e->exponent;
-        o.mode         = e->ecmTest ? "ecm"
-                        : (e->prpTest ? "prp"
-                        : (e->llTest ? ((e->doubleCheck && !cliForceLlUnsafe) ? "llsafe" : "ll")
-                        : (e->pm1Test ? "pm1" : "")));
+        if (e->gaussianMersenne) {
+            o.gaussian_mersenne = true;
+            o.gm_prp_only = e->gmPrpOnly;
+            o.gm_family = e->gmFamily;
+            o.gm_pipeline = e->gmPipeline;
+            o.gm_pipeline_proth = e->gmPipelineProth;
+            o.mode = e->gmPipeline ? "gm-chain"
+                   : (e->ecmTest ? "gm-ecm"
+                   : (e->pm1Test ? "gm-pm1"
+                   : (e->gmPrpOnly ? "gm-prp" : "gm-proth")));
+            o.proof = false;
+            o.B1 = e->B1;
+            o.B2 = e->B2;
+            o.K = e->curves;
+            o.nmax = e->curves;
+            o.gm_base = e->gmBase;
+            o.gm_sieve_limit = e->gmSieveLimit;
+            o.gm_factor_chunk_bits = e->gmFactorChunkBits;
+            o.gm_pipeline_ecm_B1 = e->gmEcmB1;
+            o.gm_pipeline_ecm_B2 = e->gmEcmB2;
+            o.gm_pipeline_ecm_curves = e->gmEcmCurves;
+            o.sigma = e->sigma;
+            if (e->ecmTest) o.compute_edwards = false;
+        } else {
+            o.mode = e->ecmTest ? "ecm"
+                   : (e->prpTest ? "prp"
+                   : (e->llTest ? ((e->doubleCheck && !cliForceLlUnsafe) ? "llsafe" : "ll")
+                   : (e->pm1Test ? "pm1" : "")));
+        }
         o.aid          = e->aid;
         o.doubleCheck  = e->doubleCheck;
 
@@ -317,6 +408,7 @@ App::App(int argc, char** argv)
             o.K    = e->curves;
         }
 
+        activeWorktodoRawLine_ = e->rawLine;
         hasWorktodoEntry_ = true;
     }
 
@@ -334,7 +426,9 @@ App::App(int argc, char** argv)
     //std::exit(-1);
     }
     engine::gpu_workload workload = engine::gpu_workload::generic;
-    if (o.mode == "prp") workload = engine::gpu_workload::prp;
+    if (o.mode == "prp" || o.mode == "gm-proth" || o.mode == "gm-prp") workload = engine::gpu_workload::prp;
+    else if (o.mode == "gm-pm1" || o.mode == "gm-chain") workload = engine::gpu_workload::pm1;
+    else if (o.mode == "gm-ecm" || o.mode == "gm-ecm-special32") workload = engine::gpu_workload::ecm;
     else if (o.mode == "ll" || o.mode == "llsafe" || o.mode == "llsafe2") workload = engine::gpu_workload::ll;
     else if (o.mode == "pm1") {
         if (o.pm1_ultralowmem) workload = engine::gpu_workload::pm1_ultralowmem;
@@ -342,11 +436,75 @@ App::App(int argc, char** argv)
         else workload = engine::gpu_workload::pm1;
     }
     else if (o.mode == "ecm") workload = engine::gpu_workload::ecm;
+
+    // Select Aevum plans by workload, not by transform length alone.  PRP,
+    // LL, P-1 Stage 1 and ECM use different operation mixes and therefore may
+    // prefer different FFT323161 geometries.  Explicit -aevum-fft requests are
+    // never rewritten.
+    if (o.aevum_fft_spec.empty()) {
+#if defined(__APPLE__)
+        if (workload == engine::gpu_workload::prp ||
+            workload == engine::gpu_workload::ll) {
+            o.aevum_fft_spec = "pow2:auto";
+            if (o.aevum) {
+                std::cout << "[Backend Apple Aevum] PRP/LL uses staged stock Type1 FFT3161; Type4/PFA remains disabled.\n";
+            }
+        }
+#else
+        const char* plan_override = nullptr;
+        switch (workload) {
+            case engine::gpu_workload::prp:
+                plan_override = std::getenv("PRMERS_AEVUM_PRP_FFT");
+                // Empty spec means plugin-native auto selection, identical to
+                // standalone Aevum unless the user supplies an explicit override.
+                o.aevum_fft_spec = plan_override && *plan_override
+                    ? plan_override : "";
+                break;
+            case engine::gpu_workload::ll:
+                plan_override = std::getenv("PRMERS_AEVUM_LL_FFT");
+                o.aevum_fft_spec = plan_override && *plan_override
+                    ? plan_override : "";
+                break;
+            case engine::gpu_workload::pm1:
+            case engine::gpu_workload::pm1_lowmem:
+                plan_override = std::getenv("PRMERS_AEVUM_PM1_FFT");
+                o.aevum_fft_spec = plan_override && *plan_override
+                    ? plan_override : "";
+                break;
+            case engine::gpu_workload::ecm:
+                plan_override = std::getenv("PRMERS_AEVUM_ECM_FFT");
+                o.aevum_fft_spec = plan_override && *plan_override
+                    ? plan_override : "";
+                break;
+            default:
+                break;
+        }
+        if (plan_override && *plan_override) {
+            std::cout << "[Aevum workload plan override] "
+                      << aevum_workload_name(workload) << "="
+                      << o.aevum_fft_spec << "\n";
+        }
+#endif
+    }
+#if defined(__APPLE__)
+    if (o.aevum_fft_spec.rfind("throughput:", 0) == 0) {
+        std::cout << "[Backend Apple Aevum] workload throughput selector normalized to pow2:auto (stock Type1 FFT3161).\n";
+        o.aevum_fft_spec = "pow2:auto";
+    }
+    // Apple ships the legacy OpenCL 1.2 stack. Keep Marin as the safe default
+    // on macOS and make Aevum an explicit opt-in only.
+    const engine::gpu_backend selected_backend = (!o.marin || o.force_engine_marin)
+        ? engine::gpu_backend::marin
+        : (o.aevum ? engine::gpu_backend::aevum : engine::gpu_backend::marin);
+    if (o.marin && !o.aevum && !o.force_engine_marin) {
+        std::cout << "[Backend macOS] Marin selected by platform default; use -aevum to opt in.\n";
+    }
+#else
     const engine::gpu_backend selected_backend = (!o.marin || o.force_engine_marin)
         ? engine::gpu_backend::marin
         : (o.aevum ? engine::gpu_backend::aevum : engine::gpu_backend::auto_select);
+#endif
     engine::configure_gpu_backend(selected_backend, o.aevum_fft_spec, workload);
-    engine::configure_aevum_use(o.aevum_use);
     return o;
   }())
   , context(options.device_id,
@@ -754,6 +912,7 @@ namespace {
 #if defined(_WIN32)
 #include <windows.h>
 #include <csignal>
+#include <cstdlib>
 static BOOL WINAPI prmers_ctrl_handler(DWORD type){
     switch(type){
         case CTRL_C_EVENT:
@@ -829,6 +988,7 @@ int App::run() {
         const std::string gui_workload = options.mode == "pm1" ? "P-1"
                                        : options.mode == "ecm" ? "ECM"
                                        : (options.mode == "ll" || options.mode == "llsafe" || options.mode == "llsafe2") ? "LL"
+                                       : (options.mode == "gm-proth" || options.mode == "gm-prp" || options.mode == "gm-pm1" || options.mode == "gm-ecm" || options.mode == "gm-ecm-special32") ? "Gaussian-Mersenne"
                                        : "PRP";
         if (!options.marin) {
             guiServer_->setBackendInfo("Internal PrMers NTT", "Internal NTT", gui_workload,
@@ -838,11 +998,16 @@ int App::run() {
                                        "Marin engine will be created on first arithmetic operation");
         } else if (options.aevum) {
             guiServer_->setBackendInfo("Forced Aevum", "Pending", gui_workload,
-                                       "Aevum engine will be created on first arithmetic operation", 0, 0,
+                                       "Aevum engine will be created on first arithmetic operation; native PFA is automatic for PRP/LL", 0, 0,
                                        options.aevum_fft_spec);
         } else {
+#if defined(__APPLE__)
+            guiServer_->setBackendInfo("macOS default", "Marin", gui_workload,
+                                       "Marin is the macOS default; use -aevum to opt in explicitly");
+#else
             guiServer_->setBackendInfo("Auto", "Pending", gui_workload,
                                        "backend will be selected from workload and transform sizes");
+#endif
         }
         guiServer_->start();
         std::cout << "GUI " << guiServer_->url() << std::endl;
@@ -873,6 +1038,104 @@ int App::run() {
 
     int rc = 1;
     bool ran = false;
+    if (options.mode == "gm-chain") {
+        // Run a complete conditional pipeline independently for each requested
+        // Gaussian family.  This avoids repeating work on a family already
+        // eliminated by an earlier phase and lets every phase use its native
+        // Aevum/Marin workload policy.
+        const std::string pipeline_mode = options.mode;
+        const std::string requested_family = options.gm_family;
+        const std::uint64_t pm1_B1 = options.B1;
+        const std::uint64_t pm1_B2 = options.B2;
+        const std::uint64_t ecm_B1 = options.gm_pipeline_ecm_B1;
+        const std::uint64_t ecm_B2 = options.gm_pipeline_ecm_B2;
+        const std::uint64_t ecm_curves = options.gm_pipeline_ecm_curves;
+        const std::uint64_t sieve_limit = options.gm_sieve_limit;
+        const bool saved_prp_only = options.gm_prp_only;
+
+        std::cout << "[GMCHAIN] family=" << requested_family
+                  << " P-1 B1=" << pm1_B1 << " B2=" << pm1_B2;
+        if (ecm_curves != 0)
+            std::cout << ", then ECM B1=" << ecm_B1 << " B2=" << ecm_B2
+                      << " curves=" << ecm_curves;
+        if (options.gm_pipeline_proth)
+            std::cout << ", then GM Proth / GQ Fermat PRP if no factor is found.\n";
+        else
+            std::cout << ", then stop after factoring.\n";
+
+        auto run_family_pipeline = [&](const std::string& family) -> int {
+            options.gm_family = family;
+            options.mode = "gm-pm1";
+            options.B1 = pm1_B1;
+            options.B2 = pm1_B2;
+            options.K = 0;
+            options.nmax = 0;
+            options.gm_sieve_limit = sieve_limit;
+            options.gm_prp_only = false;
+            configure_gaussian_phase_backend(options, engine::gpu_workload::pm1, "P-1");
+            int family_rc = runGaussianMersennePM1();
+
+            if (!interrupted && family_rc == 1 && ecm_curves != 0) {
+                options.mode = "gm-ecm";
+                options.B1 = ecm_B1;
+                options.B2 = ecm_B2;
+                options.K = ecm_curves;
+                options.nmax = ecm_curves;
+                options.gm_sieve_limit = 0; // already performed by P-1
+                configure_gaussian_phase_backend(options, engine::gpu_workload::ecm, "ECM");
+                family_rc = runGaussianMersenneECM();
+            }
+
+            if (!interrupted && family_rc == 1 && options.gm_pipeline_proth) {
+                options.mode = "gm-proth";
+                options.gm_prp_only = false;
+                options.B1 = 0;
+                options.B2 = 0;
+                options.K = 0;
+                options.nmax = 0;
+                options.gm_sieve_limit = 0; // already performed by P-1
+                configure_gaussian_phase_backend(options, engine::gpu_workload::prp,
+                                                  family == "GQ" ? "GQ Fermat PRP" : "GM Proth");
+                family_rc = runGaussianMersenne();
+            }
+            return family_rc;
+        };
+
+        if (requested_family == "BOTH") {
+            const int gm_rc = run_family_pipeline("GM");
+            if (interrupted) {
+                rc = gm_rc;
+            } else {
+                const int gq_rc = run_family_pipeline("GQ");
+                rc = (gm_rc == 2 || gq_rc == 2) ? 2
+                   : (gm_rc == 0 && gq_rc == 0) ? 0 : 1;
+            }
+        } else {
+            rc = run_family_pipeline(requested_family);
+        }
+        ran = true;
+
+        options.mode = pipeline_mode;
+        options.gm_family = requested_family;
+        options.gm_prp_only = saved_prp_only;
+        options.B1 = pm1_B1;
+        options.B2 = pm1_B2;
+        options.K = ecm_curves;
+        options.nmax = ecm_curves;
+        options.gm_sieve_limit = sieve_limit;
+    }
+    if (options.mode == "gm-proth" || options.mode == "gm-prp") {
+        rc = runGaussianMersenne();
+        ran = true;
+    }
+    if (options.mode == "gm-pm1") {
+        rc = runGaussianMersennePM1();
+        ran = true;
+    }
+    if (options.mode == "gm-ecm" || options.mode == "gm-ecm-special32" || options.mode == "gm-ecm-special4096") {
+        rc = runGaussianMersenneECM();
+        ran = true;
+    }
     if(options.mode == "ecm"){
         if(options.compute_edwards){
             rc = runECMMarinTwistedEdwards();
@@ -1004,6 +1267,38 @@ int App::run() {
             std::cout << "P-1 factoring (stage 1) need exponent >= 241" << std::endl;
         }
     }
+    // Native Gaussian-Mersenne worktodo entries are handled here because the
+    // dedicated modes intentionally remain isolated from the historical
+    // Prime95-compatible mode implementations. A completed task (factor,
+    // no-factor, prime or composite) is archived, then PrMers restarts on the
+    // next non-comment line. Interrupted/error runs keep the current line.
+    if (hasWorktodoEntry_ && options.gaussian_mersenne && !interrupted &&
+        (rc == 0 || rc == 1)) {
+        if (worktodoParser_ && worktodoParser_->removeProcessedLine(activeWorktodoRawLine_)) {
+            std::cout << "Gaussian-Mersenne entry removed from "
+                      << options.worktodo_path << " and saved to worktodo_save.txt\n";
+            bool pending = false;
+            std::ifstream wt(options.worktodo_path);
+            std::string line;
+            while (std::getline(wt, line)) {
+                const auto first = line.find_first_not_of(" \t\r\n");
+                if (first != std::string::npos && line[first] != '#' && line[first] != ';') {
+                    pending = true;
+                    break;
+                }
+            }
+            if (pending) {
+                std::cout << "Restarting for next Gaussian-Mersenne worktodo entry.\n";
+                restart_self(argc_, argv_);
+            } else {
+                std::cout << "No more Gaussian-Mersenne worktodo entries.\n";
+            }
+        } else {
+            std::cerr << "Failed to update " << options.worktodo_path << "\n";
+            return 2;
+        }
+    }
+
     if (options.gui) {
         if (guiServer_) {
             std::cout << "GUI " << guiServer_->url() << std::endl;

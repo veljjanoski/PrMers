@@ -1,0 +1,523 @@
+// Copyright (C) Mihai Preda
+
+#pragma once
+
+#include "Background.h"
+#include "Buffer.h"
+#include "Context.h"
+#include "Queue.h"
+#include "KernelCompiler.h"
+
+#include "Saver.h"
+#include "common.h"
+#include "Kernel.h"
+#include "Profile.h"
+#include "GpuCommon.h"
+#include "FFTConfig.h"
+
+#include <vector>
+#include <memory>
+#include <filesystem>
+#include <cmath>
+
+struct PRPResult;
+class Task;
+
+class Signal;
+class ProofSet;
+
+using TrigBuf = Buffer<double2>;
+using TrigPtr = shared_ptr<TrigBuf>;
+
+inline u64 residue(const Words& words) { return (u64(words[1]) << 32) | words[0]; }
+
+struct PRPResult {
+  bool isPrime{};
+  u64 res64 = 0;
+  u32 nErrors = 0;
+  fs::path proofPath{};
+  std::string res2048;
+};
+
+struct LLResult {
+  bool isPrime;
+  u64 res64;
+};
+
+struct ZAvg {
+  double sum{};
+  double n{};
+
+  void update(double z, u32 inc) {
+    sum += z * inc;
+    n += inc;
+  }
+
+  double avg() { return sum / n; }
+};
+
+class RoeInfo {
+public:
+  RoeInfo() = default;
+  RoeInfo(u32 n, double max, double mean, double sd) : N{n}, max{max}, mean{mean}, sd{sd} {
+    // https://en.wikipedia.org/wiki/Gumbel_distribution
+    gumbelBeta = sd * 0.779696801233676; // sqrt(6)/pi
+    gumbelMiu = mean - gumbelBeta * 0.577215664901533; // Euler-Mascheroni
+  }
+
+  double z(double x = 0.5) const { return N ? (x - gumbelMiu) / gumbelBeta : 0.0; }
+
+  double gumbelCDF(double x) const { return exp(-exp(-z(x))); }
+  double gumbelRightCDF(double x) const { return -expm1(-exp(-z(x))); }
+
+  std::string toString() const;
+
+  u32 N{};
+  double max{}, mean{}, sd{};
+  double gumbelMiu{}, gumbelBeta{};
+};
+
+struct Weights {
+  vector<double> weightsConstIF;
+  vector<double> weightsIF;
+};
+
+class Gpu {
+  GpuCommon shared;
+  Background* background;
+
+public:
+  const Args& args;
+
+private:
+  std::unique_ptr<Saver<PRPState>> saver;
+
+  u64 E;
+  u32 N;
+
+  FFTConfig fft;
+  u32 WIDTH;
+  u32 SMALL_H;
+  u32 BIG_H;
+
+  u32 hN, nW, nH;
+  bool useLongCarry;
+  u32 wantROE{};
+
+  Profile profile{};
+
+  // These values are populated by clDefines while KernelCompiler is built.
+  // They must be declared before compiler: C++ initializes members in declaration
+  // order, not initializer-list order.  The old order passed references to members
+  // whose lifetime had not started yet, which is undefined behaviour and triggered
+  // SIGABRT in the first Aevum arithmetic operation on Apple OpenCL.
+  bool tail_single_wide{false};          // TailSquare processes one line at a time
+  bool tail_single_kernel{true};         // TailSquare uses one kernel by default
+  u32 in_place{0};                       // 0 = out-of-place
+  u32 wmul{2};                           // Carry-fused width multiplier
+  u32 pad_size{0};                       // Padding in bytes
+
+  Queue queue;
+  vector<Queue> auxQueues;
+  KernelCompiler compiler;
+
+  /* Kernels for FFT_FP64 or FFT_FP32 */
+  bool prpMiddle1 = false;
+  Kernel kprpMiddle1, kprpMiddle1GF31, kprpMiddle1GF61;
+  Kernel kfftMidIn;
+  Kernel kfftHin;
+  Kernel ktailSquareZero;
+  Kernel ktailSquare;
+  Kernel ktailMul;
+  Kernel ktailMulLow;
+  Kernel kfftMidOut;
+  Kernel kfftW;
+
+  /* Kernels for NTT_GF31 */
+  Kernel kfftMidInGF31;
+  Kernel kfftHinGF31;
+  Kernel ktailSquareZeroGF31;
+  Kernel ktailSquareGF31;
+  Kernel ktailMulGF31;
+  Kernel ktailMulLowGF31;
+  Kernel kfftMidOutGF31;
+  Kernel kfftWGF31;
+
+  /* Kernels for NTT_GF61 */
+  Kernel kfftMidInGF61;
+  Kernel kfftHinGF61;
+#if defined(__APPLE__)
+  Kernel kfftHinGF61LoadScalarApple;
+  Kernel kfftHinGF61FftRadixApple;
+  Kernel kfftHinGF61FftTwiddleApple;
+  Kernel kfftHinGF61FftShuffleApple;
+  Kernel kfftHinGF61FftFinalApple;
+#endif
+  Kernel ktailSquareZeroGF61;
+  Kernel ktailSquareGF61;
+  Kernel ktailMulGF61;
+#if defined(__APPLE__)
+  Kernel ktailMulGF61LoadScalarApple;
+  Kernel ktailMulGF61FftRadixApple;
+  Kernel ktailMulGF61FftTwiddleApple;
+  Kernel ktailMulGF61FftShuffleApple;
+  Kernel ktailMulGF61FftFinalApple;
+  Kernel ktailMulGF61PairSpecialScalarApple;
+  Kernel ktailMulGF61PairNormalScalarApple;
+#endif
+  Kernel ktailMulLowGF61;
+  Kernel kfftMidOutGF61;
+#if defined(__APPLE__)
+  Kernel kfftMidOutGF61LoadScalarApple;
+  Kernel kfftMidOutGF61MulScalarApple;
+  Kernel kfftMidOutGF61FftApple;
+  Kernel kfftMidOutGF61Mul2ScalarApple;
+  Kernel kfftMidOutGF61WriteScalarApple;
+#endif
+  Kernel kfftWGF61;
+#if defined(__APPLE__)
+  Kernel kfftWGF61LoadScalarApple;
+  Kernel kfftWGF61WidthRadixApple;
+  Kernel kfftWGF61TwiddleShuffle1Apple;
+  Kernel kfftWGF61TwiddleShuffle4Apple;
+  Kernel kfftWGF61TwiddleShuffle8Apple;
+  Kernel kfftWGF61TwiddleShuffle16Apple;
+  Kernel kfftWGF61TwiddleShuffle64Apple;
+  Kernel kfftWGF61TwiddleShuffle256Apple;
+  Kernel kfftWGF61TwiddleShuffle512Apple;
+  Kernel kfftWGF61WidthFinalApple;
+  Kernel kfftWGF61LoadStage1FusedApple;
+  Kernel kfftWGF61WidthStageFused1Apple;
+  Kernel kfftWGF61WidthStageFused4Apple;
+  Kernel kfftWGF61WidthStageFused8Apple;
+  Kernel kfftWGF61WidthStageFused16Apple;
+  Kernel kfftWGF61WidthStageFused64Apple;
+  Kernel kfftWGF61WidthStageFused256Apple;
+  Kernel kfftWGF61WidthStageFused512Apple;
+#endif
+
+  /* Kernels dealing with the FP data and product of NTT primes */
+  Kernel kfftP;
+  Kernel kfftPCarryB;  // PFA9 carryB + fftP bridge for retained LEAD_WIDTH
+#if defined(__APPLE__)
+  Kernel kfftMidInGF61LoadScalarApple;
+  Kernel kfftMidInGF61Mul2FactorScalarApple;
+  Kernel kfftMidInGF61ApplyScalarApple;
+  Kernel kfftMidInGF61FftApple;
+  Kernel kfftMidInGF61MulApple;
+  Kernel kfftMidInGF61TransposeApple;
+  Kernel ktailSquareZeroGF61LoadApple;
+  Kernel ktailSquareZeroGF61FftRadixApple;
+  Kernel ktailSquareZeroGF61FftTwiddleApple;
+  Kernel ktailSquareZeroGF61FftShuffleApple;
+  Kernel ktailSquareZeroGF61FftFinalApple;
+  Kernel ktailSquareZeroGF61ReverseGlobalApple;
+  Kernel ktailSquareZeroGF61PairApple;
+  Kernel ktailSquareZeroGF61WriteDirectApple;
+  Kernel ktailSquareGF61LoadScalarApple;
+  Kernel ktailSquareGF61FftRadixApple;
+  Kernel ktailSquareGF61FftTwiddleApple;
+  Kernel ktailSquareGF61FftShuffleApple;
+  Kernel ktailSquareGF61FftFinalApple;
+  Kernel ktailSquareGF61ReverseCrossApple;
+  Kernel ktailSquareGF61PairApple;
+  Kernel ktailSquareGF61LoadStageFusedApple;
+  Kernel ktailSquareGF61StageFusedApple;
+  Kernel ktailSquareGF61PairCrossFusedApple;
+  Kernel ktailSquareGF61FinalPairFirstFusedApple;
+  Kernel kfftP31Apple;  // retained as an unused diagnostic fallback
+  Kernel kfftP31WeightScalarApple;
+  Kernel kfftP31WidthRadixApple;
+  Kernel kfftP31TwiddleShuffle1Apple;
+  Kernel kfftP31TwiddleShuffle4Apple;
+  Kernel kfftP31TwiddleShuffle8Apple;
+  Kernel kfftP31TwiddleShuffle16Apple;
+  Kernel kfftP31TwiddleShuffle64Apple;
+  Kernel kfftP31TwiddleShuffle256Apple;
+  Kernel kfftP31TwiddleShuffle512Apple;
+  Kernel kfftP31WidthFinalApple;
+  Kernel kfftP31WeightStage1FusedApple;
+  Kernel kfftP31WidthStageFused1Apple;
+  Kernel kfftP31WidthStageFused4Apple;
+  Kernel kfftP31WidthStageFused8Apple;
+  Kernel kfftP31WidthStageFused16Apple;
+  Kernel kfftP31WidthStageFused64Apple;
+  Kernel kfftP31WidthStageFused256Apple;
+  Kernel kfftP31WidthStageFused512Apple;
+  Kernel kfftP61WeightScalarApple;
+  Kernel kfftP61WidthRadixApple;
+  Kernel kfftP61TwiddleShuffle1Apple;
+  Kernel kfftP61TwiddleShuffle4Apple;
+  Kernel kfftP61TwiddleShuffle8Apple;
+  Kernel kfftP61TwiddleShuffle16Apple;
+  Kernel kfftP61TwiddleShuffle64Apple;
+  Kernel kfftP61TwiddleShuffle256Apple;
+  Kernel kfftP61TwiddleShuffle512Apple;
+  Kernel kfftP61WidthFinalApple;
+  Kernel kfftP61WeightStage1FusedApple;
+  Kernel kfftP61WidthStageFused1Apple;
+  Kernel kfftP61WidthStageFused4Apple;
+  Kernel kfftP61WidthStageFused8Apple;
+  Kernel kfftP61WidthStageFused16Apple;
+  Kernel kfftP61WidthStageFused64Apple;
+  Kernel kfftP61WidthStageFused256Apple;
+  Kernel kfftP61WidthStageFused512Apple;
+#endif
+  Kernel kCarryA;
+  Kernel kCarryAROE;
+  Kernel kCarryM;
+  Kernel kCarryMROE;
+  Kernel kCarryLL;
+  Kernel kCarryFused;
+  Kernel kCarryFusedROE;
+  Kernel kCarryFusedMul;
+  Kernel kCarryFusedMulROE;
+  Kernel kCarryFusedLL;
+
+  Kernel carryB;
+  Kernel transpIn, transpOut;
+  Kernel readResidue;
+  Kernel kernIsEqual;
+  Kernel sum64;
+  Kernel regAdd;
+  Kernel regSub;
+  Kernel regSubValue;
+
+  /* Weird test kernels */
+  Kernel testTrig;
+  Kernel testFFT4;
+  Kernel testFFT14;
+  Kernel testFFT15;
+  Kernel testFFT;
+  Kernel testTime;
+
+  // Kernel testKernel;
+
+  // Twiddles: trigonometry constant buffers, used in FFTs.
+  // The twiddles depend only on FFT config and do not depend on the exponent.
+  // It is important to generate the height trigs before the width trigs because width trigs can be a subset of the height trigs
+  TrigPtr bufTrigH;
+  TrigPtr bufTrigM;
+  TrigPtr bufTrigW;
+
+  // Weights and the "bigWord bits" are only needed for FP64 and FP32 FFTs
+  Weights weights;
+  Buffer<double> bufConstWeights;
+  Buffer<double> bufWeights;
+
+  // "integer word" buffers. These are "small buffers": N x int.
+  Buffer<Word> bufData;   // Main int buffer with the words.
+  Buffer<Word> bufAux;    // Auxiliary int buffer, used in transposing data in/out and in check.
+  Buffer<Word> bufCheck;  // Buffers used with the error check.
+
+  // Carry buffers, used in carry and fusedCarry.
+  Buffer<i64> bufCarry;  // Carry shuttle.
+  Buffer<int> bufReady;  // Per-group ready flag for stairway carry propagation.
+
+  // Small aux buffers.
+  Buffer<Word> bufSmallOut;
+  Buffer<u64> bufSumOut;
+  Buffer<int> bufTrue;
+  Buffer<float> bufROE; // The round-off error ("ROE"), one float element per iteration.
+  Buffer<float> bufStatsCarry;
+
+  u32 roePos{};   // The next position to write in the ROE stats buffer.
+  u32 carryPos{}; // The next position to write in the Carry stats buffer.
+
+  // The ROE positions originating from multiplications (as opposed to squarings).
+  vector<u32> mulRoePos;
+
+  // Auxilliary big buffers
+  Buffer<double> buf1;
+  Buffer<double> buf2;
+  Buffer<double> buf3;
+#if defined(__APPLE__)
+  // Two exceptional tail lines, each SMALL_HEIGHT GF61 values (GF61 = 2 doubles).
+  Buffer<double> bufAppleTailZeroGF61;
+  Buffer<double> bufAppleTailMulGF61;
+#endif
+
+  unsigned statsBits;
+  TimeInfo* timeBufVect;
+  ZAvg zAvg;
+
+  enum BOTTOM_HALF_KERNELS {KPRPMIDDLE1, KMIDIN, KFFTHIN, KTAILSQUARE, KTAILMUL, KTAILMULLOW, KMIDOUT, KFFTW};
+  vector<enum BOTTOM_HALF_KERNELS> recorded_kernels;
+  vector<Buffer<double> *> recorded_kernel_args;
+
+  const int NUM_CACHE_GROUPS = 3;
+  void splitQueue(void);
+  void mergeQueue(void);
+  void replay(void);
+
+  void fftP(Buffer<double>& out, Buffer<double>& in) { fftP(out, reinterpret_cast<Buffer<Word>&>(in)); }
+  void fftP(Buffer<double>& out, Buffer<Word>& in);
+  void fftPCarryB(Buffer<double>& out, Buffer<Word>& in);
+  void fftMidIn(Buffer<double>& buf);
+  void fftMidOut(Buffer<double>& buf);
+  void fftHin(Buffer<double>& out, Buffer<double>& in);
+  void tailSquare(Buffer<double>& buf);
+  void tailMul(Buffer<double>& buf, Buffer<double>& in2);
+  void tailMulLow(Buffer<double>& buf, Buffer<double>& in2);
+  void fftW(Buffer<double>& out, Buffer<double>& in);
+  void carryA(Buffer<double>& out, Buffer<double>& in) { carryA(reinterpret_cast<Buffer<Word>&>(out), in); }
+  void carryA(Buffer<Word>& out, Buffer<double>& in);
+  void carryM(Buffer<Word>& out, Buffer<double>& in);
+  void carryLL(Buffer<Word>& out, Buffer<double>& in);
+  void carryFused(Buffer<double>& buf);
+  void carryFusedMul(Buffer<double>& buf);
+  void carryFusedLL(Buffer<double>& buf);
+
+  vector<Word> readWords(Buffer<Word> &buf);
+  void writeWords(Buffer<Word>& buf, vector<Word> &words);
+
+  vector<Word> readOut(Buffer<Word> &buf);
+  void writeIn(Buffer<Word>& buf, vector<Word>&& words);
+
+  enum LEAD_TYPE {LEAD_NONE = 0, LEAD_WIDTH = 1, LEAD_MIDDLE = 2};
+
+  void square(Buffer<Word>& out, Buffer<Word>& in, enum LEAD_TYPE leadIn, enum LEAD_TYPE leadOut, bool doMul3 = false, bool doLL = false, bool prp = false);
+  void square(Buffer<Word>& io) { square(io, io, LEAD_NONE, LEAD_NONE, false, false); }
+  void squareCERT(Buffer<Word>& io, enum LEAD_TYPE leadIn, enum LEAD_TYPE leadOut) { square(io, io, leadIn, leadOut, false, false); }
+  void squareLL(Buffer<Word>& io, enum LEAD_TYPE leadIn, enum LEAD_TYPE leadOut) { square(io, io, leadIn, leadOut, false, true); }
+
+  u32 squareLoop(Buffer<Word>& out, Buffer<Word>& in, u64 from, u64 to, bool doTailMul3);
+  u32 squareLoop(Buffer<Word>& io, u64 from, u64 to) { return squareLoop(io, io, from, to, false); }
+
+  bool isEqual(Buffer<Word>& bufCheck, Buffer<Word>& bufAux);
+  u64 bufResidue(Buffer<Word>& buf);
+  
+  vector<u32> writeBase(const vector<u32> &v);
+  
+  void exponentiate(Buffer<Word>& bufInOut, u64 exp);
+
+  void writeState(u64 k, const vector<u32>& check, u32 blockSize);
+
+  // does either carrryFused() or the expanded version depending on useLongCarry
+  void doCarry(Buffer<double>& in, Buffer<Word>& wordBuf);
+
+  void mul(Buffer<Word>& ioA, Buffer<double>& inB, Buffer<double>& tmp1, bool mul3 = false);
+
+  void modMul(Buffer<Word>& ioA, Buffer<Word>& inB, bool mul3 = false);
+  void modMul(Buffer<Word>& ioA, Buffer<Word>& inB, enum LEAD_TYPE leadInB, bool mul3 = false);
+
+  fs::path saveProof(const Args& args, ProofSet& proofSet);
+  std::pair<RoeInfo, RoeInfo> readROE();
+  RoeInfo readCarryStats();
+
+  u32 updateCarryPos(u32 bit);
+
+  PRPState loadPRP(Saver<PRPState>& saver);
+
+  vector<Word> readChecked(Buffer<Word>& buf);
+
+  // void measureTransferSpeed();
+
+  static void doDiv9(u64 E, Words& words);
+  static bool equals9(const Words& words);
+  void selftestTrig();
+
+public:
+  Gpu(GpuCommon shared, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, bool logFftSize);
+  static unique_ptr<Gpu> make(u64 E, GpuCommon shared, FFTConfig fft, const vector<KeyVal>& extraConf = {}, bool logFftSize = true);
+
+  ~Gpu();
+
+  PRPResult isPrimePRP(const Task& task);
+  LLResult isPrimeLL(const Task& task);
+  array<u64, 4> isCERT(const Task& task);
+
+  double timePRP(int quick = 7);
+
+  tuple<bool, u64, RoeInfo, RoeInfo> measureROE(bool quick);
+  tuple<bool, RoeInfo> measureCarry();
+
+  Saver<PRPState> *getSaver();
+
+  void writeIn(Buffer<Word>& buf, const vector<u32> &words);
+
+  u64 dataResidue()  { return bufResidue(bufData); }
+  u64 checkResidue() { return bufResidue(bufCheck); }
+
+  bool doCheck(u32 blockSize);
+
+  void logTimeKernels();
+
+  Words readAndCompress(Buffer<Word>& buf);
+  vector<u32> readCheck();
+  vector<u32> readData();
+
+  u32 getFFTSize() { return N; }
+
+  // return A^h * B
+  Words expMul(const Words& A, u64 h, const Words& B, bool doSquareB);
+
+  // return A^h * B^2
+  Words expMul2(const Words& A, u64 h, const Words& B);
+
+  // A:= A^h * B
+  void expMul(Buffer<Word>& A, u64 h, Buffer<Word>& B);
+
+  // return A^(2^n)
+  Words expExp2(const Words& A, u32 n);
+  vector<Buffer<Word>> makeBufVector(u32 size);
+  vector<Buffer<double>> makeTransformBufVector(u32 size);
+
+  void regSync();
+  void regProfileReport(bool emit);
+  bool regSupportsLeadCache() const;
+  bool regSupportsFusedLL() const;
+  bool regSupportsPreparedMulLead() const;
+  void regSquareStep(Buffer<Word>& io, bool lead_in, bool lead_out, bool ll = false);
+  void regMulPreparedStep(Buffer<Word>& dst, Buffer<double>& prepared, bool lead_in, bool lead_out);
+  void regCopy(Buffer<Word>& dst, const Buffer<Word>& src);
+  void regWrite(Buffer<Word>& dst, const Words& words);
+  Words regRead(Buffer<Word>& src);
+  void regSquare(Buffer<Word>& io, u32 factor = 1);
+  void regPrepare(Buffer<Word>& src);
+  void regPrepare(Buffer<double>& prepared, Buffer<Word>& src);
+  void regMulPrepared(Buffer<Word>& dst, u32 factor = 1);
+  void regMulPrepared(Buffer<Word>& dst, Buffer<double>& prepared, u32 factor = 1);
+  void regMul(Buffer<Word>& dst, Buffer<Word>& src, u32 factor = 1);
+  void regAddWords(Buffer<Word>& dst, const Buffer<Word>& src);
+  void regSubWords(Buffer<Word>& dst, const Buffer<Word>& src);
+  void regSetU32(Buffer<Word>& dst, u32 value);
+  void regSubU32(Buffer<Word>& dst, u32 value);
+  bool regEqual(Buffer<Word>& lhs, Buffer<Word>& rhs);
+  void regDebugSquareTrace(Buffer<Word>& io, u64* trace, size_t trace_count);
+
+  void clear(bool isPRP);
+
+private:
+#if defined(__APPLE__)
+  bool apple_stage_finish = false;
+  bool apple_fused_tailsquare_gf61 = true;
+  bool apple_bridge_fused_tailsquare_gf61 = true;
+  bool apple_fused_fftp_width = true;
+  bool apple_fused_fftp_weight_first = true;
+  bool apple_fused_fftw_width = true;
+  bool apple_fused_fftw_load_first = true;
+  void appleStageFinish();
+#else
+  void appleStageFinish() {}
+#endif
+  u32 getProofPower(u64 k);
+  void doBigLog(u64 k, u64 res, bool checkOK, float secsPerIt, u64 nIters, u32 nErrors);
+  enum WHICH_KERNEL {CARRYFUSED=0, MIDIN=1, MIDIN31=2, MIDIN61=3, TAIL=4, TAIL31=5, TAIL61=6, MIDOUT=7, MIDOUT31=8, MIDOUT61=9};
+  string numCudaRegisters(enum WHICH_KERNEL which_kernel);
+  enum WHICH_KERNEL_TYPE {KFP=0, K31=1, K61=2, KALL=3};
+  string kernelDefines(enum WHICH_KERNEL_TYPE which_kernel);
+};
+
+// Compute the size of an FFT/NTT data buffer depending on the FFT/NTT float/prime.  Size is returned in units of sizeof(double).
+// Data buffers require extra space for padding.  We can probably tighten up the amount of extra memory allocated.
+// The worst case seems to be !INPLACE, MIDDLE=4, PAD_SIZE=512.
+
+#define MID_ADJUST(size,M,pad)                  ((pad == 0 || M != 4) ? (size) : (size) * 5/4)
+#define PAD_ADJUST(N,M,inplace,pad)             (inplace ? 3*N/2 : MID_ADJUST(pad == 0 ? N : pad <= 128 ? 9*N/8 : pad <= 256 ? 5*N/4 : 3*N/2, M, pad))
+#define FP64_DATA_SIZE(W,M,H,inplace,pad)       PAD_ADJUST(W*M*H*2, M, inplace, pad)
+#define FP32_DATA_SIZE(W,M,H,inplace,pad)       PAD_ADJUST(W*M*H*2, M, inplace, pad) * sizeof(float) / sizeof(double)
+#define GF31_DATA_SIZE(W,M,H,inplace,pad)       PAD_ADJUST(W*M*H*2, M, inplace, pad) * sizeof(uint) / sizeof(double)
+#define GF61_DATA_SIZE(W,M,H,inplace,pad)       PAD_ADJUST(W*M*H*2, M, inplace, pad) * sizeof(ulong) / sizeof(double)
+#define TOTAL_DATA_SIZE(fft,W,M,H,inplace,pad)  (int)fft.FFT_FP64 * FP64_DATA_SIZE(W,M,H,inplace,pad) + (int)fft.FFT_FP32 * FP32_DATA_SIZE(W,M,H,inplace,pad) + \
+                                                (int)fft.NTT_GF31 * GF31_DATA_SIZE(W,M,H,inplace,pad) + (int)fft.NTT_GF61 * GF61_DATA_SIZE(W,M,H,inplace,pad)

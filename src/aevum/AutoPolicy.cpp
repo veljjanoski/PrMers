@@ -9,6 +9,12 @@
 
 namespace {
 
+bool runtime_autotune_enabled() {
+    const char* value = std::getenv("AEVUM_AUTOTUNE");
+    if (!value || !*value) return true;
+    return std::string(value) != "0" && std::string(value) != "off" && std::string(value) != "OFF";
+}
+
 double parse_env_ratio(const char* name, const double fallback) {
     const char* value = std::getenv(name);
     if (!value || !*value) return fallback;
@@ -26,6 +32,13 @@ struct PolicyProfile {
     const char* compatibility_reason = nullptr;
 };
 
+const char* plan_family(const std::string& spec) {
+    if (spec.rfind("4:", 0) == 0) return "Type4 FFT323161";
+    if (spec.rfind("pfa9:", 0) == 0) return "PFA9";
+    if (spec.rfind("pfa3:", 0) == 0) return "PFA3";
+    return "Type1 FFT3161";
+}
+
 PolicyProfile profile_for(const engine::gpu_workload workload, const std::size_t register_count) {
     switch (workload) {
         case engine::gpu_workload::prp:
@@ -34,16 +47,16 @@ PolicyProfile profile_for(const engine::gpu_workload workload, const std::size_t
             return {1.00, "PRP/LL throughput", "AEVUM_AUTO_LL_MAX_RATIO"};
         case engine::gpu_workload::pm1:
             if (register_count <= 16) {
-                // Normal Stage 1 uses the generic engine API. Aevum is worthwhile
-                // only with a clear transform-size advantage.
-                return {0.75, "P-1 Stage 1", "AEVUM_AUTO_PM1_STAGE1_MAX_RATIO"};
+                // RC2: admit Aevum up to equal transform size, then let the real-GPU
+                // differential gate decide whether this becomes the tagged default.
+                return {1.00, "P-1 Stage 1", "AEVUM_AUTO_PM1_STAGE1_MAX_RATIO"};
             }
             return {1.00, "P-1 multi-register/Stage 2", "AEVUM_AUTO_PM1_STAGE2_MAX_RATIO"};
         case engine::gpu_workload::pm1_lowmem:
             // The 3-register low-memory implementation uses generic set/pow/mul
-            // operations and is valid on both engines. Keep the same conservative
-            // transform advantage as normal Stage 1.
-            return {0.75, "P-1 low-memory (3-register)", "AEVUM_AUTO_PM1_LOWMEM_MAX_RATIO"};
+            // operations and is valid on both engines. RC2 uses the same equal-size
+            // admission gate as normal P-1.
+            return {1.00, "P-1 low-memory (3-register)", "AEVUM_AUTO_PM1_LOWMEM_MAX_RATIO"};
         case engine::gpu_workload::pm1_ultralowmem:
             // The one-register implementation encodes multiply-by-3 in Marin's
             // fast3 square operation. It is an algorithmic incompatibility, not a
@@ -51,9 +64,9 @@ PolicyProfile profile_for(const engine::gpu_workload workload, const std::size_t
             return {0.0, "P-1 ultra-low-memory (1-register)", nullptr, false,
                     "Marin fast3-only one-register algorithm"};
         case engine::gpu_workload::ecm:
-            // ECM has 51 long-lived registers and many mixed operations. Stay
-            // conservative unless Aevum saves at least 25% of transform length.
-            return {0.75, "ECM conservative", "AEVUM_AUTO_ECM_MAX_RATIO"};
+            // RC2 validates mixed-operation Aevum directly on RTX 3080/Radeon VII;
+            // admit equal-size plans here and retain Marin fallback when unsupported.
+            return {1.00, "ECM mixed-operation", "AEVUM_AUTO_ECM_MAX_RATIO"};
         default:
             return {0.75, "generic conservative", "AEVUM_AUTO_GENERIC_MAX_RATIO"};
     }
@@ -75,7 +88,8 @@ const char* aevum_workload_name(const engine::gpu_workload value) {
 
 AevumAutoDecision aevum_auto_decide(const std::uint32_t exponent,
                                     const std::size_t register_count,
-                                    const engine::gpu_workload workload) {
+                                    const engine::gpu_workload workload,
+                                    const std::string& fft_spec) {
     AevumAutoDecision result;
     result.marin_transform = ibdwt::transform_size(exponent);
 
@@ -93,10 +107,127 @@ AevumAutoDecision aevum_auto_decide(const std::uint32_t exponent,
     }
 
     std::string reason;
-    if (!aevum_engine_resolve_auto_fft(exponent, &result.aevum_transform, &result.fft_spec, &reason)) {
+    const bool native_request = fft_spec.empty();
+#if defined(__APPLE__)
+    const bool native_prp_geometry = false;
+#else
+    const bool native_prp_geometry =
+        native_request &&
+        !runtime_autotune_enabled() &&
+        workload == engine::gpu_workload::prp;
+#endif
+    const bool resolved = native_prp_geometry
+        ? aevum_engine_resolve_fft(
+              exponent, "native-prp:auto",
+              &result.aevum_transform, &result.fft_spec, &reason)
+        : native_request
+          ? aevum_engine_resolve_auto_fft(
+                exponent, &result.aevum_transform, &result.fft_spec, &reason)
+          : aevum_engine_resolve_fft(
+                exponent, fft_spec,
+                &result.aevum_transform, &result.fft_spec, &reason);
+    if (!resolved) {
         result.detail = reason;
         return result;
     }
+
+    // v100.17 low-range correctness gate.
+    //
+    // The native ordinary-Mersenne 512K Aevum plan is known-bad on an external
+    // Windows/RTX 4070 Ti SUPER reproduction. Never run that plan in AUTO.
+    // On Linux/Windows, however, a *larger* Aevum plan may still be correct and
+    // faster than Marin. Defer that decision to create_gpu(), which performs a
+    // deterministic word-exact differential probe and a measured throughput
+    // comparison, then caches the result for this exact exponent/GPU/version.
+    //
+    // Smaller native plans stay Marin-only. Gaussian PRP/Proth is untouched
+    // because it uses a different 1/3-register path.
+    constexpr std::size_t kOrdinaryPrpQuarantineWords = 524288u;
+    if (workload == engine::gpu_workload::prp &&
+        register_count == 8u &&
+        result.aevum_transform > 0 &&
+        result.aevum_transform <= kOrdinaryPrpQuarantineWords) {
+#if !defined(__APPLE__)
+        if (native_request &&
+            result.aevum_transform == kOrdinaryPrpQuarantineWords) {
+            std::ostringstream out;
+            out << "profile=" << profile.name
+                << ", regs=" << register_count
+                << ", native-Aevum=" << result.aevum_transform
+                << ", Marin=" << result.marin_transform
+                << ", native-family=" << plan_family(result.fft_spec)
+                << ", native-FFT=" << result.fft_spec
+                << ", safety=runtime-compare (native 512K forbidden; larger Aevum candidates require exact differential + measured speed win)";
+            result.detail = out.str();
+            result.use_aevum = false;
+            result.runtime_compare = true;
+            return result;
+        }
+#endif
+        std::ostringstream out;
+        out << "profile=" << profile.name
+            << ", regs=" << register_count
+            << ", Aevum=" << result.aevum_transform
+            << ", Marin=" << result.marin_transform
+            << ", family=" << plan_family(result.fft_spec)
+            << ", FFT=" << result.fft_spec
+            << ", safety=Marin-only (ordinary PRP native Aevum <=512K quarantined)";
+        result.detail = out.str();
+        result.use_aevum = false;
+        return result;
+    }
+
+    // v100.09 PRP boundary bridge.
+    //
+    // Issue #36 proved that choosing Type4 merely because it has the same
+    // transform length as native Type1 is wrong on some GPUs (notably GB202).
+    // Conversely, RTX 5090 and Radeon VII measurements around 197M show that
+    // upstream-style Type4 4M 4:1K:8:256:101 remains usable at ~46.97 bpw
+    // while native Type1 has already stepped to 8M.
+    //
+    // Promote Type4 only when it is a genuine size bridge, never merely a
+    // same-size alternative to native Type1.
+    bool type4_boundary_bridge = false;
+    double type4_boundary_bpw = 0.0;
+    double type4_boundary_reduction = 1.0;
+#if !defined(__APPLE__)
+    if (native_request &&
+        !runtime_autotune_enabled() &&
+        workload == engine::gpu_workload::prp &&
+        result.fft_spec.rfind("1:", 0) == 0) {
+        constexpr const char* kType4BoundaryPlan = "4:1K:8:256:101";
+        constexpr double kType4BoundaryMaxBpw = 46.97;
+        constexpr double kType4BoundaryMinReduction = 1.50;
+
+        // The bridge plan is a fixed 4M transform.  Check the cheap policy
+        // gates before asking the plugin to resolve it; this avoids emitting
+        // a misleading "may be too small" warning for exponents above the
+        // measured bridge boundary when that candidate will not be selected.
+        constexpr std::size_t kType4BoundaryWords = 4194304u;
+        type4_boundary_bpw =
+            static_cast<double>(exponent) / static_cast<double>(kType4BoundaryWords);
+        type4_boundary_reduction =
+            static_cast<double>(result.aevum_transform) /
+            static_cast<double>(kType4BoundaryWords);
+
+        if (kType4BoundaryWords < result.aevum_transform &&
+            type4_boundary_reduction >= kType4BoundaryMinReduction &&
+            type4_boundary_bpw <= kType4BoundaryMaxBpw) {
+            std::size_t bridge_transform = 0;
+            std::string bridge_spec;
+            std::string bridge_reason;
+            if (aevum_engine_resolve_fft(exponent, kType4BoundaryPlan,
+                                         &bridge_transform, &bridge_spec, &bridge_reason) &&
+                bridge_transform == kType4BoundaryWords &&
+                bridge_spec == kType4BoundaryPlan) {
+                result.aevum_transform = bridge_transform;
+                result.fft_spec = bridge_spec;
+                result.force_fft_spec = true;
+                type4_boundary_bridge = true;
+            }
+        }
+    }
+#endif
 
     const double ratio = result.marin_transform == 0
         ? 1000.0
@@ -114,7 +245,14 @@ AevumAutoDecision aevum_auto_decide(const std::uint32_t exponent,
         << ", Marin=" << result.marin_transform
         << ", ratio=" << std::fixed << std::setprecision(2) << ratio
         << ", limit=" << std::fixed << std::setprecision(2) << limit
+        << ", family=" << plan_family(result.fft_spec)
         << ", FFT=" << result.fft_spec;
+    if (type4_boundary_bridge) {
+        out << ", boundary-bridge=1"
+            << ", type4-bpw=" << std::fixed << std::setprecision(2) << type4_boundary_bpw
+            << ", size-reduction=" << std::fixed << std::setprecision(2)
+            << type4_boundary_reduction << "x";
+    }
     result.detail = out.str();
     result.use_aevum = ratio <= limit;
     return result;

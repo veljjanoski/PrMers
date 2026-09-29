@@ -4,6 +4,24 @@
 #include "fftwidth.cl"
 #include "middle.cl"
 
+#if (FFT_TYPE == FFT3161 || FFT_TYPE == FFT323161) && PFA_RADIX
+// Map one scalar produced by an inverse PFA width row directly to the
+// canonical transposed pair layout consumed by carry.cl.  This fuses the
+// former transform-sized pfaUnpack pass into fftW.
+inline u32 pfaWLogicalIndex(u32 row, u32 binary_index) {
+  const u32 delta = (row + PFA_RADIX - binary_index % PFA_RADIX) % PFA_RADIX;
+  const u32 t = (delta * PFA_L_INV) % PFA_RADIX;
+  return binary_index + PFA_BINARY_LENGTH * t;
+}
+
+inline u32 pfaWCanonicalPairIndex(u32 logical) {
+  const u32 pair = logical >> 1;
+  const u32 x = pair / BIG_HEIGHT;
+  const u32 line = pair - x * BIG_HEIGHT;
+  return line * WIDTH + x;
+}
+#endif
+
 #if FFT_FP64
 
 // Do the ending fft_WIDTH after an fftMiddleOut.  This is the same as the first half of carryFused.
@@ -47,8 +65,26 @@ KERNEL(G_W) fftW(P(T2) out, CP(T2) in, Trig smallTrig) {
 
   readCarryFusedLine(inF2, u, g, me);
   fft_WIDTH(lds, u, smallTrigF2, 1, me);
+#if FFT_TYPE == FFT323161 && PFA_RADIX
+  // Match the fused CRT scatter below.  The inverse tail swaps components:
+  // y carries the even binary digit and x carries the odd binary digit.
+  P(F) outScalarF = (P(F)) outF2;
+  const u32 row = g / SMALL_HEIGHT;
+  const u32 y = g - row * SMALL_HEIGHT;
+  const u32 firstBinaryPair = me * SMALL_HEIGHT + y;
+  u32 nEven = pfaWLogicalIndex(row, firstBinaryPair * 2u);
+  u32 nOdd  = pfaWLogicalIndex(row, firstBinaryPair * 2u + 1u);
+#pragma unroll
+  for (u32 i = 0; i < NW; ++i) {
+    outScalarF[pfaWCanonicalPairIndex(nEven) * 2u + 1u] = u[i].y;
+    outScalarF[pfaWCanonicalPairIndex(nOdd)  * 2u]      = u[i].x;
+    nEven += PFA_LOGICAL_STEP; if (nEven >= NWORDS) nEven -= NWORDS;
+    nOdd  += PFA_LOGICAL_STEP; if (nOdd  >= NWORDS) nOdd  -= NWORDS;
+  }
+#else
   outF2 += WIDTH * g;
   write(G_W, NW, u, outF2, 0);
+#endif
 }
 
 #endif
@@ -75,8 +111,27 @@ KERNEL(G_W) fftWGF31(P(T2) out, CP(T2) in, Trig smallTrig) {
 
   readCarryFusedLine(in31, u, g, me);
   fft_WIDTH(lds, u, smallTrig31, 1, me);
+#if (FFT_TYPE == FFT3161 || FFT_TYPE == FFT323161) && PFA_RADIX
+  // The inverse tail leaves components swapped: y is the even binary digit,
+  // x is the odd binary digit.  Scatter scalar stores so adjacent canonical
+  // digits may safely originate in different Good-Thomas rows.
+  P(Z31) outScalar31 = (P(Z31)) out31;
+  const u32 row = g / SMALL_HEIGHT;
+  const u32 y = g - row * SMALL_HEIGHT;
+  const u32 firstBinaryPair = me * SMALL_HEIGHT + y;
+  u32 nEven = pfaWLogicalIndex(row, firstBinaryPair * 2u);
+  u32 nOdd  = pfaWLogicalIndex(row, firstBinaryPair * 2u + 1u);
+#pragma unroll
+  for (u32 i = 0; i < NW; ++i) {
+    outScalar31[pfaWCanonicalPairIndex(nEven) * 2u + 1u] = u[i].y;
+    outScalar31[pfaWCanonicalPairIndex(nOdd)  * 2u]      = u[i].x;
+    nEven += PFA_LOGICAL_STEP; if (nEven >= NWORDS) nEven -= NWORDS;
+    nOdd  += PFA_LOGICAL_STEP; if (nOdd  >= NWORDS) nOdd  -= NWORDS;
+  }
+#else
   out31 += WIDTH * g;
   write(G_W, NW, u, out31, 0);
+#endif
 }
 
 #endif
@@ -103,8 +158,180 @@ KERNEL(G_W) fftWGF61(P(T2) out, CP(T2) in, Trig smallTrig) {
 
   readCarryFusedLine(in61, u, g, me);
   fft_WIDTH(lds, u, smallTrig61, 1, me);
+#if (FFT_TYPE == FFT3161 || FFT_TYPE == FFT323161) && PFA_RADIX
+  P(Z61) outScalar61 = (P(Z61)) out61;
+  const u32 row = g / SMALL_HEIGHT;
+  const u32 y = g - row * SMALL_HEIGHT;
+  const u32 firstBinaryPair = me * SMALL_HEIGHT + y;
+  u32 nEven = pfaWLogicalIndex(row, firstBinaryPair * 2u);
+  u32 nOdd  = pfaWLogicalIndex(row, firstBinaryPair * 2u + 1u);
+#pragma unroll
+  for (u32 i = 0; i < NW; ++i) {
+    outScalar61[pfaWCanonicalPairIndex(nEven) * 2u + 1u] = u[i].y;
+    outScalar61[pfaWCanonicalPairIndex(nOdd)  * 2u]      = u[i].x;
+    nEven += PFA_LOGICAL_STEP; if (nEven >= NWORDS) nEven -= NWORDS;
+    nOdd  += PFA_LOGICAL_STEP; if (nOdd  >= NWORDS) nOdd  -= NWORDS;
+  }
+#else
   out61 += WIDTH * g;
   write(G_W, NW, u, out61, 0);
+#endif
 }
+
+#if defined(AEVUM_APPLE_OPENCL12)
+
+// Apple accepts the full fftMiddleOutGF61 pipeline but rejects the following
+// monolithic fftWGF61 pipeline at clCreateKernel.  Stage only this GF61 width
+// transform.  No extra transform-sized allocation is needed: the caller's
+// output and consumed middle-out input buffers are the two ping-pong banks.
+KERNEL(G_W) fftWGF61ApplePlaceholder(P(T2) out, CP(T2) in, Trig smallTrig) {
+  if (get_global_id(0) == 0) out[0] = in[0];
+}
+
+// Scalar form of readCarryFusedLine for the Apple-forced INPLACE=0, PAD=0
+// layout.  Each work-item loads exactly one GF61 value and writes the normal
+// contiguous width-line layout consumed by the staged radix kernels.
+KERNEL(G_W) fftWGF61LoadScalarApple(P(T2) outRaw, CP(T2) inRaw) {
+  const u32 p = get_global_id(0);
+  const u32 line = p / WIDTH;
+  const u32 x = p - line * WIDTH;
+  const u32 i = x / G_W;
+  const u32 me = x - i * G_W;
+  const u32 sizeY = OUT_WG / OUT_SIZEX;
+
+  const u32 middleOutX = line % SMALL_HEIGHT;
+  const u32 chunkX = middleOutX / OUT_SIZEX;
+  const u32 xWithinOutWg = middleOutX % OUT_SIZEX;
+  const u32 middleOutI = line / SMALL_HEIGHT;
+  const u32 chunkY = me / sizeY + i * (G_W / sizeY);
+
+  const u32 src = chunkX * MIDDLE * WIDTH * OUT_SIZEX
+                + xWithinOutWg * sizeY
+                + middleOutI * OUT_WG
+                + (me % sizeY)
+                + chunkY * MIDDLE * OUT_WG;
+
+  CP(GF61) in61 = (CP(GF61)) (inRaw + DISTGF61);
+  P(GF61) out61 = (P(GF61)) (outRaw + DISTGF61);
+  out61[p] = in61[src];
+}
+
+KERNEL(G_W) fftWGF61WidthRadixApple(P(T2) ioRaw) {
+  GF61 u[NW];
+  const u32 g = get_group_id(0);
+  const u32 me = get_local_id(0);
+  P(GF61) io61 = (P(GF61)) (ioRaw + DISTGF61) + g * WIDTH + me;
+
+  for (u32 i = 0; i < NW; ++i) u[i] = io61[i * G_W];
+  fft_RADIX(u);
+  for (u32 i = 0; i < NW; ++i) io61[i * G_W] = u[i];
+}
+
+#define DEFINE_APPLE_FFTW_GF61_TWIDDLE_SHUFFLE(NAME, STAGE)                    \
+KERNEL(G_W) NAME(P(T2) outRaw, CP(T2) inRaw, global const T2 *trigRaw) {        \
+  const u32 p = get_global_id(0);                                               \
+  const u32 line = p / WIDTH;                                                   \
+  const u32 x = p - line * WIDTH;                                               \
+  const u32 i = x / G_W;                                                        \
+  const u32 me = x - i * G_W;                                                   \
+  CP(GF61) in61 = (CP(GF61)) (inRaw + DISTGF61);                               \
+  P(GF61) out61 = (P(GF61)) (outRaw + DISTGF61);                               \
+  TrigGF61 trig61 = (TrigGF61) (trigRaw + DISTWTRIGGF61);                      \
+  GF61 v = in61[p];                                                             \
+  const u32 mask = (STAGE) - 1;                                                 \
+  const u32 trigBase = me & ~mask;                                              \
+  if (i != 0) v = cmul(v, TFLOAD(&trig61[(i - 1) * G_W + trigBase]));          \
+  const u32 dst = i * (STAGE) + (me & ~mask) * NW + (me & mask);               \
+  out61[line * WIDTH + dst] = v;                                                \
+}
+
+DEFINE_APPLE_FFTW_GF61_TWIDDLE_SHUFFLE(fftWGF61TwiddleShuffle1Apple,   1)
+DEFINE_APPLE_FFTW_GF61_TWIDDLE_SHUFFLE(fftWGF61TwiddleShuffle4Apple,   4)
+DEFINE_APPLE_FFTW_GF61_TWIDDLE_SHUFFLE(fftWGF61TwiddleShuffle8Apple,   8)
+DEFINE_APPLE_FFTW_GF61_TWIDDLE_SHUFFLE(fftWGF61TwiddleShuffle16Apple, 16)
+DEFINE_APPLE_FFTW_GF61_TWIDDLE_SHUFFLE(fftWGF61TwiddleShuffle64Apple, 64)
+DEFINE_APPLE_FFTW_GF61_TWIDDLE_SHUFFLE(fftWGF61TwiddleShuffle256Apple, 256)
+DEFINE_APPLE_FFTW_GF61_TWIDDLE_SHUFFLE(fftWGF61TwiddleShuffle512Apple, 512)
+
+#undef DEFINE_APPLE_FFTW_GF61_TWIDDLE_SHUFFLE
+
+// v0.3.56: exact radix + twiddle + shuffle composition for the Apple GF61
+// inverse width transform.  This removes one full GF61 write/read round trip
+// per width stage without LDS or a cross-work-item barrier.
+#define DEFINE_APPLE_FFTW_GF61_STAGE_FUSED(NAME, STAGE)                        \
+KERNEL(G_W) NAME(P(T2) outRaw, CP(T2) inRaw, global const T2 *trigRaw) {        \
+  const u32 line = get_group_id(0);                                             \
+  const u32 me = get_local_id(0);                                                \
+  CP(GF61) in61 = (CP(GF61)) (inRaw + DISTGF61) + line * WIDTH;                 \
+  P(GF61) out61 = (P(GF61)) (outRaw + DISTGF61) + line * WIDTH;                 \
+  TrigGF61 trig61 = (TrigGF61) (trigRaw + DISTWTRIGGF61);                      \
+  GF61 u[NW];                                                                   \
+  for (u32 i = 0; i < NW; ++i) u[i] = in61[i * G_W + me];                      \
+  fft_RADIX(u);                                                                 \
+  const u32 mask = (STAGE) - 1;                                                 \
+  const u32 trigBase = me & ~mask;                                              \
+  for (u32 i = 0; i < NW; ++i) {                                                \
+    GF61 v = u[i];                                                              \
+    if (i != 0) v = cmul(v, TFLOAD(&trig61[(i - 1) * G_W + trigBase]));        \
+    const u32 dst = i * (STAGE) + (me & ~mask) * NW + (me & mask);             \
+    out61[dst] = v;                                                             \
+  }                                                                             \
+}
+
+DEFINE_APPLE_FFTW_GF61_STAGE_FUSED(fftWGF61WidthStageFused1Apple,   1)
+DEFINE_APPLE_FFTW_GF61_STAGE_FUSED(fftWGF61WidthStageFused4Apple,   4)
+DEFINE_APPLE_FFTW_GF61_STAGE_FUSED(fftWGF61WidthStageFused8Apple,   8)
+DEFINE_APPLE_FFTW_GF61_STAGE_FUSED(fftWGF61WidthStageFused16Apple, 16)
+DEFINE_APPLE_FFTW_GF61_STAGE_FUSED(fftWGF61WidthStageFused64Apple, 64)
+DEFINE_APPLE_FFTW_GF61_STAGE_FUSED(fftWGF61WidthStageFused256Apple, 256)
+DEFINE_APPLE_FFTW_GF61_STAGE_FUSED(fftWGF61WidthStageFused512Apple, 512)
+
+#undef DEFINE_APPLE_FFTW_GF61_STAGE_FUSED
+
+// Exact LoadScalar + stage-1 composition.  The host keeps source and
+// destination distinct so the global transpose load remains race-free.
+KERNEL(G_W) fftWGF61LoadStage1FusedApple(P(T2) outRaw, CP(T2) inRaw,
+                                         global const T2 *trigRaw) {
+  const u32 line = get_group_id(0);
+  const u32 me = get_local_id(0);
+  const u32 sizeY = OUT_WG / OUT_SIZEX;
+  CP(GF61) in61 = (CP(GF61)) (inRaw + DISTGF61);
+  P(GF61) out61 = (P(GF61)) (outRaw + DISTGF61) + line * WIDTH;
+  TrigGF61 trig61 = (TrigGF61) (trigRaw + DISTWTRIGGF61);
+  GF61 u[NW];
+  for (u32 i = 0; i < NW; ++i) {
+    const u32 middleOutX = line % SMALL_HEIGHT;
+    const u32 chunkX = middleOutX / OUT_SIZEX;
+    const u32 xWithinOutWg = middleOutX % OUT_SIZEX;
+    const u32 middleOutI = line / SMALL_HEIGHT;
+    const u32 chunkY = me / sizeY + i * (G_W / sizeY);
+    const u32 src = chunkX * MIDDLE * WIDTH * OUT_SIZEX
+                  + xWithinOutWg * sizeY
+                  + middleOutI * OUT_WG
+                  + (me % sizeY)
+                  + chunkY * MIDDLE * OUT_WG;
+    u[i] = in61[src];
+  }
+  fft_RADIX(u);
+  for (u32 i = 0; i < NW; ++i) {
+    GF61 v = u[i];
+    if (i != 0) v = cmul(v, TFLOAD(&trig61[(i - 1) * G_W + me]));
+    out61[i + me * NW] = v;
+  }
+}
+
+KERNEL(G_W) fftWGF61WidthFinalApple(P(T2) outRaw, CP(T2) inRaw) {
+  GF61 u[NW];
+  const u32 g = get_group_id(0);
+  const u32 me = get_local_id(0);
+  CP(GF61) in61 = (CP(GF61)) (inRaw + DISTGF61) + g * WIDTH + me;
+  P(GF61) out61 = (P(GF61)) (outRaw + DISTGF61) + g * WIDTH + me;
+
+  for (u32 i = 0; i < NW; ++i) u[i] = in61[i * G_W];
+  fft_RADIX(u);
+  for (u32 i = 0; i < NW; ++i) out61[i * G_W] = u[i];
+}
+
+#endif  // AEVUM_APPLE_OPENCL12
 
 #endif

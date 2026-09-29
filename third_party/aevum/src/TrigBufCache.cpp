@@ -670,9 +670,7 @@ vector<uint2> genSmallTrigComboGF31(Args *args, u32 width, u32 middle, u32 size,
 
 vector<uint2> genMiddleTrigGF31(u32 smallH, u32 middle, u32 width) {
   vector<uint2> tab;
-  if (middle == 1) {
-    tab.resize(1);
-  } else {
+  { // MIDDLE=1 still needs width and width*height roots for middleMul2.
     GF31 root1hm = GF31::root_one(smallH * middle);
     for (u32 m = 1; m < middle; ++m) {
       for (u32 k = 0; k < smallH; ++k) { tab.push_back(root1GF31(root1hm, k * m)); }
@@ -832,9 +830,7 @@ vector<ulong2> genSmallTrigComboGF61(Args *args, u32 width, u32 middle, u32 size
 
 vector<ulong2> genMiddleTrigGF61(u32 smallH, u32 middle, u32 width) {
   vector<ulong2> tab;
-  if (middle == 1) {
-    tab.resize(1);
-  } else {
+  { // MIDDLE=1 still needs width and width*height roots for middleMul2.
     GF61 root1hm = GF61::root_one(smallH * middle);
     for (u32 m = 1; m < middle; ++m) {
       for (u32 k = 0; k < smallH; ++k) { tab.push_back(root1GF61(root1hm, k * m)); }
@@ -910,7 +906,7 @@ vector<double2> genSmallTrigCombo(Args *args, FFTConfig fft, u32 width, u32 midd
   }
 
   if (fft.NTT_GF31) {
-    vector<uint2> tab2 = genSmallTrigComboGF31(args, width, middle, size, radix, tail_single_wide);
+    vector<uint2> tab2 = genSmallTrigComboGF31(args, width, fft.isPfa() ? 1u : middle, size, radix, tail_single_wide);
     tab2.resize(SMALLTRIGCOMBO_GF31_SIZE(width, middle, size, radix));
     // Append tab2 to tab
     tabsize = tab.size();
@@ -919,7 +915,7 @@ vector<double2> genSmallTrigCombo(Args *args, FFTConfig fft, u32 width, u32 midd
   }
 
   if (fft.NTT_GF61) {
-    vector<ulong2> tab3 = genSmallTrigComboGF61(args, width, middle, size, radix, tail_single_wide);
+    vector<ulong2> tab3 = genSmallTrigComboGF61(args, width, fft.isPfa() ? 1u : middle, size, radix, tail_single_wide);
     tab3.resize(SMALLTRIGCOMBO_GF61_SIZE(width, middle, size, radix));
     // Append tab3 to tab
     tabsize = tab.size();
@@ -949,7 +945,7 @@ vector<double2> genMiddleTrig(FFTConfig fft, u32 smallH, u32 middle, u32 width) 
   }
 
   if (fft.NTT_GF31) {
-    vector<uint2> tab2 = genMiddleTrigGF31(smallH, middle, width);
+    vector<uint2> tab2 = fft.isPfa() ? vector<uint2>(MIDDLETRIG_GF31_SIZE(width, middle, smallH), uint2{1u, 0u}) : genMiddleTrigGF31(smallH, middle, width);
     tab2.resize(MIDDLETRIG_GF31_SIZE(width, middle, smallH));
     // Append tab2 to tab
     tabsize = tab.size();
@@ -958,7 +954,7 @@ vector<double2> genMiddleTrig(FFTConfig fft, u32 smallH, u32 middle, u32 width) 
   }
 
   if (fft.NTT_GF61) {
-    vector<ulong2> tab3 = genMiddleTrigGF61(smallH, middle, width);
+    vector<ulong2> tab3 = fft.isPfa() ? vector<ulong2>(MIDDLETRIG_GF61_SIZE(width, middle, smallH), ulong2{1u, 0u}) : genMiddleTrigGF61(smallH, middle, width);
     tab3.resize(MIDDLETRIG_GF61_SIZE(width, middle, smallH));
     // Append tab3 to tab
     tabsize = tab.size();

@@ -4,6 +4,8 @@ GPU-accelerated PRP, Lucas-Lehmer, P-1 and ECM testing for Mersenne numbers.
 
 https://github.com/cherubrock-seb/PrMers
 
+Distributed Gaussian-Mersenne work, public factors and result tracking are available on [GMNet](https://gmnet.gaussianmersenne.workers.dev/results).
+
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/cherubrock-seb/PrMers/blob/main/prmers.ipynb)
 
 Releases for Linux, macOS and Windows are available here:
@@ -12,10 +14,11 @@ Releases for Linux, macOS and Windows are available here:
 
 PrMers is an OpenCL GPU program focused on long modular arithmetic runs for numbers of the form `2^p - 1`. It supports PRP, Lucas-Lehmer, P-1 and ECM workflows, with checkpointing, result JSON output, Prime95 compatible handoff files, worktodo parsing, and an optional web GUI.
 
-The default backend policy is automatic. PrMers selects between the Marin backend by Yves Gallot and the optional Aevum backend from the workload, register count and transform sizes. Marin uses an integer IBDWT-style transform modulo `2^64 - 2^32 + 1`. Aevum exposes GPUOwl/PRPLL paired integer NTT arithmetic over `GF(M31^2)` and `GF(M61^2)` through a PrMers `engine::Reg` adapter. The v99.7 policy uses measured transform-size thresholds per workload. The adapter retains GPU-side register equality for Gerbicz checks and bounded Mersenne carry canonicalization for residue export.
+The default backend policy is automatic on Linux and Windows. On macOS, Marin is the safe platform default and Aevum is used only when `-aevum` (or `-aevum-fft`) is supplied explicitly. PrMers otherwise selects between the Marin backend by Yves Gallot and the optional Aevum backend from the workload, register count and transform sizes. Marin uses an integer IBDWT-style transform modulo `2^64 - 2^32 + 1`. Aevum exposes GPUOwl/PRPLL paired integer NTT arithmetic over `GF(M31^2)` and `GF(M61^2)` through a PrMers `engine::Reg` adapter. The v99.7 policy uses measured transform-size thresholds per workload. The adapter retains GPU-side register equality for Gerbicz checks and bounded Mersenne carry canonicalization for residue export.
 
 Use `-engine-marin` to force Marin, `-aevum` to force Aevum, or `-aevum-auto` to request the default policy explicitly. The historical `-marin` option keeps its previous meaning and selects the internal PrMers NTT path. The standalone engine is intended for publication at https://github.com/cherubrock-seb/aevum-engine.
 ## Contents
+
 
 - [What PrMers can do](#what-prmers-can-do)
 - [Quick start](#quick-start)
@@ -27,9 +30,13 @@ Use `-engine-marin` to force Marin, `-aevum` to force Aevum, or `-aevum-auto` to
 - [ECM factoring](#ecm-factoring)
 - [worktodo.txt and AutoPrimeNet](#worktodotxt-and-autoprimenet)
 - [Prime95 and mprime interop](#prime95-and-mprime-interop)
+- [Gaussian-Mersenne extension](README_GAUSSIAN_MERSENNE.md)
+- [Gaussian-Mersenne P-1/ECM](README_GAUSSIAN_FACTORING.md)
+- [Gaussian-Mersenne ECM Special32 - mathematical note](docs/GAUSSIAN_ECM_SPECIAL32_THEORY.md)
 - [Web GUI](#web-gui)
 - [GPU memory test](#gpu-memory-test)
 - [NTT and IBDWT transform sizes](#ntt-and-ibdwt-transform-sizes)
+- [Native PFA radix-3 and radix-9](#native-pfa-radix-3-and-radix-9)
 - [Benchmarks](#benchmarks)
 - [Backend and code](#backend-and-code)
 - [Related inspiration](#related-inspiration)
@@ -40,7 +47,9 @@ Use `-engine-marin` to force Marin, `-aevum` to force Aevum, or `-aevum-auto` to
 
 | Area | Status | Notes |
 |---|---|---|
-| Mersenne PRP | Supported | Default mode, automatic Marin/Aevum backend selection |
+| Gaussian-Mersenne Proth/PRP | Experimental v99.88 | Opt-in `-gm`; exact lift into `2^(4p)-1`, no Aevum-kernel changes |
+| Gaussian-Mersenne P-1/ECM | Experimental v100.00 | Opt-in `-gm-pm1` / `-gm-ecm`; deterministic GM Special32 prepass via `-gm-ecm-special32` |
+| Mersenne PRP | Supported | Default mode; automatic Marin/Aevum on Linux/Windows, Marin by default on macOS |
 | Mersenne Lucas-Lehmer | Supported | Safe GL mode, classic unsafe mode, doubling safe mode |
 | P-1 factoring | Supported | Stage 1, default V-trace Stage 2, classic Stage 2 fallback, resume export, Prime95 handoff |
 | P-1 ultra-low-memory mode | Supported | 1-register Stage 1 and 1-register Stage 2 product-exponent path |
@@ -59,7 +68,7 @@ Run a PRP test on a Mersenne number:
 ./prmers 136279841
 ```
 
-The command above uses automatic backend selection. Force a backend only for testing or benchmarking:
+On Linux and Windows, the command above uses automatic backend selection. On macOS it uses Marin by default. Force a backend only for testing or benchmarking:
 
 ```bash
 ./prmers 136279841 -engine-marin
@@ -297,14 +306,12 @@ Run the built-in help for the exact option list supported by your binary:
 | `-wagstaff` | Test `W = (2^p + 1) / 3` |
 | `-pm1` | P-1 factoring mode |
 | `-ecm` | ECM factoring mode |
-| `-aevum` | Force the Aevum `engine::Reg` backend |
+| `-aevum` | Force the Aevum `engine::Reg` backend; PRP/LL use automatic PFA selection |
 | `-engine-marin` | Force the Marin `engine::Reg` backend |
-| `-aevum-auto` | Explicitly request automatic Marin/Aevum selection |
-| `-aevum-fft <spec>` | Force Aevum with this FFT3161 shape, e.g. `1:512:8:512:202` |
-| `-aevum-use <list>` | Aevum kernel settings `KEY=VALUE,...`, e.g. from `tests/run_aevum_tune.sh` (also `AEVUM_USE`) |
+| `-aevum-auto` | Explicitly request the normal auto policy; macOS still keeps Marin unless `-aevum` is used |
 | `-marin` | Legacy option: use the internal PrMers NTT path |
 
-Automatic Marin/Aevum selection is the default when no backend option is supplied.
+Automatic Marin/Aevum selection is the default on Linux and Windows. macOS defaults to Marin; use `-aevum` for an explicit Aevum opt-in.
 
 
 Automatic selection compares the native transform sizes for every engine creation. PRP/LL and multi-register P-1 accept Aevum when its transform is no larger than Marin. P-1 Stage 1 and ECM require a clearer advantage (`Aevum / Marin <= 0.75` by default). Thus `M136279841` P-1 Stage 1 selects Aevum automatically: its FFT3161 transform is 4M words versus 8M for Marin, matching the measured Radeon VII advantage. A forced Aevum Stage 1 uses the generic `square` plus prepared base-3 multiplication path instead of the Marin-specific `fast3` shortcut. `-pm1-ultralowmem` remains Marin-only because its one-register algorithm depends on `fast3`. Stage 1 checkpoints are tagged with their arithmetic backend; incompatible checkpoints are ignored safely.
@@ -879,6 +886,94 @@ For a given exponent p, PrMers chooses an NTT/IBDWT size N:
 
 Note: for MM31 (`p = 2147483647`), the valid Marin transform size is `167772160 = 5*2^25`. Pure `2^27` is not valid for the Goldilocks root layout used here.
 
+## Native PFA radix-3 and radix-9
+
+Aevum can use a Good-Thomas prime-factor layout with a transform length
+`N = r * 2^m`, where `r` is 3 or 9. The power-of-two rows keep the existing
+half-real `GF(M31^2) x GF(M61^2)` path, while a small odd-axis transform is
+applied before and after the row transforms. The inverse stage writes directly
+to the canonical Aevum carry layout, so there is no separate unpack pass.
+
+For PRP and Lucas-Lehmer work, Aevum now evaluates this path automatically.
+Radix 3 or radix 9 is selected when the actual Aevum stock/PFA size ratio
+reaches its validated threshold; otherwise the normal power-of-two plan is retained.
+On macOS, Marin remains the platform default, but an explicit `-aevum` request
+uses the same PFA selector.
+
+```bash
+./prmers 175000001 -aevum          # automatic PFA/stock choice
+./prmers 175000001 -aevum -pfa 9   # force radix 9
+./prmers 175000001 -aevum -pfa-off # force the stock Aevum plan
+```
+
+<a id="native-pfa-automatic-selection-ranges"></a>
+### Native PFA automatic selection ranges
+
+The table below is the current default `pfa:auto` policy with the normal
+`fftOverdrive = 1.0`. The limits are exponent values `p` for `M_p = 2^p - 1`.
+They are checked by the plan-policy test at the exact boundaries.
+
+| Automatic plan | Exponent range `p` | Selected Aevum plan | Transform words | Stock/PFA ratio |
+|---|---:|---|---:|---:|
+| Radix 3 | 10,627,319–15,724,707 | `pfa3:1:256:3:256:101` | 393,216 | 1.333x |
+| Radix 3 | 21,071,135–31,284,264 | `pfa3:1:256:3:512:101` | 786,432 | 1.333x |
+| Radix 9 | 41,922,069–46,560,704 | `pfa9:1:256:9:256:202` | 1,179,648 | 1.778x |
+| Radix 3 | 46,560,705–62,080,936 | `pfa3:1:512:3:512:101` | 1,572,864 | 1.333x |
+| Radix 9 | 83,194,017–92,625,960 | `pfa9:1:256:9:512:202` | 2,359,296 | 1.778x |
+| Radix 3 | 92,625,961–123,343,992 | `pfa3:1:512:3:1K:101` | 3,145,728 | 1.333x |
+| Radix 9 | 165,507,233–183,789,168 | `pfa9:1:512:9:512:202` | 4,718,592 | 1.778x |
+| Radix 3 | 183,789,169–244,737,648 | `pfa3:1:1K:3:1K:101` | 6,291,456 | 1.333x |
+| Radix 9 | 328,414,017–365,879,616 | `pfa9:1:512:9:1K:202` | 9,437,184 | 1.778x |
+| Radix 3 | 365,879,617–487,210,368 | `pfa3:1:4K:3:512:101` | 12,582,912 | 1.333x |
+| Radix 9 | 653,808,129–725,153,152 | `pfa9:1:1K:9:1K:202` | 18,874,368 | 1.778x |
+| Radix 3 | 725,153,153–965,612,672 | `pfa3:1:4K:3:1K:101` | 25,165,824 | 1.333x |
+| Radix 9 | 1,295,872,129–1,440,869,120 | `pfa9:1:4K:9:512:202` | 37,748,736 | 1.778x |
+| Radix 9 | 2,574,967,041–2,862,863,872 | `pfa9:1:4K:9:1K:202` | 75,497,472 | 1.778x |
+
+All other admissible exponent ranges use the normal power-of-two Aevum plan.
+The automatic gates are `1.30x` for radix 3 and `1.60x` for radix 9.
+The explicit radix options remain available for validation and benchmarking.
+
+### Force-adaptive FFT type 4 + PFA9 in v99.73
+
+At `p=175000039`, both type 1 and type 4 use the same 4.50M-word PFA9
+transform. A full type 4 therefore adds an FP32 transform without reducing the
+transform length. The measured result was about 612 IPS, versus about 770 IPS
+for the exact paired-NTT plan.
+
+Every ordinary type-4 request is now capacity-aware, including an explicit `-aevum-fft pfa9:4:...` plan:
+
+```bash
+./prmers 175000039 -d 1 -pfa9-type4 -proof 0
+# Equivalent explicit request:
+./prmers 175000039 -d 1 -aevum-fft pfa9:4:512:9:512:202 -proof 0
+```
+
+It requests the type-4 shape, checks the exact FFT3161 limit, and elides the
+FP32 plane only when GF31+GF61 is still safe. At 175M, 37.09 bpw is below the
+38.95-bpw paired-NTT limit, so this executes the fast exact plan:
+
+```text
+pfa9:1:512:9:512:202
+```
+
+The real three-plane diagnostic path remains available and enables concurrent OpenCL
+queues by default:
+
+```bash
+./prmers 175000039 -d 1 -pfa9-type4-full -proof 0
+```
+
+The true three-plane plan is spelled `pfa9full:4:512:9:512:202`. Use `AEVUM_TYPE4_MULTI_Q=0` to reproduce the old single-queue baseline.
+Run all four comparisons with:
+
+```bash
+./scripts/test_type4_optimized_ubuntu.sh 1 180 175000039
+```
+
+The full path remains useful above the paired-NTT BPW limit; the adaptive path
+never elides FP32 unless the exact two-prime capacity test passes.
+
 ## Benchmarks
 
 Performance depends on GPU, clocks, power limits, OpenCL driver, thermal behavior and PrMers version. Treat the following values as rough guidance.
@@ -887,36 +982,6 @@ Mersenne Forum discussion:
 
 https://www.mersenneforum.org/node/1086124/page3
 
-### Quick PRP overview, Marin backend
-
-PRP throughput for `p` near `136279841`.
-
-| GPU | User or system | PRMERS_SCORE | Iter/s | Approx PRP ETA | Notes |
-|---|---:|---:|---:|---:|---|
-| NVIDIA GeForce RTX 5090 | Resolver, vast.ai | n/a | about 2230 | about 17 h | High-end NVIDIA |
-| NVIDIA GeForce RTX 4090 | Resolver | 100.00/100 | about 1225 | about 31 h | Reference score |
-| NVIDIA GeForce RTX 5070 Laptop | beepthebee | 62.69/100 | about 356 | about 4.5 d | OC reported |
-| NVIDIA GeForce RTX 4060 Ti | Lorenzo | 69.14/100 | about 318 | about 5 d | Desktop midrange |
-| NVIDIA GeForce RTX 4070 Laptop | Phantomas | 52.24/100 | about 255 | about 6 d | Laptop GPU |
-| NVIDIA GeForce RTX 2060 | hwt, Artoria2e5 | 45.76/100 | about 240-259 | about 6 d | Some undervolt or power cap runs |
-| NVIDIA GeForce GTX 1660 Ti | Phantomas | n/a | about 234 | about 6.8 d | Older Turing GPU |
-| AMD Radeon VII | cherubrock | 50.57/100 | about 350 | about 4.5 d | Development card |
-| Apple M4 Pro | wigglefruit | 30.29/100 | about 164 | about 9.6 d | Apple silicon |
-| Apple M2 | cherubrock | n/a | about 25 | about 62 d | MacBook Air 8 GB |
-
-### Detailed examples
-
-| GPU | p = 57885161 | p = 74207281 | p = 82589933 | p = 136279841 |
-|---|---:|---:|---:|---:|
-| RTX 5090 | about 2350 iter/s | about 2230 iter/s | about 1970 iter/s | about 2230 iter/s |
-| Radeon VII | about 510 iter/s | about 436 iter/s | about 402 iter/s | about 350 iter/s |
-| RTX 4090 | about 1030 iter/s | about 910 iter/s | about 840 iter/s | about 1225 iter/s |
-| RTX 4060 Ti | about 420 iter/s | about 366 iter/s | about 337 iter/s | about 318 iter/s |
-| RTX 4070 Laptop | about 370 iter/s | about 320 iter/s | about 283 iter/s | about 255 iter/s |
-| GTX 1660 Ti | about 330 iter/s | about 288 iter/s | about 262 iter/s | about 234 iter/s |
-| RTX 5070 Laptop | about 858 iter/s | about 882 iter/s | about 875 iter/s | about 356 iter/s |
-| Apple M4 Pro | about 264 iter/s | about 231 iter/s | about 213 iter/s | about 164 iter/s |
-| Apple M2 | about 42 iter/s | about 38 iter/s | about 32 iter/s | about 25 iter/s |
 
 ## Backend and code
 
@@ -1030,14 +1095,7 @@ Run the GPU backend matrix with:
 AEVUM_TEST_DEVICE=0 make test-aevum-auto-gpu
 ```
 
-Tune Aevum for a GPU (the FFT shape and Aevum's kernel settings, every configuration checked against GMP), confirm the gain with PRP runs and check the result with Gerbicz-Li checks and a full PRP of `M3021377`:
-
-```bash
-tests/run_aevum_tune.sh 0
-./prmers 136279841 -config tests/aevum-tune/aevum-tuned.cfg
-```
-
-The tuned FFT shape applies to exponents of the same transform size (set `PRMERS_TUNE_EXPONENT` to tune another size). `tests/run_gpu_speedup_check.sh 0` checks the fused squaring loop, GPU proof generation and the Marin radix-5 kernels on a GPU and measures PRP throughput.
+`tests/run_gpu_speedup_check.sh 0` checks on a GPU Aevum's chained squarings against GMP, GPU proof generation and the Marin radix-5 kernels, and measures PRP throughput with and without the Aevum register lead cache.
 
 Aevum is a customized GPLv3 derivative of GPUOwl/PRPLL, adapted by cherubrock-seb into a reusable register engine. Its external interface is modeled after the kind of opaque register operations used by Marin, while the Aevum arithmetic implementation remains derived from GPUOwl/PRPLL. Aevum is not an official upstream release.
 
@@ -1098,3 +1156,55 @@ PrMers is developed by cherubrock-seb, with feedback and contributions from user
 - A forced Aevum request falls back to Marin only when no admissible FFT3161 plan exists, and the log states the reason explicitly.
 - The one-register P-1 ultra-low-memory algorithm is the sole Marin-only path because it depends on Marin `fast3`; Auto selects Marin and forced Aevum exits cleanly before GPU allocation.
 - PRP/LL checkpoints now include backend and mode metadata. Legacy untagged checkpoints are not loaded into Aevum, and LL-safe, LL-safe2 and LL-unsafe use distinct filenames.
+
+### Power-of-two FFT323161 lead cache in v99.74
+
+The exact plan `4:512:8:512:202` is now accepted by Aevum.  Consecutive
+`engine::square_mul(reg, 1)` calls use a one-square pending scheduler so the
+GPU retains `LEAD_WIDTH` and upstream `carryFused` between iterations.  See
+`README_POW2_TYPE4_LEAD_CACHE.md` for validation and A/B commands.
+
+
+### Stable correctness release v99.85
+
+The v99.85 release excludes the experimental M19 path. It contains the classic
+P-1 Stage 2 BSGS correctness fix, deterministic ECM/P-1 stop/continue policies,
+and the conservative Apple Aevum safety policy described in
+`RELEASE_V99.85.md`.
+
+To compare Aevum Type1, Type4 and PFA plans by workload on Linux, run:
+
+```bash
+PRMERS_DEVICE=1 PRMERS_PLAN_AUDIT_PROFILE=standard \
+  ./scripts/audit_aevum_plans_ubuntu.sh
+```
+
+The audit requires word-exact results before a faster plan can be recommended.
+`throughput:auto` remains the PRP/LL policy; ECM and P-1 Stage 1 remain on the
+validated Type1 policy until the workload audit proves a faster exact plan.
+P-1 Stage 2 V-trace and classic BSGS use Marin.
+
+### Workload-aware Aevum plans (v99.86)
+
+Automatic Aevum plans are selected separately for PRP, LL, P-1 Stage 1 and
+ECM. Run `scripts/audit_aevum_plans_ubuntu.sh` to compare exact candidates and
+produce a local override profile. See `RELEASE_V99.86.md`.
+
+## GMNet distributed Gaussian Mersenne search
+
+PrMers is the GPU calculation engine used by GMNet:
+
+```text
+https://gmnet.gaussianmersenne.workers.dev/
+```
+
+GMRelay obtains assignments, updates `worktodo.txt`, renews leases, and submits
+the JSON result files written by PrMers:
+
+```text
+https://github.com/cherubrock-seb/gmrelay
+```
+
+A deep P-1 Stage 1 job uses `B2 = B1`, which disables Stage 2. A mixed
+factorization campaign uses `GMCHAIN=...,factor`, which runs P-1 and optional
+ECM and then stops without starting a Proth test.

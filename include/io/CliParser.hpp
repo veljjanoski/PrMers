@@ -14,6 +14,27 @@ struct CliOptions {
     uint64_t iterforce2 = 0;
     bool torus = false;
     bool wagstaff = false;
+    // Gaussian-Mersenne norm G_p = 2^p - (2/p)2^((p+1)/2) + 1.
+    // The GPU path uses the exact factor lift G_p | 2^(4p)-1, so the existing
+    // Mersenne arithmetic remains untouched.
+    bool gaussian_mersenne = false;
+    bool gm_prp_only = false;
+    // Target norm: GM, GQ, or BOTH. Old worktodo/CLI defaults to GM.
+    std::string gm_family = "GM";
+    bool gm_cpu = false;
+    bool gm_safe_replay = false;
+    uint32_t gm_base = 0;
+    uint64_t gm_sieve_limit = 1'000'000ULL;
+    uint64_t gm_replay_block = 0;
+    // Product-exponent chunk target for Gaussian-Mersenne P-1/ECM Stage 2.
+    uint64_t gm_factor_chunk_bits = 0;
+    // Native worktodo-only conditional pipeline: P-1 -> optional ECM.
+    bool gm_pipeline = false;
+    // Backward-compatible default: continue to Proth unless GMCHAIN ends in factor.
+    bool gm_pipeline_proth = true;
+    uint64_t gm_pipeline_ecm_B1 = 0;
+    uint64_t gm_pipeline_ecm_B2 = 0;
+    uint64_t gm_pipeline_ecm_curves = 0;
     int device_id = 0;
     bool tune = false;
     std::string mode = "prp";                // "prp" ou "ll"
@@ -29,7 +50,9 @@ struct CliOptions {
     bool aevum_auto = true;
     bool force_engine_marin = false;
     std::string aevum_fft_spec = "";
-    std::string aevum_use = "";
+    bool aevum_fft_spec_explicit = false;
+    int aevum_pfa_radix = -1;             // -1=auto, 0=disabled, 3 or 9
+    bool aevum_pfa_off = false;            // keep the stock power-of-two Aevum plan
     bool bench = false;
     bool profiling = false;
     bool debug = false;
@@ -101,6 +124,9 @@ struct CliOptions {
     bool pm1_vtrace_product_tree = false; // Experimental v62 bucket-local product-tree Stage 2 accumulation (opt-in)
     uint32_t pm1_vtrace_product_tree_width = 16; // Scratch fan-in/chunk width for product-tree experiment
     bool pm1_no_stage1_gcd = false;
+    // Default safety policy: a newly discovered Stage-1 factor completes the
+    // requested P-1 job. Opt in only when Stage 2 is intentionally required.
+    bool pm1_continue_stage2_after_factor = false;
     std::string p95path;
     int max_local_size1 = 0;
     int max_local_size2 = 0;
@@ -135,6 +161,9 @@ struct CliOptions {
     uint64_t curves_tested_for_found = 0;
     int invarianterror = 0;
     uint32_t ecm_progress_interval_ms = 2000;
+    // Default ECM policy stops after the first factor that was not supplied in
+    // -factors. This flag keeps running the remaining curves after reporting it.
+    bool ecm_continue_after_factor = false;
     bool s3only = false;
     bool s4only = false;
 };

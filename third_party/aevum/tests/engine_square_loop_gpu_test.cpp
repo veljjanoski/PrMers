@@ -1,5 +1,7 @@
-// GPU check of aevum_engine_square_loop against GMP, and timing of the fused loop versus
-// one aevum_engine_square_mul call per squaring.
+// GPU check against GMP of consecutive aevum_engine_square_mul calls, which Aevum chains through
+// the carryFused kernel (register lead cache), of a prepared multiplication after such a chain and
+// of Lucas-Lehmer steps (square_mul then sub_u32 2), with the time per squaring.
+// AEVUM_REG_LEAD_CACHE=0 times unchained squarings.
 //
 // usage: engine_square_loop_gpu_test <libaevum_engine> <device> <tune_dir> [exponent[:iterations] ...]
 //   AEVUM_TEST_FFT=<spec> forces an FFT shape, e.g. 1:512:8:512:202
@@ -52,7 +54,7 @@ struct Api {
     int (*get_words)(aevum_engine_handle, size_t, uint32_t*, size_t);
     int (*prepare)(aevum_engine_handle, size_t, size_t);
     int (*square_mul)(aevum_engine_handle, size_t, uint32_t);
-    int (*square_loop)(aevum_engine_handle, size_t, uint64_t, int);
+    int (*sub_u32)(aevum_engine_handle, size_t, uint32_t);
     int (*mul)(aevum_engine_handle, size_t, size_t, uint32_t);
     const char* (*last_error)();
 };
@@ -99,7 +101,7 @@ int main(int argc, char** argv) {
     api.get_words = load_symbol<decltype(api.get_words)>(lib, "aevum_engine_get_words");
     api.prepare = load_symbol<decltype(api.prepare)>(lib, "aevum_engine_prepare");
     api.square_mul = load_symbol<decltype(api.square_mul)>(lib, "aevum_engine_square_mul");
-    api.square_loop = load_symbol<decltype(api.square_loop)>(lib, "aevum_engine_square_loop");
+    api.sub_u32 = load_symbol<decltype(api.sub_u32)>(lib, "aevum_engine_sub_u32");
     api.mul = load_symbol<decltype(api.mul)>(lib, "aevum_engine_mul");
     api.last_error = load_symbol<decltype(api.last_error)>(lib, "aevum_engine_last_error");
 
@@ -142,31 +144,25 @@ int main(int argc, char** argv) {
 
             // Warm up (kernel compilation) outside of the timings.
             require(api.set_u32(h, 0, 3), "set");
-            require(api.square_loop(h, 0, 2, 0), "square_loop");
-            require(api.square_mul(h, 0, 1), "square_mul");
+            for (int i = 0; i < 3; ++i) require(api.square_mul(h, 0, 1), "square_mul");
             require(api.sync(h), "sync");
 
             require(api.set_u32(h, 0, 3), "set");
-            auto t0 = std::chrono::steady_clock::now();
+            const auto t0 = std::chrono::steady_clock::now();
             for (uint64_t i = 0; i < k; ++i) require(api.square_mul(h, 0, 1), "square_mul");
             require(api.sync(h), "sync");
-            const double single = seconds_since(t0) / double(k);
+            const double per_square = seconds_since(t0) / double(k);
             check(0, "square_mul x k");
 
-            require(api.set_u32(h, 1, 3), "set");
-            t0 = std::chrono::steady_clock::now();
-            require(api.square_loop(h, 1, k, 0), "square_loop");
-            require(api.sync(h), "sync");
-            const double fused = seconds_since(t0) / double(k);
-            check(1, "square_loop");
-
-            // The loop output must be a normal register: multiply it by a prepared operand.
+            // After a chain the register must be a normal one: multiply it by a prepared operand.
+            require(api.set_u32(h, 0, 3), "set");
+            for (uint64_t i = 0; i < k; ++i) require(api.square_mul(h, 0, 1), "square_mul");
             require(api.set_u32(h, 2, 5), "set");
             require(api.prepare(h, 2, 2), "prepare");
-            require(api.mul(h, 1, 2, 1), "mul");
-            mpz_mul_ui(expected, expected, 5);
-            mpz_mod(expected, expected, mp);
-            check(1, "square_loop then prepared mul");
+            require(api.mul(h, 0, 2, 1), "mul");
+            mpz_mul_ui(actual, expected, 5);
+            mpz_mod(expected, actual, mp);
+            check(0, "square_mul x k then prepared mul");
 
             // Lucas-Lehmer steps x := x^2 - 2 from x = 4.
             mpz_set_ui(expected, 4);
@@ -175,12 +171,14 @@ int main(int argc, char** argv) {
                 mpz_sub_ui(expected, expected, 2);
                 mpz_mod(expected, expected, mp);
             }
-            require(api.set_u32(h, 0, 4), "set");
-            require(api.square_loop(h, 0, k, 1), "square_loop LL");
-            check(0, "square_loop Lucas-Lehmer");
+            require(api.set_u32(h, 1, 4), "set");
+            for (uint64_t i = 0; i < k; ++i) {
+                require(api.square_mul(h, 1, 1), "square_mul");
+                require(api.sub_u32(h, 1, 2), "sub_u32");
+            }
+            check(1, "Lucas-Lehmer steps");
 
-            std::printf("M%u transform=%zu: %.3f ms/iter single, %.3f ms/iter fused loop (x%.2f)\n",
-                        e.p, api.transform_size(h), single * 1e3, fused * 1e3, single / fused);
+            std::printf("M%u transform=%zu: %.3f ms/iter\n", e.p, api.transform_size(h), per_square * 1e3);
         } catch (const std::exception& ex) {
             std::printf("M%u: %s\n", e.p, ex.what());
             ++failures;
@@ -190,6 +188,6 @@ int main(int argc, char** argv) {
 
     mpz_clears(mp, expected, actual, exponent, three, nullptr);
     close_library(lib);
-    std::printf("%s\n", failures ? "square_loop GPU test FAILED" : "square_loop GPU test passed");
+    std::printf("%s\n", failures ? "square chain GPU test FAILED" : "square chain GPU test passed");
     return failures ? 1 : 0;
 }

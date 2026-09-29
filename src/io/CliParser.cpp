@@ -9,7 +9,7 @@
  *         https://www.craig-wood.com/nick/armprime/
  *     and available on GitHub at:
  *         https://github.com/ncw/
- *   - Yves Gallot (https://github.com/galloty), author of Genefer 
+ *   - Yves Gallot (https://github.com/galloty), author of Genefer
  *     (https://github.com/galloty/genefer22), who helped clarify the NTT and IDBWT concepts.
  *   - The GPUOwl project (https://github.com/preda/gpuowl), which performs Mersenne
  *     searches using FFT and double-precision arithmetic.
@@ -18,15 +18,17 @@
  *
  * Author: Cherubrock
  *
- * This code is released as free software. 
+ * This code is released as free software.
  */
 #include "io/CliParser.hpp"
 #include "util/StringUtils.hpp"
 #include <iostream>
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include "util/PathUtils.hpp"
 #include <filesystem>
+#include <stdexcept>
 #include "opencl/Context.hpp"
 #include "core/Version.hpp"
 
@@ -103,11 +105,29 @@ void printUsage(const char* progName) {
     std::cout << "  -pm1-vtrace-product-tree-width <N> : (Experimental) Product-tree scratch/chunk width, default 16" << std::endl;
     std::cout << "  -b2start <value>     : (Optional) Stage 2 lower bound/start for split ranges. With -pm1-s2-resume2reg, -b1 remains the Stage-1 resume bound and primes in (-b2start,-b2] are tested" << std::endl;
     std::cout << "  -nogcd-stage1        : (Optional) skip the ordinary P-1 Stage 1 GCD after writing PM1 resume/checkpoint; useful before Stage 2" << std::endl;
+    std::cout << "  -pm1-continue-stage2-after-factor : Continue requested Stage 2 even when Stage 1 finds a new factor (default: stop)" << std::endl;
     std::cout << "  -checklevel <value>  : (Optional) Will force gerbicz check every B*<value> by default check is done every 10 min and at the end." << std::endl;
     std::cout << "  -glblock <B>         : (Optional) Gerbicz-Li block size B for a new PRP test (default 1000, at most sqrt(p))" << std::endl;
     std::cout << "  -wagstaff            : (Optional) will check PRP if (2^p + 1)/3 is probably prime" << std::endl;
+    std::cout << "  -gm | -gm-proth      : Deterministic Gaussian-Mersenne Proth test for G_p = Norm((1+i)^p-1)" << std::endl;
+    std::cout << "  -gm-prp              : Base-a Fermat PRP for G_p (fast screening, not a proof)" << std::endl;
+    std::cout << "  -gm-family <GM|GQ|BOTH> : Select the Gaussian norm(s); legacy default is GM" << std::endl;
+    std::cout << "  -gm-base <a>         : Small base; deterministic Proth applies to GM, while GQ uses Fermat PRP" << std::endl;
+    std::cout << "  -gm-sieve <limit>    : Search admissible prime factors q=4kp+1 through limit (default 1000000, 0 disables)" << std::endl;
+    std::cout << "  -gm-cpu              : GMP reference implementation instead of GPU" << std::endl;
+    std::cout << "  -gm-safe             : Full independent block replay check (strong safety, about 2x arithmetic)" << std::endl;
+    std::cout << "  -gm-replay-block <N> : Override safe replay block length" << std::endl;
+    std::cout << "  -gm-pm1 -b1 <B1> [-b2 <B2>] : P-1 factor G_p through the exact 2^(4p)-1 lift" << std::endl;
+    std::cout << "  -gm-ecm -b1 <B1> [-b2 <B2>] -K <curves> : ECM factor G_p with lifted Montgomery arithmetic" << std::endl;
+    std::cout << "  -gm-ecm-special4096 -b1 <B1> [-b2 <B2>] [-K <profiles>] : experimental GM high-2 portfolio targeting v2(#E)>=12" << std::endl;
+    std::cout << "  -gm-ecm-special32 -b1 <B1> [-b2 <B2>] : GM-only deterministic 3-profile ECM prepass (A/B/C); -K is ignored" << std::endl;
+    std::cout << "  -gm-factor-chunk-bits <N> : Stage 2 product-exponent chunk target (P-1 default 262144, ECM 131072)" << std::endl;
+    std::cout << "  Native Gaussian worktodo: every type accepts an optional final GM|GQ|BOTH family" << std::endl;
+    std::cout << "    GMPROTH=p[,sieve[,family]], GMPRP=p[,sieve[,family]]" << std::endl;
+    std::cout << "    GMPMINUS1/GMECM append family after their optional fields" << std::endl;
+    std::cout << "    GMCHAIN=p,pm1_B1,pm1_B2[,ecm_B1[,ecm_B2[,curves[,sieve[,chunk_bits[,finish[,family]]]]]]]" << std::endl;
     std::cout << "  -ecm -b1 <B1> [-b2 <B2>] -K <curves> : Run ECM factoring with bounds B1 [and optional B2], on given number of curves" << std::endl;
-    
+
     std::cout << "  -montgomery          : (Optional) compute in Montgomery and use Montgomery (compute done in montgomery)" << std::endl;
     std::cout << "  -edwards             : (Optional) compute in Montgomery and use (twisted) Edwards curve converted to Montgomery (compute done in Montgomery)" << std::endl;
     std::cout << "  -ced                 : (Optional) compute in Twisted Edwards (by default) and use (twisted) Edwards curves (notorsion twisted or torsion 2x8 possible no twist a=1) " << std::endl;
@@ -118,20 +138,25 @@ void printUsage(const char* progName) {
     std::cout << "  -torsion16           : (Optional) use torsion-16" << std::endl;
     std::cout << "  -notorsion           : (Optional) use no torsion instead of default torsion-16" << std::endl;
     std::cout << "  -iv163               : (Optional) use family_iv_163 curves (Gélin-Kleinjung-Lenstra) gives 16/3 average v2 (around order 32 point)" << std::endl;
-    
+
     std::cout << "  -ecm_check_interval <value> : ECM Error Check interval in seconds (300s by default)" << std::endl;
     std::cout << "  -ecm_progress_ms <value>    : ECM progress update interval in milliseconds (default: 2000 ms)" << std::endl;
+    std::cout << "  -ecm-continue-after-factor  : Continue with later curves after finding a new factor (default: stop)" << std::endl;
     std::cout << "  -p95path <path>      : (Optional) Prime95/mprime directory for ECM Stage2 handoff; enables Prime95 Stage2" << std::endl;
     std::cout << "  -nop95stage2         : (Optional) Disable Prime95 Stage2 handoff even if -p95path is set" << std::endl;
     //std::cout << "  -brent [<d>]         : (Optional) use Brent-Suyama variant with default or specified degree d (e.g., -brent 6)" << std::endl;
     //std::cout << "  -bsgs                : (Optional) enable batching of multipliers in ECM stage 2 to reduce ladder calls" << std::endl;
     std::cout << "  Backend selection (default: automatic Marin/Aevum):" << std::endl;
-    std::cout << "  -aevum               : Strictly force Aevum; exit with an error when no FFT3161 plan is available" << std::endl;
+    std::cout << "  -aevum               : Strictly force Aevum; exit with an error when no supported Aevum plan is available" << std::endl;
     std::cout << "  -engine-marin        : Force the Marin engine::Reg backend" << std::endl;
-    std::cout << "  -aevum-auto          : Explicitly select automatic Marin/Aevum mode" << std::endl;
+    std::cout << "  -aevum-auto          : Explicitly select automatic Marin/Aevum mode (macOS still defaults to Marin unless -aevum is used)" << std::endl;
     std::cout << "  -marin               : Legacy internal PrMers NTT path (not supported with -llunsafe)" << std::endl;
-    std::cout << "  -aevum-fft <spec>    : Force an Aevum FFT3161 shape, for example 1:1024:8:512" << std::endl;
-    std::cout << "  -aevum-use <list>    : Aevum kernel settings KEY=VALUE,... (as found by tests/run_aevum_tune.sh; env AEVUM_USE)" << std::endl;
+    std::cout << "  -aevum-fft <spec>    : Force an Aevum plan; pfa9:4 is capacity-adaptive, pfa9full:4 forces all three planes" << std::endl;
+    std::cout << "  -pfa9-type4          : Force type-4 policy; automatically elides redundant FP32 when exact FFT3161 is sufficient" << std::endl;
+    std::cout << "  -pfa9-type4-full     : Diagnostic only: force full FP32+GF31+GF61 PFA9 plan" << std::endl;
+    std::cout << "  -pfa [3|9]           : Enable/force native Aevum Good-Thomas PFA (auto when omitted)" << std::endl;
+    std::cout << "  -pfa3 / -pfa9        : Force native Aevum PFA radix 3 or radix 9" << std::endl;
+    std::cout << "  -pfa-off             : Keep the stock power-of-two Aevum plan" << std::endl;
     std::cout << "  Auto policy env      : AEVUM_AUTO_MAX_RATIO or workload-specific AEVUM_AUTO_PM1_STAGE1_MAX_RATIO, AEVUM_AUTO_PM1_STAGE2_MAX_RATIO, AEVUM_AUTO_ECM_MAX_RATIO" << std::endl;
     std::cout << "  -resume              : (Optional) write GMP-ECM and Prime 95 resume file after P-1 stage 1" << std::endl;
     //std::cout << "  -p95                 : (Optional) write Prime 95 resume file after P-1 stage 1" << std::endl;
@@ -144,7 +169,7 @@ void printUsage(const char* progName) {
     std::cout << "  -http <port>          : (Optional) Specify the HTTP port for the GUI server (default: 3131)" << std::endl;
     std::cout << "  -host <ip|0.0.0.0|localhost> : (Optional) Specify the HTTP host for the GUI server (default: 127.0.0.1)" << std::endl;
     //std::cout << "  -ipv4                 : (Optional) Set the HTTP host to the first IPv4 interface" << std::endl;
-    
+
     std::cout << "  -maxe <value>         : (Optional) Max bits for each E chunk (in MiB). If set to 0, defaults to 10000 bits. Example: -maxe 64 -> 64 MiB = 536870912 bits. By default if no -maxe you it is set to 32 Mib." << std::endl;
     std::cout << "  -memtest              : GPU Memory & Stability test (OpenCL)" << std::endl;
     std::cout << "  -memlim <percent>     : (Optional) Fraction percentage of memory used (used precompute stage 2 p-1)" << std::endl;
@@ -164,6 +189,343 @@ static uint64_t to_u64(const char* s){
     unsigned long long v = std::strtoull(s, &end, 10);
     if(errno || end==s) return 0ULL;
     return static_cast<uint64_t>(v);
+}
+
+static bool parse_cli_tail_option(CliOptions& opts,
+                                  int& i,
+                                  int argc,
+                                  char** argv) {
+    if (std::strcmp(argv[i], "-b1") == 0 && i + 1 < argc) {
+        opts.B1 = std::strtoull(argv[i + 1], nullptr, 10);  // base 10
+        ++i;
+    }
+    else if (std::strcmp(argv[i], "-b1old") == 0 && i + 1 < argc) {
+        opts.B1old = std::strtoull(argv[i + 1], nullptr, 10);  // base 10
+        ++i;
+    }
+    else if (std::strcmp(argv[i], "-b2") == 0 && i + 1 < argc) {
+        opts.B2 = std::strtoull(argv[i + 1], nullptr, 10);  // base 10
+        ++i;
+    }
+    else if ((std::strcmp(argv[i], "-b2start") == 0 ||
+              std::strcmp(argv[i], "--b2start") == 0 ||
+              std::strcmp(argv[i], "-s2from") == 0 ||
+              std::strcmp(argv[i], "--s2from") == 0 ||
+              std::strcmp(argv[i], "-stage2start") == 0 ||
+              std::strcmp(argv[i], "--stage2start") == 0) && i + 1 < argc) {
+        opts.B2Start = std::strtoull(argv[i + 1], nullptr, 10);  // base 10
+        ++i;
+    }
+    else if (std::strcmp(argv[i], "-b3") == 0 && i + 1 < argc) {
+        opts.B3 = std::strtoull(argv[i + 1], nullptr, 10);  // base 10
+        ++i;
+    }
+    else if (std::strcmp(argv[i], "-b4") == 0 && i + 1 < argc) {
+        opts.B4 = std::strtoull(argv[i + 1], nullptr, 10);  // base 10
+        ++i;
+    }
+    else if (std::strcmp(argv[i], "-K") == 0 && i + 1 < argc) {
+        opts.K = std::strtoull(argv[i + 1], nullptr, 10);  // base 10
+        ++i;
+    }
+    else if (std::strcmp(argv[i], "-nmax") == 0 && i + 1 < argc) {
+        opts.nmax = std::strtoull(argv[i + 1], nullptr, 10);  // base 10
+        ++i;
+    }
+    else if (std::strcmp(argv[i], "-memlim") == 0 && i + 1 < argc) {
+        opts.memlim = std::strtoull(argv[i + 1], nullptr, 10);  // base 10
+        ++i;
+    }
+    else if (std::strcmp(argv[i], "-seed") == 0 && i + 1 < argc) {
+        opts.curve_seed = std::strtoull(argv[i + 1], nullptr, 10);  // base 10
+        ++i;
+    }
+    else if (std::strcmp(argv[i], "-sigma") == 0 && i + 1 < argc) {
+        opts.sigma = argv[i + 1];
+        opts.K = 1;
+        ++i;
+    }
+    else if (std::strcmp(argv[i], "-tbits") == 0 && i + 1 < argc) {
+        opts.tbits = std::strtoull(argv[i + 1], nullptr, 10);  // base 10
+        ++i;
+    }
+    else if (std::strcmp(argv[i], "-erroriter") == 0 && i + 1 < argc) {
+        opts.erroriter = std::strtoull(argv[i + 1], nullptr, 10);  // base 10
+        ++i;
+    }
+    else if (std::strcmp(argv[i], "-ecm-continue-after-factor") == 0 ||
+             std::strcmp(argv[i], "--ecm-continue-after-factor") == 0 ||
+             std::strcmp(argv[i], "-ecm-continue-curves-after-factor") == 0) {
+        opts.ecm_continue_after_factor = true;
+    }
+    else if (std::strcmp(argv[i], "-ecm_check_interval") == 0 && i + 1 < argc) {
+        opts.ecm_check_interval = std::strtoull(argv[i + 1], nullptr, 10);  // base 10
+        ++i;
+    }
+    else if (std::strcmp(argv[i], "-ecm_progress_ms") == 0 && i + 1 < argc) {
+        opts.ecm_progress_interval_ms = std::strtoull(argv[i + 1], nullptr, 10);  // base 10
+        ++i;
+    }
+
+    else if (std::strcmp(argv[i], "-llsafeb") == 0 && i + 1 < argc) {
+        opts.llsafe_block = std::strtoull(argv[i + 1], nullptr, 10);  // base 10
+        ++i;
+    }
+    else if (std::strcmp(argv[i], "-l1") == 0 && i + 1 < argc) {
+        opts.max_local_size1 = to_u64(argv[++i]);
+    }
+    else if (std::strcmp(argv[i], "-checklevel") == 0 && i + 1 < argc) {
+        opts.checklevel = to_u64(argv[++i]);
+    }
+    else if (std::strcmp(argv[i], "-glblock") == 0 && i + 1 < argc) {
+        opts.gl_block = to_u64(argv[++i]);
+    }
+    else if (std::strcmp(argv[i], "-chunk256") == 0 && i + 1 < argc) {
+        opts.chunk256 = to_u64(argv[++i]);
+    }
+    else if (std::strcmp(argv[i], "-l5") == 0 && i + 1 < argc) {
+        opts.max_local_size5 = to_u64(argv[++i]);
+    }
+    else if (std::strcmp(argv[i], "-iterforce") == 0 && i + 1 < argc) {
+        opts.iterforce = to_u64(argv[++i]);
+    }
+    else if (std::strcmp(argv[i], "-iterforce2") == 0 && i + 1 < argc) {
+        opts.iterforce2 = to_u64(argv[++i]);
+    }
+    else if (std::strcmp(argv[i], "-maxe") == 0 && i + 1 < argc) {
+        uint64_t mb = std::strtoull(argv[i + 1], nullptr, 10);
+        opts.max_e_bits = (mb == 0 ? 10000ULL : (mb << 23));
+        ++i;
+    }
+
+    else if (std::strcmp(argv[i], "-l2") == 0 && i + 1 < argc) {
+        opts.max_local_size2 = to_u64(argv[++i]);
+    }
+    else if (std::strcmp(argv[i], "-l3") == 0 && i + 1 < argc) {
+        opts.max_local_size3 = to_u64(argv[++i]);
+    }
+    else if (std::strcmp(argv[i], "-enqueue_max") == 0 && i + 1 < argc) {
+        opts.enqueue_max = to_u64(argv[++i]);
+    }
+    else if (std::strcmp(argv[i], "-res64_display_interval") == 0 && i + 1 < argc) {
+        int v = to_u64(argv[++i]);
+        if (v < 0) {
+            std::cerr << "Error: -res64_display_interval must be 0 (to disable) or > 0\n";
+            std::exit(EXIT_FAILURE);
+        }
+        opts.res64_display_interval = v;
+    }
+    else if (std::strcmp(argv[i], "-user") == 0 && i + 1 < argc) {
+        opts.user = argv[++i];
+    }
+    else if (std::strcmp(argv[i], "-password") == 0 && i + 1 < argc) {
+        opts.password = argv[++i];
+    }
+    else if (std::strcmp(argv[i], "-computer") == 0 && i + 1 < argc) {
+        opts.computer_name = argv[++i];
+    }
+    else if (std::strcmp(argv[i], "--noask") == 0 || std::strcmp(argv[i], "-noask") == 0) {
+        opts.noAsk = true;
+    }
+    else if (std::strcmp(argv[i], "-wagstaff") == 0) {
+        opts.wagstaff = true;
+    }
+    else if (std::strcmp(argv[i], "-resume") == 0) {
+        opts.resume = true;
+    }
+    else if (std::strcmp(argv[i], "-p95") == 0) {
+        opts.resume95 = true;
+    }
+    else if (std::strcmp(argv[i], "-noverify") == 0) {
+        opts.verify = false;
+    }
+    else if (std::strcmp(argv[i], "-tune") == 0) {
+        opts.tune = true;
+    }
+    else if (std::strcmp(argv[i], "-worktodo") == 0 && i + 1 < argc) {
+        opts.worktodo_path = argv[++i];
+    }
+    else if (std::strcmp(argv[i], "-config") == 0 && i + 1 < argc) {
+        opts.config_path = argv[++i];
+    }
+    else if (std::strcmp(argv[i], "-kernelpath") == 0 && i + 1 < argc) {
+        opts.kernel_path = argv[++i];
+    }
+    else if (std::strcmp(argv[i], "-gerbiczli") == 0 || std::strcmp(argv[i], "-gerbiczli") == 0) {
+        opts.gerbiczli = false;
+    }
+    else if (std::strcmp(argv[i], "-pm1-lowmem") == 0 ||
+             std::strcmp(argv[i], "--pm1-lowmem") == 0 ||
+             std::strcmp(argv[i], "-pm1lowmem") == 0 ||
+             std::strcmp(argv[i], "-lowmem") == 0) {
+        opts.pm1_lowmem = true;
+        opts.gerbiczli = false;
+    }
+    else if (std::strcmp(argv[i], "-pm1-ultralowmem") == 0 ||
+             std::strcmp(argv[i], "--pm1-ultralowmem") == 0 ||
+             std::strcmp(argv[i], "-pm1ultralowmem") == 0 ||
+             std::strcmp(argv[i], "-pm1-1reg") == 0) {
+        opts.pm1_lowmem = true;
+        opts.pm1_ultralowmem = true;
+        opts.gerbiczli = false;
+    }
+    else if (std::strcmp(argv[i], "-pm1-s2-resume2reg") == 0 ||
+             std::strcmp(argv[i], "--pm1-s2-resume2reg") == 0 ||
+             std::strcmp(argv[i], "-pm1s2resume2reg") == 0 ||
+             std::strcmp(argv[i], "-pm1-stage2-2reg") == 0) {
+        opts.pm1_lowmem = true;
+        opts.pm1_ultralowmem = true;
+        opts.pm1_s2_resume2reg = true;
+        opts.gerbiczli = false;
+    }
+    else if (std::strcmp(argv[i], "-pm1-continue-stage2-after-factor") == 0 ||
+             std::strcmp(argv[i], "--pm1-continue-stage2-after-factor") == 0 ||
+             std::strcmp(argv[i], "-pm1-continue-after-factor") == 0) {
+        opts.pm1_continue_stage2_after_factor = true;
+    }
+    else if (std::strcmp(argv[i], "-pm1-vtrace-off") == 0 ||
+             std::strcmp(argv[i], "--pm1-vtrace-off") == 0 ||
+             std::strcmp(argv[i], "-pm1-stage2-classic") == 0 ||
+             std::strcmp(argv[i], "-vtrace-off") == 0) {
+        opts.pm1_vtrace_off = true;
+        opts.pm1_vtrace = false;
+    }
+    else if (std::strcmp(argv[i], "-pm1-vtrace") == 0 ||
+             std::strcmp(argv[i], "--pm1-vtrace") == 0 ||
+             std::strcmp(argv[i], "-pm1-stage2-vtrace") == 0 ||
+             std::strcmp(argv[i], "-vtrace") == 0) {
+        // Kept for compatibility: V-trace is now the default normal-memory Stage 2.
+        opts.pm1_vtrace = true;
+    }
+    else if ((std::strcmp(argv[i], "-pm1-vtrace-d") == 0 ||
+              std::strcmp(argv[i], "--pm1-vtrace-d") == 0 ||
+              std::strcmp(argv[i], "-vtrace-d") == 0) && i + 1 < argc) {
+        opts.pm1_vtrace = true;
+        opts.pm1_vtrace_D = std::strtoull(argv[i + 1], nullptr, 10);
+        ++i;
+    }
+    else if (std::strcmp(argv[i], "-pm1-vtrace-auto-d") == 0 ||
+             std::strcmp(argv[i], "--pm1-vtrace-auto-d") == 0 ||
+             std::strcmp(argv[i], "-vtrace-auto-d") == 0) {
+        opts.pm1_vtrace = true;
+        opts.pm1_vtrace_auto_d = true;
+    }
+    else if (std::strcmp(argv[i], "-pm1-vtrace-auto-d-aggressive") == 0 ||
+             std::strcmp(argv[i], "--pm1-vtrace-auto-d-aggressive") == 0 ||
+             std::strcmp(argv[i], "-vtrace-auto-d-aggressive") == 0) {
+        opts.pm1_vtrace = true;
+        opts.pm1_vtrace_auto_d = true;
+        opts.pm1_vtrace_auto_d_aggressive = true;
+    }
+    else if ((std::strcmp(argv[i], "-pm1-vtrace-deep-d") == 0 ||
+              std::strcmp(argv[i], "--pm1-vtrace-deep-d") == 0 ||
+              std::strcmp(argv[i], "-vtrace-deep-d") == 0) && i + 1 < argc) {
+        opts.pm1_vtrace = true;
+        const char* val = argv[i + 1];
+        if (std::strcmp(val, "auto") == 0 || std::strcmp(val, "AUTO") == 0) {
+            opts.pm1_vtrace_auto_d = true;
+            opts.pm1_vtrace_deep_d_auto = true;
+        } else {
+            opts.pm1_vtrace_D = std::strtoull(val, nullptr, 10);
+        }
+        ++i;
+    }
+    else if (std::strcmp(argv[i], "-pm1-vtrace-product-tree") == 0 ||
+             std::strcmp(argv[i], "--pm1-vtrace-product-tree") == 0 ||
+             std::strcmp(argv[i], "-vtrace-product-tree") == 0) {
+        opts.pm1_vtrace = true;
+        opts.pm1_vtrace_product_tree = true;
+    }
+    else if ((std::strcmp(argv[i], "-pm1-vtrace-product-tree-width") == 0 ||
+              std::strcmp(argv[i], "--pm1-vtrace-product-tree-width") == 0 ||
+              std::strcmp(argv[i], "-vtrace-product-tree-width") == 0) && i + 1 < argc) {
+        opts.pm1_vtrace = true;
+        opts.pm1_vtrace_product_tree = true;
+        unsigned long long w = std::strtoull(argv[i + 1], nullptr, 10);
+        if (w < 2ULL) w = 2ULL;
+        if (w > 64ULL) w = 64ULL;
+        opts.pm1_vtrace_product_tree_width = static_cast<uint32_t>(w);
+        ++i;
+    }
+    else if ((std::strcmp(argv[i], "-pm1-vtrace-max-regs") == 0 ||
+              std::strcmp(argv[i], "--pm1-vtrace-max-regs") == 0 ||
+              std::strcmp(argv[i], "-vtrace-max-regs") == 0) && i + 1 < argc) {
+        opts.pm1_vtrace = true;
+        opts.pm1_vtrace_auto_d = true;
+        opts.pm1_vtrace_max_regs = std::strtoull(argv[i + 1], nullptr, 10);
+        ++i;
+    }
+    else if (std::strcmp(argv[i], "-pm1-vtrace-auto-batch") == 0 ||
+             std::strcmp(argv[i], "--pm1-vtrace-auto-batch") == 0 ||
+             std::strcmp(argv[i], "-vtrace-auto-batch") == 0) {
+        opts.pm1_vtrace = true;
+        opts.pm1_vtrace_auto_batch = true;
+    }
+    else if ((std::strcmp(argv[i], "-pm1-vtrace-baby-batch") == 0 ||
+              std::strcmp(argv[i], "--pm1-vtrace-baby-batch") == 0 ||
+              std::strcmp(argv[i], "-vtrace-baby-batch") == 0) && i + 1 < argc) {
+        opts.pm1_vtrace = true;
+        opts.pm1_vtrace_baby_batch = std::strtoull(argv[i + 1], nullptr, 10);
+        ++i;
+    }
+    else if ((std::strcmp(argv[i], "-pm1-vtrace-max-batches") == 0 ||
+              std::strcmp(argv[i], "--pm1-vtrace-max-batches") == 0 ||
+              std::strcmp(argv[i], "-vtrace-max-batches") == 0) && i + 1 < argc) {
+        opts.pm1_vtrace = true;
+        opts.pm1_vtrace_max_batches = std::strtoull(argv[i + 1], nullptr, 10);
+        if (opts.pm1_vtrace_max_batches == 0) opts.pm1_vtrace_max_batches = 1;
+        ++i;
+    }
+    else if (std::strcmp(argv[i], "-pm1-vtrace-no-auto-batch") == 0 ||
+             std::strcmp(argv[i], "--pm1-vtrace-no-auto-batch") == 0 ||
+             std::strcmp(argv[i], "-vtrace-no-auto-batch") == 0) {
+        opts.pm1_vtrace = true;
+        opts.pm1_vtrace_auto_batch = false;
+    }
+    else if (std::strcmp(argv[i], "-pm1-vtrace-negadd-off") == 0 ||
+             std::strcmp(argv[i], "--pm1-vtrace-negadd-off") == 0 ||
+             std::strcmp(argv[i], "-vtrace-negadd-off") == 0) {
+        opts.pm1_vtrace = true;
+        opts.pm1_vtrace_negadd_off = true;
+    }
+    else if (std::strcmp(argv[i], "-pm1-vtrace-pair95") == 0 ||
+             std::strcmp(argv[i], "--pm1-vtrace-pair95") == 0 ||
+             std::strcmp(argv[i], "-vtrace-pair95") == 0) {
+        opts.pm1_vtrace = true;
+        opts.pm1_vtrace_pair95 = true;
+        opts.pm1_vtrace_pair95_off = false;
+    }
+    else if (std::strcmp(argv[i], "-pm1-vtrace-pair95-off") == 0 ||
+             std::strcmp(argv[i], "--pm1-vtrace-pair95-off") == 0 ||
+             std::strcmp(argv[i], "-vtrace-pair95-off") == 0) {
+        opts.pm1_vtrace = true;
+        opts.pm1_vtrace_pair95_off = true;
+        opts.pm1_vtrace_pair95 = false;
+    }
+    else if ((std::strcmp(argv[i], "-pm1-vtrace-pair95-l") == 0 ||
+              std::strcmp(argv[i], "--pm1-vtrace-pair95-l") == 0 ||
+              std::strcmp(argv[i], "-vtrace-pair95-l") == 0) && i + 1 < argc) {
+        opts.pm1_vtrace = true;
+        opts.pm1_vtrace_pair95 = true;
+        opts.pm1_vtrace_pair95_L = std::strtoull(argv[i + 1], nullptr, 10);
+        ++i;
+    }
+    else if (std::strcmp(argv[i], "-nogcd-stage1") == 0 ||
+             std::strcmp(argv[i], "--nogcd-stage1") == 0 ||
+             std::strcmp(argv[i], "-no-gcd-stage1") == 0 ||
+             std::strcmp(argv[i], "-nogcdstage1") == 0) {
+        opts.pm1_no_stage1_gcd = true;
+    }
+    else if (strcmp(argv[i], "-factors") == 0 && i + 1 < argc) {
+        opts.knownFactors = util::split(argv[++i], ',');
+        //opts.knownFactors_start = util::split(argv[++i], ',');
+        opts.knownFactors_start.assign(opts.knownFactors.begin(), opts.knownFactors.end());
+    }
+    else {
+        return false;
+    }
+
+    return true;
 }
 
 CliOptions CliParser::parse(int argc, char** argv ) {
@@ -191,6 +553,113 @@ CliOptions CliParser::parse(int argc, char** argv ) {
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
             opts.device_id = to_u64(argv[++i]);
+        }
+        else if (std::strcmp(argv[i], "-gm") == 0 ||
+                 std::strcmp(argv[i], "--gm") == 0 ||
+                 std::strcmp(argv[i], "-gm-proth") == 0 ||
+                 std::strcmp(argv[i], "--gm-proth") == 0 ||
+                 std::strcmp(argv[i], "-gaussian-mersenne") == 0) {
+            opts.gaussian_mersenne = true;
+            opts.gm_prp_only = false;
+            opts.mode = "gm-proth";
+            opts.proof = false;
+        }
+        else if (std::strcmp(argv[i], "-gm-prp") == 0 ||
+                 std::strcmp(argv[i], "--gm-prp") == 0) {
+            opts.gaussian_mersenne = true;
+            opts.gm_prp_only = true;
+            opts.mode = "gm-prp";
+            opts.proof = false;
+        }
+        else if (std::strcmp(argv[i], "-gm-pm1") == 0 ||
+                 std::strcmp(argv[i], "--gm-pm1") == 0) {
+            opts.gaussian_mersenne = true;
+            opts.gm_prp_only = false;
+            opts.mode = "gm-pm1";
+            opts.proof = false;
+        }
+        else if (std::strcmp(argv[i], "-gm-ecm") == 0 ||
+                 std::strcmp(argv[i], "--gm-ecm") == 0) {
+            opts.gaussian_mersenne = true;
+            opts.gm_prp_only = false;
+            opts.mode = "gm-ecm";
+            opts.proof = false;
+            opts.compute_edwards = false;
+        }
+        else if (std::strcmp(argv[i], "-gm-ecm-special32") == 0 ||
+                 std::strcmp(argv[i], "--gm-ecm-special32") == 0) {
+            opts.gaussian_mersenne = true;
+            opts.gm_prp_only = false;
+            opts.mode = "gm-ecm-special32";
+            opts.proof = false;
+            opts.compute_edwards = false;
+            // Special32 is itself the deterministic prepass; do not silently
+            // divert it through the legacy sieve/Suyama dispatcher.
+            opts.gm_sieve_limit = 0;
+        }
+        else if (std::strcmp(argv[i], "-gm-ecm-special4096") == 0 ||
+                 std::strcmp(argv[i], "--gm-ecm-special4096") == 0) {
+            opts.gaussian_mersenne = true;
+            opts.gm_prp_only = false;
+            opts.mode = "gm-ecm-special4096";
+            opts.proof = false;
+            opts.compute_edwards = false;
+            opts.gm_sieve_limit = 0;
+        }
+        else if (std::strcmp(argv[i], "-gm-cpu") == 0 ||
+                 std::strcmp(argv[i], "--gm-cpu") == 0) {
+            opts.gaussian_mersenne = true;
+            opts.gm_cpu = true;
+            if (opts.mode != "gm-prp" && opts.mode != "gm-pm1" && opts.mode != "gm-ecm" && opts.mode != "gm-ecm-special32" && opts.mode != "gm-ecm-special4096") opts.mode = "gm-proth";
+            opts.proof = false;
+        }
+        else if (std::strcmp(argv[i], "-gm-safe") == 0 ||
+                 std::strcmp(argv[i], "--gm-safe") == 0) {
+            opts.gaussian_mersenne = true;
+            opts.gm_safe_replay = true;
+            if (opts.mode != "gm-prp" && opts.mode != "gm-pm1" && opts.mode != "gm-ecm" && opts.mode != "gm-ecm-special32" && opts.mode != "gm-ecm-special4096") opts.mode = "gm-proth";
+            opts.proof = false;
+        }
+        else if ((std::strcmp(argv[i], "-gm-family") == 0 ||
+                  std::strcmp(argv[i], "--gm-family") == 0) && i + 1 < argc) {
+            std::string family = argv[++i];
+            std::transform(family.begin(), family.end(), family.begin(),
+                           [](unsigned char c){ return static_cast<char>(std::toupper(c)); });
+            if (family != "GM" && family != "GQ" && family != "BOTH") {
+                throw std::runtime_error("-gm-family accepts only GM, GQ, or BOTH");
+            }
+            opts.gaussian_mersenne = true;
+            opts.gm_family = family;
+            opts.proof = false;
+        }
+        else if ((std::strcmp(argv[i], "-gm-base") == 0 ||
+                  std::strcmp(argv[i], "--gm-base") == 0) && i + 1 < argc) {
+            const uint64_t value = to_u64(argv[++i]);
+            if (value < 2 || value > 0xffffffffULL) {
+                throw std::runtime_error("-gm-base must be between 2 and 4294967295");
+            }
+            opts.gm_base = static_cast<uint32_t>(value);
+        }
+        else if ((std::strcmp(argv[i], "-gm-sieve") == 0 ||
+                  std::strcmp(argv[i], "--gm-sieve") == 0) && i + 1 < argc) {
+            opts.gm_sieve_limit = to_u64(argv[++i]);
+        }
+        else if ((std::strcmp(argv[i], "-gm-replay-block") == 0 ||
+                  std::strcmp(argv[i], "--gm-replay-block") == 0) && i + 1 < argc) {
+            opts.gaussian_mersenne = true;
+            opts.gm_replay_block = to_u64(argv[++i]);
+            opts.gm_safe_replay = true;
+            if (opts.mode != "gm-prp" && opts.mode != "gm-pm1" && opts.mode != "gm-ecm" && opts.mode != "gm-ecm-special32" && opts.mode != "gm-ecm-special4096") opts.mode = "gm-proth";
+            opts.proof = false;
+        }
+        else if ((std::strcmp(argv[i], "-gm-factor-chunk-bits") == 0 ||
+                  std::strcmp(argv[i], "--gm-factor-chunk-bits") == 0) && i + 1 < argc) {
+            opts.gaussian_mersenne = true;
+            opts.gm_factor_chunk_bits = to_u64(argv[++i]);
+            if (opts.gm_factor_chunk_bits < 1024) {
+                throw std::runtime_error("-gm-factor-chunk-bits must be >= 1024");
+            }
+            opts.proof = false;
         }
         else if (std::strcmp(argv[i], "-prp") == 0) {
             opts.mode = "prp";
@@ -267,9 +736,64 @@ CliOptions CliParser::parse(int argc, char** argv ) {
             opts.force_engine_marin = false;
             opts.marin = true;
             opts.aevum_fft_spec = argv[++i];
+            opts.aevum_fft_spec_explicit = true;
         }
-        else if (std::strcmp(argv[i], "-aevum-use") == 0 && i + 1 < argc) {
-            opts.aevum_use = argv[++i];
+        else if (std::strcmp(argv[i], "-pfa9-type4") == 0 ||
+                 std::strcmp(argv[i], "-pfa9-type4-fast") == 0 ||
+                 std::strcmp(argv[i], "-pfa9-fft323161") == 0) {
+            opts.aevum = true;
+            opts.aevum_auto = false;
+            opts.force_engine_marin = false;
+            opts.marin = true;
+            opts.aevum_pfa_radix = 9;
+            opts.aevum_pfa_off = false;
+            opts.aevum_fft_spec = "pfa9:4:512:9:512:202";
+            opts.aevum_fft_spec_explicit = true;
+        }
+        else if (std::strcmp(argv[i], "-pfa9-type4-full") == 0) {
+            opts.aevum = true;
+            opts.aevum_auto = false;
+            opts.force_engine_marin = false;
+            opts.marin = true;
+            opts.aevum_pfa_radix = 9;
+            opts.aevum_pfa_off = false;
+            opts.aevum_fft_spec = "pfa9full:4:512:9:512:202";
+            opts.aevum_fft_spec_explicit = true;
+        }
+        else if (std::strcmp(argv[i], "-pfa-off") == 0 ||
+                 std::strcmp(argv[i], "-no-pfa") == 0) {
+            opts.aevum_pfa_radix = 0;
+            opts.aevum_pfa_off = true;
+            opts.aevum_fft_spec.clear();
+            opts.aevum_fft_spec_explicit = true;
+        }
+        else if (std::strcmp(argv[i], "-pfa") == 0 ||
+                 std::strcmp(argv[i], "-pfa-auto") == 0 ||
+                 std::strncmp(argv[i], "-pfa=", 5) == 0 ||
+                 std::strcmp(argv[i], "-pfa3") == 0 ||
+                 std::strcmp(argv[i], "-pfa9") == 0) {
+            int radix = -1;
+            if (std::strcmp(argv[i], "-pfa3") == 0) radix = 3;
+            else if (std::strcmp(argv[i], "-pfa9") == 0) radix = 9;
+            else if (std::strncmp(argv[i], "-pfa=", 5) == 0) {
+                const char* value = argv[i] + 5;
+                if (std::strcmp(value, "3") == 0) radix = 3;
+                else if (std::strcmp(value, "9") == 0) radix = 9;
+                else if (std::strcmp(value, "auto") != 0) {
+                    throw std::runtime_error("-pfa accepts only auto, 3, or 9");
+                }
+            } else if (i + 1 < argc &&
+                       (std::strcmp(argv[i + 1], "3") == 0 || std::strcmp(argv[i + 1], "9") == 0)) {
+                radix = std::atoi(argv[++i]);
+            }
+            opts.aevum = true;
+            opts.aevum_auto = false;
+            opts.force_engine_marin = false;
+            opts.marin = true;
+            opts.aevum_pfa_radix = radix;
+            opts.aevum_pfa_off = false;
+            opts.aevum_fft_spec = radix == 3 ? "pfa:3" : radix == 9 ? "pfa:9" : "pfa:auto";
+            opts.aevum_fft_spec_explicit = true;
         }
         else if (std::strcmp(argv[i], "-s3") == 0) {
             opts.s3only = true;
@@ -383,323 +907,9 @@ CliOptions CliParser::parse(int argc, char** argv ) {
             opts.exportmers = true;
             opts.exponent = p;
         }
-        else if (std::strcmp(argv[i], "-b1") == 0 && i + 1 < argc) {
-            opts.B1 = std::strtoull(argv[i + 1], nullptr, 10);  // base 10
-            ++i;
+        else if (parse_cli_tail_option(opts, i, argc, argv)) {
+            continue;
         }
-        else if (std::strcmp(argv[i], "-b1old") == 0 && i + 1 < argc) {
-            opts.B1old = std::strtoull(argv[i + 1], nullptr, 10);  // base 10
-            ++i;
-        }
-        else if (std::strcmp(argv[i], "-b2") == 0 && i + 1 < argc) {
-            opts.B2 = std::strtoull(argv[i + 1], nullptr, 10);  // base 10
-            ++i;
-        }
-        else if ((std::strcmp(argv[i], "-b2start") == 0 ||
-                  std::strcmp(argv[i], "--b2start") == 0 ||
-                  std::strcmp(argv[i], "-s2from") == 0 ||
-                  std::strcmp(argv[i], "--s2from") == 0 ||
-                  std::strcmp(argv[i], "-stage2start") == 0 ||
-                  std::strcmp(argv[i], "--stage2start") == 0) && i + 1 < argc) {
-            opts.B2Start = std::strtoull(argv[i + 1], nullptr, 10);  // base 10
-            ++i;
-        }
-        else if (std::strcmp(argv[i], "-b3") == 0 && i + 1 < argc) {
-            opts.B3 = std::strtoull(argv[i + 1], nullptr, 10);  // base 10
-            ++i;
-        }
-        else if (std::strcmp(argv[i], "-b4") == 0 && i + 1 < argc) {
-            opts.B4 = std::strtoull(argv[i + 1], nullptr, 10);  // base 10
-            ++i;
-        }
-        else if (std::strcmp(argv[i], "-K") == 0 && i + 1 < argc) {
-            opts.K = std::strtoull(argv[i + 1], nullptr, 10);  // base 10
-            ++i;
-        }
-        else if (std::strcmp(argv[i], "-nmax") == 0 && i + 1 < argc) {
-            opts.nmax = std::strtoull(argv[i + 1], nullptr, 10);  // base 10
-            ++i;
-        }
-        else if (std::strcmp(argv[i], "-memlim") == 0 && i + 1 < argc) {
-            opts.memlim = std::strtoull(argv[i + 1], nullptr, 10);  // base 10
-            ++i;
-        }
-        else if (std::strcmp(argv[i], "-seed") == 0 && i + 1 < argc) {
-            opts.curve_seed = std::strtoull(argv[i + 1], nullptr, 10);  // base 10
-            ++i;
-        }
-        else if (std::strcmp(argv[i], "-sigma") == 0 && i + 1 < argc) {
-            opts.sigma = argv[i + 1];
-            opts.K = 1;
-            ++i;
-        }
-        else if (std::strcmp(argv[i], "-tbits") == 0 && i + 1 < argc) {
-            opts.tbits = std::strtoull(argv[i + 1], nullptr, 10);  // base 10
-            ++i;
-        }
-        else if (std::strcmp(argv[i], "-erroriter") == 0 && i + 1 < argc) {
-            opts.erroriter = std::strtoull(argv[i + 1], nullptr, 10);  // base 10
-            ++i;
-        }
-        else if (std::strcmp(argv[i], "-ecm_check_interval") == 0 && i + 1 < argc) {
-            opts.ecm_check_interval = std::strtoull(argv[i + 1], nullptr, 10);  // base 10
-            ++i;
-        }
-        else if (std::strcmp(argv[i], "-ecm_progress_ms") == 0 && i + 1 < argc) {
-            opts.ecm_progress_interval_ms = std::strtoull(argv[i + 1], nullptr, 10);  // base 10
-            ++i;
-        }
-        
-        else if (std::strcmp(argv[i], "-llsafeb") == 0 && i + 1 < argc) {
-            opts.llsafe_block = std::strtoull(argv[i + 1], nullptr, 10);  // base 10
-            ++i;
-        }
-        else if (std::strcmp(argv[i], "-l1") == 0 && i + 1 < argc) {
-            opts.max_local_size1 = to_u64(argv[++i]);
-        }
-        else if (std::strcmp(argv[i], "-checklevel") == 0 && i + 1 < argc) {
-            opts.checklevel = to_u64(argv[++i]);
-        }
-        else if (std::strcmp(argv[i], "-glblock") == 0 && i + 1 < argc) {
-            opts.gl_block = to_u64(argv[++i]);
-        }
-        else if (std::strcmp(argv[i], "-chunk256") == 0 && i + 1 < argc) {
-            opts.chunk256 = to_u64(argv[++i]);
-        }
-        else if (std::strcmp(argv[i], "-l5") == 0 && i + 1 < argc) {
-            opts.max_local_size5 = to_u64(argv[++i]);
-        }
-        else if (std::strcmp(argv[i], "-iterforce") == 0 && i + 1 < argc) {
-            opts.iterforce = to_u64(argv[++i]);
-        }
-        else if (std::strcmp(argv[i], "-iterforce2") == 0 && i + 1 < argc) {
-            opts.iterforce2 = to_u64(argv[++i]);
-        }
-        else if (std::strcmp(argv[i], "-maxe") == 0 && i + 1 < argc) {
-            uint64_t mb = std::strtoull(argv[i + 1], nullptr, 10);
-            opts.max_e_bits = (mb == 0 ? 10000ULL : (mb << 23));
-            ++i;
-        }
-        
-        else if (std::strcmp(argv[i], "-l2") == 0 && i + 1 < argc) {
-            opts.max_local_size2 = to_u64(argv[++i]);
-        }
-        else if (std::strcmp(argv[i], "-l3") == 0 && i + 1 < argc) {
-            opts.max_local_size3 = to_u64(argv[++i]);
-        }
-        else if (std::strcmp(argv[i], "-enqueue_max") == 0 && i + 1 < argc) {
-            opts.enqueue_max = to_u64(argv[++i]);
-        }
-        else if (std::strcmp(argv[i], "-res64_display_interval") == 0 && i + 1 < argc) {
-            int v = to_u64(argv[++i]);
-            if (v < 0) {
-                std::cerr << "Error: -res64_display_interval must be 0 (to disable) or > 0\n";
-                std::exit(EXIT_FAILURE);
-            }
-            opts.res64_display_interval = v;
-        }
-        else if (std::strcmp(argv[i], "-user") == 0 && i + 1 < argc) {
-            opts.user = argv[++i];
-        }
-        else if (std::strcmp(argv[i], "-password") == 0 && i + 1 < argc) {
-            opts.password = argv[++i];
-        }
-        else if (std::strcmp(argv[i], "-computer") == 0 && i + 1 < argc) {
-            opts.computer_name = argv[++i];
-        }
-        else if (std::strcmp(argv[i], "--noask") == 0 || std::strcmp(argv[i], "-noask") == 0) {
-            opts.noAsk = true;
-        }
-        else if (std::strcmp(argv[i], "-wagstaff") == 0) {
-            opts.wagstaff = true;
-        }
-        else if (std::strcmp(argv[i], "-resume") == 0) {
-            opts.resume = true;
-        }
-        else if (std::strcmp(argv[i], "-p95") == 0) {
-            opts.resume95 = true;
-        }
-        else if (std::strcmp(argv[i], "-noverify") == 0) {
-            opts.verify = false;
-        }
-        else if (std::strcmp(argv[i], "-tune") == 0) {
-            opts.tune = true;
-        }
-        else if (std::strcmp(argv[i], "-worktodo") == 0 && i + 1 < argc) {
-            opts.worktodo_path = argv[++i];
-        }
-        else if (std::strcmp(argv[i], "-config") == 0 && i + 1 < argc) {
-            opts.config_path = argv[++i];
-        }
-        else if (std::strcmp(argv[i], "-kernelpath") == 0 && i + 1 < argc) {
-            opts.kernel_path = argv[++i];
-        }
-        else if (std::strcmp(argv[i], "-gerbiczli") == 0 || std::strcmp(argv[i], "-gerbiczli") == 0) {
-            opts.gerbiczli = false;
-        }
-        else if (std::strcmp(argv[i], "-pm1-lowmem") == 0 ||
-                 std::strcmp(argv[i], "--pm1-lowmem") == 0 ||
-                 std::strcmp(argv[i], "-pm1lowmem") == 0 ||
-                 std::strcmp(argv[i], "-lowmem") == 0) {
-            opts.pm1_lowmem = true;
-            opts.gerbiczli = false;
-        }
-        else if (std::strcmp(argv[i], "-pm1-ultralowmem") == 0 ||
-                 std::strcmp(argv[i], "--pm1-ultralowmem") == 0 ||
-                 std::strcmp(argv[i], "-pm1ultralowmem") == 0 ||
-                 std::strcmp(argv[i], "-pm1-1reg") == 0) {
-            opts.pm1_lowmem = true;
-            opts.pm1_ultralowmem = true;
-            opts.gerbiczli = false;
-        }
-        else if (std::strcmp(argv[i], "-pm1-s2-resume2reg") == 0 ||
-                 std::strcmp(argv[i], "--pm1-s2-resume2reg") == 0 ||
-                 std::strcmp(argv[i], "-pm1s2resume2reg") == 0 ||
-                 std::strcmp(argv[i], "-pm1-stage2-2reg") == 0) {
-            opts.pm1_lowmem = true;
-            opts.pm1_ultralowmem = true;
-            opts.pm1_s2_resume2reg = true;
-            opts.gerbiczli = false;
-        }
-        else if (std::strcmp(argv[i], "-pm1-vtrace-off") == 0 ||
-                 std::strcmp(argv[i], "--pm1-vtrace-off") == 0 ||
-                 std::strcmp(argv[i], "-pm1-stage2-classic") == 0 ||
-                 std::strcmp(argv[i], "-vtrace-off") == 0) {
-            opts.pm1_vtrace_off = true;
-            opts.pm1_vtrace = false;
-        }
-        else if (std::strcmp(argv[i], "-pm1-vtrace") == 0 ||
-                 std::strcmp(argv[i], "--pm1-vtrace") == 0 ||
-                 std::strcmp(argv[i], "-pm1-stage2-vtrace") == 0 ||
-                 std::strcmp(argv[i], "-vtrace") == 0) {
-            // Kept for compatibility: V-trace is now the default normal-memory Stage 2.
-            opts.pm1_vtrace = true;
-        }
-        else if ((std::strcmp(argv[i], "-pm1-vtrace-d") == 0 ||
-                  std::strcmp(argv[i], "--pm1-vtrace-d") == 0 ||
-                  std::strcmp(argv[i], "-vtrace-d") == 0) && i + 1 < argc) {
-            opts.pm1_vtrace = true;
-            opts.pm1_vtrace_D = std::strtoull(argv[i + 1], nullptr, 10);
-            ++i;
-        }
-        else if (std::strcmp(argv[i], "-pm1-vtrace-auto-d") == 0 ||
-                 std::strcmp(argv[i], "--pm1-vtrace-auto-d") == 0 ||
-                 std::strcmp(argv[i], "-vtrace-auto-d") == 0) {
-            opts.pm1_vtrace = true;
-            opts.pm1_vtrace_auto_d = true;
-        }
-        else if (std::strcmp(argv[i], "-pm1-vtrace-auto-d-aggressive") == 0 ||
-                 std::strcmp(argv[i], "--pm1-vtrace-auto-d-aggressive") == 0 ||
-                 std::strcmp(argv[i], "-vtrace-auto-d-aggressive") == 0) {
-            opts.pm1_vtrace = true;
-            opts.pm1_vtrace_auto_d = true;
-            opts.pm1_vtrace_auto_d_aggressive = true;
-        }
-        else if ((std::strcmp(argv[i], "-pm1-vtrace-deep-d") == 0 ||
-                  std::strcmp(argv[i], "--pm1-vtrace-deep-d") == 0 ||
-                  std::strcmp(argv[i], "-vtrace-deep-d") == 0) && i + 1 < argc) {
-            opts.pm1_vtrace = true;
-            const char* val = argv[i + 1];
-            if (std::strcmp(val, "auto") == 0 || std::strcmp(val, "AUTO") == 0) {
-                opts.pm1_vtrace_auto_d = true;
-                opts.pm1_vtrace_deep_d_auto = true;
-            } else {
-                opts.pm1_vtrace_D = std::strtoull(val, nullptr, 10);
-            }
-            ++i;
-        }
-        else if (std::strcmp(argv[i], "-pm1-vtrace-product-tree") == 0 ||
-                 std::strcmp(argv[i], "--pm1-vtrace-product-tree") == 0 ||
-                 std::strcmp(argv[i], "-vtrace-product-tree") == 0) {
-            opts.pm1_vtrace = true;
-            opts.pm1_vtrace_product_tree = true;
-        }
-        else if ((std::strcmp(argv[i], "-pm1-vtrace-product-tree-width") == 0 ||
-                  std::strcmp(argv[i], "--pm1-vtrace-product-tree-width") == 0 ||
-                  std::strcmp(argv[i], "-vtrace-product-tree-width") == 0) && i + 1 < argc) {
-            opts.pm1_vtrace = true;
-            opts.pm1_vtrace_product_tree = true;
-            unsigned long long w = std::strtoull(argv[i + 1], nullptr, 10);
-            if (w < 2ULL) w = 2ULL;
-            if (w > 64ULL) w = 64ULL;
-            opts.pm1_vtrace_product_tree_width = static_cast<uint32_t>(w);
-            ++i;
-        }
-        else if ((std::strcmp(argv[i], "-pm1-vtrace-max-regs") == 0 ||
-                  std::strcmp(argv[i], "--pm1-vtrace-max-regs") == 0 ||
-                  std::strcmp(argv[i], "-vtrace-max-regs") == 0) && i + 1 < argc) {
-            opts.pm1_vtrace = true;
-            opts.pm1_vtrace_auto_d = true;
-            opts.pm1_vtrace_max_regs = std::strtoull(argv[i + 1], nullptr, 10);
-            ++i;
-        }
-        else if (std::strcmp(argv[i], "-pm1-vtrace-auto-batch") == 0 ||
-                 std::strcmp(argv[i], "--pm1-vtrace-auto-batch") == 0 ||
-                 std::strcmp(argv[i], "-vtrace-auto-batch") == 0) {
-            opts.pm1_vtrace = true;
-            opts.pm1_vtrace_auto_batch = true;
-        }
-        else if ((std::strcmp(argv[i], "-pm1-vtrace-baby-batch") == 0 ||
-                  std::strcmp(argv[i], "--pm1-vtrace-baby-batch") == 0 ||
-                  std::strcmp(argv[i], "-vtrace-baby-batch") == 0) && i + 1 < argc) {
-            opts.pm1_vtrace = true;
-            opts.pm1_vtrace_baby_batch = std::strtoull(argv[i + 1], nullptr, 10);
-            ++i;
-        }
-        else if ((std::strcmp(argv[i], "-pm1-vtrace-max-batches") == 0 ||
-                  std::strcmp(argv[i], "--pm1-vtrace-max-batches") == 0 ||
-                  std::strcmp(argv[i], "-vtrace-max-batches") == 0) && i + 1 < argc) {
-            opts.pm1_vtrace = true;
-            opts.pm1_vtrace_max_batches = std::strtoull(argv[i + 1], nullptr, 10);
-            if (opts.pm1_vtrace_max_batches == 0) opts.pm1_vtrace_max_batches = 1;
-            ++i;
-        }
-        else if (std::strcmp(argv[i], "-pm1-vtrace-no-auto-batch") == 0 ||
-                 std::strcmp(argv[i], "--pm1-vtrace-no-auto-batch") == 0 ||
-                 std::strcmp(argv[i], "-vtrace-no-auto-batch") == 0) {
-            opts.pm1_vtrace = true;
-            opts.pm1_vtrace_auto_batch = false;
-        }
-        else if (std::strcmp(argv[i], "-pm1-vtrace-negadd-off") == 0 ||
-                 std::strcmp(argv[i], "--pm1-vtrace-negadd-off") == 0 ||
-                 std::strcmp(argv[i], "-vtrace-negadd-off") == 0) {
-            opts.pm1_vtrace = true;
-            opts.pm1_vtrace_negadd_off = true;
-        }
-        else if (std::strcmp(argv[i], "-pm1-vtrace-pair95") == 0 ||
-                 std::strcmp(argv[i], "--pm1-vtrace-pair95") == 0 ||
-                 std::strcmp(argv[i], "-vtrace-pair95") == 0) {
-            opts.pm1_vtrace = true;
-            opts.pm1_vtrace_pair95 = true;
-            opts.pm1_vtrace_pair95_off = false;
-        }
-        else if (std::strcmp(argv[i], "-pm1-vtrace-pair95-off") == 0 ||
-                 std::strcmp(argv[i], "--pm1-vtrace-pair95-off") == 0 ||
-                 std::strcmp(argv[i], "-vtrace-pair95-off") == 0) {
-            opts.pm1_vtrace = true;
-            opts.pm1_vtrace_pair95_off = true;
-            opts.pm1_vtrace_pair95 = false;
-        }
-        else if ((std::strcmp(argv[i], "-pm1-vtrace-pair95-l") == 0 ||
-                  std::strcmp(argv[i], "--pm1-vtrace-pair95-l") == 0 ||
-                  std::strcmp(argv[i], "-vtrace-pair95-l") == 0) && i + 1 < argc) {
-            opts.pm1_vtrace = true;
-            opts.pm1_vtrace_pair95 = true;
-            opts.pm1_vtrace_pair95_L = std::strtoull(argv[i + 1], nullptr, 10);
-            ++i;
-        }
-        else if (std::strcmp(argv[i], "-nogcd-stage1") == 0 ||
-                 std::strcmp(argv[i], "--nogcd-stage1") == 0 ||
-                 std::strcmp(argv[i], "-no-gcd-stage1") == 0 ||
-                 std::strcmp(argv[i], "-nogcdstage1") == 0) {
-            opts.pm1_no_stage1_gcd = true;
-        }
-        else if (strcmp(argv[i], "-factors") == 0 && i + 1 < argc) {
-            opts.knownFactors = util::split(argv[++i], ',');
-            //opts.knownFactors_start = util::split(argv[++i], ',');
-            opts.knownFactors_start.assign(opts.knownFactors.begin(), opts.knownFactors.end());
-        }
-        
         else if (argv[i][0] != '-') {
             if (opts.exponent == 0) {
                 opts.exponent = std::strtoull(argv[i], nullptr, 10);
@@ -712,6 +922,15 @@ CliOptions CliParser::parse(int argc, char** argv ) {
             std::cerr << "Warning: Unknown option '" << argv[i] << "'\n";
         }
     }
+    if (opts.gaussian_mersenne) {
+        if (opts.mode != "gm-pm1" && opts.mode != "gm-ecm" && opts.mode != "gm-ecm-special32" && opts.mode != "gm-ecm-special4096") {
+            opts.mode = opts.gm_prp_only ? "gm-prp" : "gm-proth";
+        }
+        opts.proof = false;
+        // Gaussian factors are factors of G_p, not of the lifted M_(4p).  Keep
+        // supplied factors only for the dedicated factoring modes.
+        if (opts.mode == "gm-proth" || opts.mode == "gm-prp") opts.knownFactors.clear();
+    }
     if(opts.wagstaff){
         //std::cout << "[WAGSTAFF MODE] This test will check if (2^)" << options.exponent << " + 1)/3 is PRP prime" << std::endl;
         //p  = p*2;
@@ -723,7 +942,7 @@ CliOptions CliParser::parse(int argc, char** argv ) {
     if(opts.mode == "ll"){
         opts.erroriter = 0;
     }
-    
+
     // Check that LL test is not used for Mersenne cofactors
     if (opts.mode == "ll" && !opts.knownFactors.empty()) {
         std::cerr << "Error: Lucas-Lehmer test cannot be used on Mersenne cofactors." << std::endl;

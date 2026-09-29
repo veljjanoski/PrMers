@@ -21,7 +21,6 @@
  */
 #include "core/ProofMarin.hpp"
 #include "io/Sha3Hash.h"
-#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -200,36 +199,55 @@ ProofMarin ProofMarin::load(const std::filesystem::path& filePath) {
 }
 
 namespace {
-// A residue is hashed as its first (E - 1) / 8 + 1 little-endian bytes. A residue converted from
-// GMP has no leading zero words, so a shorter vector is zero-padded here: reading past its end
-// made the prover's hash differ from the verifier's, which reads the zero-padded proof file.
-const uint32_t* hashableWords(uint32_t E, const std::vector<uint32_t>& words, std::vector<uint32_t>& padded) {
-  const size_t nWords = (static_cast<size_t>(E) + 31) / 32;
-  if (words.size() >= nWords) return words.data();
-  padded.assign(nWords, 0);
-  std::copy(words.begin(), words.end(), padded.begin());
-  return padded.data();
+
+std::vector<uint32_t> canonicalProofWords(
+    uint32_t E,
+    const std::vector<uint32_t>& words) {
+  const size_t expectedWords =
+      (static_cast<size_t>(E) + 31u) / 32u;
+
+  if (words.size() > expectedWords) {
+    throw std::runtime_error("Proof residue exceeds exponent width");
+  }
+
+  std::vector<uint32_t> padded = words;
+  padded.resize(expectedWords, 0u);
+
+  if ((E & 31u) != 0u && !padded.empty()) {
+    const uint32_t used = E & 31u;
+    padded.back() &= (uint32_t(1) << used) - 1u;
+  }
+
+  return padded;
 }
-}  // namespace
+
+} // namespace
 
 // Hash functions for ProofMarin generation
-std::array<uint64_t, 4> ProofMarin::hashWords(uint32_t E, const std::vector<uint32_t>& words) {
-  // Hash the words data
+std::array<uint64_t, 4> ProofMarin::hashWords(
+    uint32_t E,
+    const std::vector<uint32_t>& words) {
+  auto padded = canonicalProofWords(E, words);
+  const uint32_t nBytes = (E - 1) / 8 + 1;
+
   io::SHA3 hasher;
-  uint32_t nBytes = (E - 1) / 8 + 1;
-  std::vector<uint32_t> padded;
-  return std::move(hasher.update(hashableWords(E, words, padded), nBytes)).finish();
+  hasher.update(padded.data(), nBytes);
+  return std::move(hasher).finish();
 }
 
-std::array<uint64_t, 4> ProofMarin::hashWords(uint32_t E,
-                                         const std::array<uint64_t, 4>& prefix,
-                                         const std::vector<uint32_t>& words) {
-  // Hash the prefix first, then the words data
+std::array<uint64_t, 4> ProofMarin::hashWords(
+    uint32_t E,
+    const std::array<uint64_t, 4>& prefix,
+    const std::vector<uint32_t>& words) {
+  auto padded = canonicalProofWords(E, words);
+  const uint32_t nBytes = (E - 1) / 8 + 1;
+
   io::SHA3 hasher;
-  uint32_t nBytes = (E - 1) / 8 + 1;
-  hasher.update(prefix.data(), static_cast<uint32_t>(prefix.size()) * sizeof(uint64_t));
-  std::vector<uint32_t> padded;
-  return std::move(hasher.update(hashableWords(E, words, padded), nBytes)).finish();
+  hasher.update(
+      prefix.data(),
+      static_cast<uint32_t>(prefix.size() * sizeof(uint64_t)));
+  hasher.update(padded.data(), nBytes);
+  return std::move(hasher).finish();
 }
 
 uint64_t ProofMarin::res64(const std::vector<uint32_t>& words) {

@@ -98,6 +98,7 @@ G_H        "group height" == SMALL_HEIGHT / NH
 #define NONTEMPORAL 0
 #endif
 
+
 // FFT variant is in 3 parts.  One digit for WIDTH, one digit for MIDDLE, one digit for HEIGHT.
 // For WIDTH and HEIGHT there are 3 variants:
 // 0   compute one trig, bcast, chainmul                                        previously was :even/:odd BCAST=1
@@ -208,6 +209,24 @@ G_H        "group height" == SMALL_HEIGHT / NH
 #define NWORDS (ND * 2u)
 #define NWORDS_IS_POWER_OF_TWO  !(NWORDS & (NWORDS - 1))
 
+#ifndef PFA_RADIX
+#define PFA_RADIX 0u
+#endif
+
+#if PFA_RADIX
+#ifndef PFA_LOG2_ROOT_TWO31
+#error PFA_LOG2_ROOT_TWO31 must be supplied for mixed-radix transforms
+#endif
+#ifndef PFA_LOG2_ROOT_TWO61
+#error PFA_LOG2_ROOT_TWO61 must be supplied for mixed-radix transforms
+#endif
+#define M31_LOG2_ROOT_TWO ((u32) PFA_LOG2_ROOT_TWO31)
+#define M61_LOG2_ROOT_TWO ((u32) PFA_LOG2_ROOT_TWO61)
+#else
+#define M31_LOG2_ROOT_TWO ((u32) (((1ULL << 30) / NWORDS) % 31))
+#define M61_LOG2_ROOT_TWO ((u32) (((1ULL << 60) / NWORDS) % 61))
+#endif
+
 #if (NW != 4 && NW != 8) || (NH != 4 && NH != 8)
 #error NW and NH must be passed in, expected value 4 or 8.
 #endif
@@ -245,6 +264,19 @@ typedef ulong2 GF61;        // A complex value using two Z61s.  For a GF(M61^2) 
 #if FFT_TYPE < 0 || (FFT_TYPE > 4 && FFT_TYPE < 50) || FFT_TYPE > 53
 #error - unsupported FFT/NTT
 #endif
+
+// The FP64 FFT can save a few FP64 ops by applying some of the weights using FMA.  nVidia compilers are clever enough to do this automatically.
+// AMD's rocm compiler needs us to do this explicitly (see carryfused.cl's precompute and fft_common's use of it below).  Only wired up
+// for FFT_TYPE==FFT64 with fft_WIDTH's RADIX 4 or 8 (fft4_skip1 / fft8_skip1 in fft4.cl / fft8.cl); not the 32-thread
+// WIDTH=256 special case (WIDTH==256, NW==8, fft8_4-based, see fft_common).
+#if !defined(FUSE_WEIGHT_BUTTERFLY)
+#if AMDGPU && FFT_TYPE == FFT64 && !(WIDTH == 256 && NW == 8)
+#define FUSE_WEIGHT_BUTTERFLY 1
+#else
+#define FUSE_WEIGHT_BUTTERFLY 0
+#endif
+#endif
+
 // Word and Word2 define the data type for FFT integers passed between the CPU and GPU.
 #if WordSize == 8
 typedef i64 Word;
@@ -766,7 +798,15 @@ void OVERLOAD bar(const u32 WG) {
 
 // A half-barrier is only needed when half-a-workgroup needs a barrier.
 // This is used e.g. by the double-wide tailSquare, where LDS is split between the halves.
-void halfBar() { if (get_enqueued_local_size(0) / 2 > WAVEFRONT) { bar(); } }
+void halfBar() {
+#if defined(__OPENCL_C_VERSION__) && __OPENCL_C_VERSION__ < 200
+  // OpenCL C 1.2 has no get_enqueued_local_size().  PrMers/Aevum always
+  // supplies an explicit local size, so get_local_size() is equivalent here.
+  if (get_local_size(0) / 2 > WAVEFRONT) { bar(); }
+#else
+  if (get_enqueued_local_size(0) / 2 > WAVEFRONT) { bar(); }
+#endif
+}
 
 
 // nVidia GPUs (Hopper architecture sm 9.0 and later) support Programatic Dependent Launch where the tail end execution of one kernel can overlap

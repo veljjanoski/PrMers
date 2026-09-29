@@ -12,6 +12,7 @@ class TuneEntry {
 public:
   double cost;
   FFTConfig fft;
+  std::vector<KeyVal> use{}; // optional trailing -use profile; legacy two-column entries unchanged
 
   bool update(std::vector<TuneEntry>&) const;
   bool willUpdate(const vector<TuneEntry>&) const;

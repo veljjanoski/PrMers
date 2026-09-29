@@ -2,6 +2,7 @@
 #include "marin/engine.h"
 
 #include <algorithm>
+#include <cmath>
 #include <array>
 #include <cstdlib>
 #include <cstring>
@@ -90,8 +91,8 @@ struct Api {
     using version_fn = const char* (*)();
     using error_fn = const char* (*)();
     using resolve_fn = int (*)(uint32_t, const char*, char*, std::size_t);
-    using set_use_fn = int (*)(const char*);
     using create_fn = Handle (*)(uint32_t, std::size_t, uint32_t, int, const char*, const char*);
+    using create_ex_fn = Handle (*)(uint32_t, std::size_t, uint32_t, int, const char*, const char*, uint32_t);
     using destroy_fn = void (*)(Handle);
     using size_fn = std::size_t (*)(Handle);
     using sync_fn = int (*)(Handle);
@@ -101,7 +102,6 @@ struct Api {
     using copy_fn = int (*)(Handle, std::size_t, std::size_t);
     using prepare_fn = int (*)(Handle, std::size_t, std::size_t);
     using square_fn = int (*)(Handle, std::size_t, uint32_t);
-    using square_loop_fn = int (*)(Handle, std::size_t, uint64_t, int);
     using mul_fn = int (*)(Handle, std::size_t, std::size_t, uint32_t);
     using binary_fn = int (*)(Handle, std::size_t, std::size_t);
     using sub_u32_fn = int (*)(Handle, std::size_t, uint32_t);
@@ -112,8 +112,8 @@ struct Api {
     version_fn version = nullptr;
     error_fn last_error = nullptr;
     resolve_fn resolve_fft = nullptr;
-    set_use_fn set_use = nullptr;           // optional: absent in older plugins
     create_fn create = nullptr;
+    create_ex_fn create_ex = nullptr;
     destroy_fn destroy = nullptr;
     size_fn transform_size = nullptr;
     size_fn word_count = nullptr;
@@ -124,7 +124,6 @@ struct Api {
     copy_fn copy = nullptr;
     prepare_fn prepare = nullptr;
     square_fn square_mul = nullptr;
-    square_loop_fn square_loop = nullptr;   // optional: absent in older plugins
     mul_fn mul = nullptr;
     binary_fn add = nullptr;
     binary_fn sub_reg = nullptr;
@@ -163,7 +162,7 @@ struct Api {
 #else
         dlerror();
         void* symbol = dlsym(library, name);
-        dlerror();
+        (void)dlerror();
         return reinterpret_cast<T>(symbol);
 #endif
     }
@@ -241,8 +240,8 @@ struct Api {
         version = load_symbol<version_fn>("aevum_engine_version");
         last_error = load_symbol<error_fn>("aevum_engine_last_error");
         resolve_fft = load_symbol<resolve_fn>("aevum_engine_resolve_fft");
-        set_use = load_optional_symbol<set_use_fn>("aevum_engine_set_use");
         create = load_symbol<create_fn>("aevum_engine_create");
+        create_ex = load_optional_symbol<create_ex_fn>("aevum_engine_create_ex");
         destroy = load_symbol<destroy_fn>("aevum_engine_destroy");
         transform_size = load_symbol<size_fn>("aevum_engine_transform_size");
         word_count = load_symbol<size_fn>("aevum_engine_word_count");
@@ -253,7 +252,6 @@ struct Api {
         copy = load_symbol<copy_fn>("aevum_engine_copy");
         prepare = load_symbol<prepare_fn>("aevum_engine_prepare");
         square_mul = load_symbol<square_fn>("aevum_engine_square_mul");
-        square_loop = load_optional_symbol<square_loop_fn>("aevum_engine_square_loop");
         mul = load_symbol<mul_fn>("aevum_engine_mul");
         add = load_symbol<binary_fn>("aevum_engine_add");
         sub_reg = load_symbol<binary_fn>("aevum_engine_sub_reg");
@@ -269,17 +267,16 @@ Api& api() {
 
 class engine_aevum final : public engine {
 public:
-    engine_aevum(uint32_t exponent, std::size_t register_count, std::size_t device, bool verbose, const std::string& fft_spec,
-                 const std::string& use)
+    engine_aevum(uint32_t exponent, std::size_t register_count, std::size_t device, bool verbose, const std::string& fft_spec, uint32_t workload)
         : exponent_(exponent), register_count_(register_count), api_(api()) {
         const std::string tune_dir = api_.tune_dir().string();
-        if (api_.set_use) {
-            if (!api_.set_use(use.c_str())) fail("set_use");
-        } else if (!use.empty()) {
-            std::cout << "[Backend Aevum] Warning: this engine plugin ignores -aevum-use" << std::endl;
+        if (api_.create_ex) {
+            handle_ = api_.create_ex(exponent, register_count, static_cast<uint32_t>(device), verbose ? 1 : 0,
+                                    fft_spec.empty() ? nullptr : fft_spec.c_str(), tune_dir.c_str(), workload);
+        } else {
+            handle_ = api_.create(exponent, register_count, static_cast<uint32_t>(device), verbose ? 1 : 0,
+                                  fft_spec.empty() ? nullptr : fft_spec.c_str(), tune_dir.c_str());
         }
-        handle_ = api_.create(exponent, register_count, static_cast<uint32_t>(device), verbose ? 1 : 0,
-                              fft_spec.empty() ? nullptr : fft_spec.c_str(), tune_dir.c_str());
         if (!handle_) fail("create");
         transform_size_ = api_.transform_size(handle_);
         word_count_ = api_.word_count(handle_);
@@ -288,8 +285,12 @@ public:
             handle_ = nullptr;
             throw std::runtime_error("Aevum plugin returned an invalid transform");
         }
-        std::cout << "[Backend Aevum] engine::Reg adapter active, GF(M31^2) x GF(M61^2)"
+        const char* radix1k_env = std::getenv("AEVUM_RADIX1K");
+        const bool radix1k_8 = radix1k_env && std::string(radix1k_env) == "8";
+        std::cout << "[Backend Aevum] engine::Reg adapter active, FFT3161/FFT323161"
                   << " | transform=" << transform_size_
+                  << " | requested-plan=" << (fft_spec.empty() ? "plugin-auto" : fft_spec)
+                  << " | radix1k=" << (radix1k_8 ? "8(explicit-override)" : "4(safe-default)")
                   << " | regs=" << register_count_
                   << " | plugin=" << api_.path
                   << " | tune=" << api_.tune_dir().string()
@@ -328,18 +329,6 @@ public:
     void square_mul(const Reg src, const uint32 a = 1) const override {
         check_reg(src);
         require(api_.square_mul(handle_, src, a), "square_mul");
-    }
-
-    // Consecutive squarings run through the plugin's fused-carry loop, which avoids the
-    // per-squaring fftP/fftW/carryA/carryB round trip of square_mul.
-    void square_loop(const Reg src, const uint64 count, const bool sub2 = false) const override {
-        if (!api_.square_loop) {
-            engine::square_loop(src, count, sub2);
-            return;
-        }
-        check_reg(src);
-        if (count == 0) return;
-        require(api_.square_loop(handle_, src, count, sub2 ? 1 : 0), "square_loop");
     }
 
     void set_multiplicand(const Reg dst, const Reg src) const override {
@@ -555,10 +544,15 @@ std::size_t transform_size_from_spec(const std::string& spec) {
         if (pos == std::string::npos) break;
         start = pos + 1;
     }
-    if (fields.size() < 4 || fields[0] != "1") throw std::runtime_error("invalid Aevum FFT3161 spec");
-    const std::size_t width = parse_fft_dimension(fields[1]);
-    const std::size_t middle = parse_fft_dimension(fields[2]);
-    const std::size_t height = parse_fft_dimension(fields[3]);
+    std::size_t offset = 0;
+    if (!fields.empty() && (fields[0] == "pfa3" || fields[0] == "pfa9" || fields[0] == "pfa9fast" || fields[0] == "pfa9full")) offset = 1;
+    const bool supported_type = fields.size() >= offset + 4 &&
+                                (fields[offset] == "1" || fields[offset] == "4");
+    if (!supported_type)
+        throw std::runtime_error("invalid Aevum FFT3161/FFT323161 spec");
+    const std::size_t width = parse_fft_dimension(fields[offset + 1]);
+    const std::size_t middle = parse_fft_dimension(fields[offset + 2]);
+    const std::size_t height = parse_fft_dimension(fields[offset + 3]);
     if (width > std::numeric_limits<std::size_t>::max() / middle) throw std::runtime_error("Aevum FFT size overflow");
     const std::size_t half = width * middle;
     if (half > std::numeric_limits<std::size_t>::max() / height / 2) throw std::runtime_error("Aevum FFT size overflow");
@@ -586,8 +580,112 @@ bool aevum_engine_resolve_auto_fft(uint32_t exponent,
         if (transform_size) *transform_size = size;
         if (resolved_spec) *resolved_spec = spec;
         return true;
-    } catch (const std::exception&) {
-        if (reason) *reason = "Aevum engine plugin unavailable";
+    } catch (const std::exception& e) {
+        if (reason) *reason = std::string("Aevum engine plugin unavailable: ") + e.what();
+        return false;
+    }
+}
+
+bool aevum_engine_resolve_factor_safe_fft(uint32_t exponent,
+                                           uint32_t factor,
+                                           std::size_t* transform_size,
+                                           std::string* resolved_spec,
+                                           std::string* reason) {
+    if (factor == 0) {
+        if (reason) *reason = "small multiplication factor must be positive";
+        return false;
+    }
+
+    std::size_t current_size = 0;
+    std::string current_spec;
+    std::string current_reason;
+
+    if (!aevum_engine_resolve_auto_fft(
+            exponent, &current_size, &current_spec, &current_reason)) {
+        if (reason) *reason = current_reason;
+        return false;
+    }
+
+    if (factor == 1) {
+        if (transform_size) *transform_size = current_size;
+        if (resolved_spec) *resolved_spec = current_spec;
+        return true;
+    }
+
+    const long double extra_bits =
+        std::log2(static_cast<long double>(factor));
+
+    for (unsigned attempt = 0; attempt < 8; ++attempt) {
+        const long double effective =
+            static_cast<long double>(exponent) +
+            extra_bits * static_cast<long double>(current_size);
+
+        if (effective >
+            static_cast<long double>(
+                std::numeric_limits<uint32_t>::max())) {
+            if (reason) *reason =
+                "factor-safe Aevum effective exponent exceeds uint32 range";
+            return false;
+        }
+
+        const uint32_t effective_exponent =
+            static_cast<uint32_t>(std::ceil(effective));
+
+        std::size_t next_size = 0;
+        std::string next_spec;
+        std::string next_reason;
+
+        if (!aevum_engine_resolve_auto_fft(
+                effective_exponent,
+                &next_size, &next_spec, &next_reason)) {
+            if (reason) *reason = next_reason;
+            return false;
+        }
+
+        if (next_size < current_size) {
+            if (reason) *reason =
+                "factor-safe Aevum resolver moved to a smaller transform";
+            return false;
+        }
+
+        if (next_size == current_size) {
+            if (transform_size) *transform_size = next_size;
+            if (resolved_spec) *resolved_spec = next_spec;
+            return true;
+        }
+
+        current_size = next_size;
+        current_spec = next_spec;
+    }
+
+    if (reason) *reason =
+        "factor-safe Aevum FFT promotion did not converge";
+    return false;
+}
+
+bool aevum_engine_resolve_fft(uint32_t exponent,
+                               const std::string& requested_spec,
+                               std::size_t* transform_size,
+                               std::string* resolved_spec,
+                               std::string* reason) {
+    try {
+        auto& loaded = api();
+        std::array<char, 96> resolved{};
+        const char* request = requested_spec.empty() ? nullptr : requested_spec.c_str();
+        if (!loaded.resolve_fft(exponent, request, resolved.data(), resolved.size())) {
+            if (reason) {
+                const char* detail = loaded.last_error ? loaded.last_error() : nullptr;
+                *reason = detail && *detail ? detail : "no admissible FFT3161 plan";
+            }
+            return false;
+        }
+        const std::string spec(resolved.data());
+        const std::size_t size = transform_size_from_spec(spec);
+        if (transform_size) *transform_size = size;
+        if (resolved_spec) *resolved_spec = spec;
+        return true;
+    } catch (const std::exception& e) {
+        if (reason) *reason = std::string("Aevum engine plugin unavailable: ") + e.what();
         return false;
     }
 }
@@ -601,6 +699,6 @@ engine* create_aevum_engine(uint32_t exponent,
                             std::size_t device,
                             bool verbose,
                             const std::string& fft_spec,
-                            const std::string& use) {
-    return new engine_aevum(exponent, register_count, device, verbose, fft_spec, use);
+                            std::uint32_t workload) {
+    return new engine_aevum(exponent, register_count, device, verbose, fft_spec, workload);
 }

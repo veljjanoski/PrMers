@@ -19,6 +19,8 @@ add_executable(prpll
   CycleFile.cpp
   tune.cpp
   TuneEntry.cpp
+  PrpUseTune.cpp
+  RuntimeAutotune.cpp
   fs.cpp
   version.inc
   )

@@ -871,6 +871,7 @@ int App::runPM1Stage2() {
         char* s = mpz_get_str(nullptr, 10, g.get_mpz_t());
         writeStageResult(filename, "B2=" + B2.get_str() + "  factor=" + std::string(s));
         std::cout << "\n>>>  Factor P-1 (stage 2) found : " << s << '\n';
+        std::cout << "P-1 factor stage 2 found: " << s << '\n';
         if (guiServer_) {
                                 std::ostringstream oss;
                                 oss << "\n>>>  Factor P-1 (stage 2) found : " << s << '\n';
@@ -892,6 +893,7 @@ int App::runPM1Stage2() {
     if (found) {
         char* s = mpz_get_str(nullptr, 10, g);
         std::cout << "\n>>>  Factor P-1 (stage 2) found : " << s << '\n';
+        std::cout << "P-1 factor stage 2 found: " << s << '\n';
         std::free(s);
     } else {
         std::cout << "\nNo factor P-1 (stage 2) until B2 = " << B2 << '\n';
@@ -1137,6 +1139,7 @@ int App::runPM1() {
     //gmp_printf("GCD(x - 1, 2^%u - 1) = %Zd\n", options.exponent, g);
 
     bool factorFound = g != 1 && g != Mp;
+    bool newStage1FactorFound = false;
 
     std::string filename = "stage1_result_B1_" + std::to_string(B1) +
                         "_p_" + std::to_string(options.exponent) + ".txt";
@@ -1158,11 +1161,17 @@ int App::runPM1() {
                                 oss  << "\nP-1 factor stage 1 found: " << fstr << std::endl;
                       guiServer_->appendLog(oss.str());
             }
-        options.knownFactors.push_back(std::string(fstr));
+        const std::string factor_string(fstr);
+        newStage1FactorFound = !p95_is_known_factor_string(factor_string, options.knownFactors_start);
+        if (!p95_is_known_factor_string(factor_string, options.knownFactors))
+            options.knownFactors.push_back(factor_string);
         std::free(fstr);
         std::cout << "\n";
-        if(options.B2>0){
+        if (options.B2 > 0 && (!newStage1FactorFound || options.pm1_continue_stage2_after_factor)) {
             runPM1Stage2();
+        } else if (options.B2 > 0 && newStage1FactorFound) {
+            std::cout << "[PM1] New Stage 1 factor found; Stage 2 skipped by default. "
+                         "Use -pm1-continue-stage2-after-factor to run it anyway.\n";
         }
 //        else{
             //backupManager.clearState();
@@ -1765,6 +1774,7 @@ int App::runPM1Stage2MarinLowMem() {
             std::string f = gNew.get_str(10);
             writeStageResult(filename, "B1=" + std::to_string(B1u) + " B2Start=" + std::to_string(stage2Low) + " B2=" + std::to_string(B2u) + " factor=" + f);
             std::cout << "\n>>>  Factor P-1 (stage 2 resume2reg product exponent) found : " << f << "\n";
+            std::cout << "P-1 factor stage 2 found: " << f << "\n";
             options.knownFactors.push_back(f);
         } else {
             writeStageResult(filename, "No factor P-1 stage2 resume2reg in range (" + std::to_string(stage2Low) + "," + std::to_string(B2u) + "] from B1=" + std::to_string(B1u));
@@ -1855,6 +1865,7 @@ int App::runPM1Stage2MarinLowMem() {
         if (found) {
             std::string f = g.get_str(10);
             std::cout << "\n>>>  Factor P-1 (stage 2 ultralowmem GPU one-register product exponent) found : " << f << "\n";
+            std::cout << "P-1 factor stage 2 found: " << f << "\n";
             options.knownFactors.push_back(f);
             delete eng;
             return 0;
@@ -1906,6 +1917,7 @@ int App::runPM1Stage2MarinLowMem() {
     if (found) {
         char* fstr = mpz_get_str(nullptr, 10, g.get_mpz_t());
         std::cout << "\n>>>  Factor P-1 (stage 2 lowmem streamed product) found : " << fstr << "\n";
+        std::cout << "P-1 factor stage 2 found: " << fstr << "\n";
         options.knownFactors.push_back(std::string(fstr));
         std::free(fstr);
     } else {
@@ -3386,6 +3398,7 @@ int App::runPM1Stage2MarinVTrace() {
         std::cerr << "[PM1-VTRACE] cannot allocate GPU engine.\n";
         return -2;
     }
+    const bool aevum_vtrace_backend = eng->is_aevum_backend();
 
     // v87: normal V-trace Stage-2 checkpoints are compact by default.
     // The old full-engine checkpoint copied every baby register to host RAM;
@@ -3521,6 +3534,14 @@ int App::runPM1Stage2MarinVTrace() {
     std::vector<int32_t> babyGlobalToLocal(babyCount, int32_t(-1));
     auto precompute_baby_window = [&](size_t batchStart, size_t batchEnd,
                                       std::vector<int32_t>& babyGlobalToLocal){
+        // Aevum keeps only a small LRU cache of prepared multiplicands.  A
+        // previous Stage-2 pass may have evicted V1 in favour of VD and the
+        // current trace term, so make the recurrence source live explicitly
+        // before rebuilding a baby window.
+        if (aevum_vtrace_backend) {
+            eng->set_multiplicand((engine::Reg)RMUL_V1, (engine::Reg)RV1);
+        }
+
         if (batchEnd > babyCount) batchEnd = babyCount;
         std::fill(babyGlobalToLocal.begin(), babyGlobalToLocal.end(), int32_t(-1));
         for (size_t gi = batchStart; gi < batchEnd; ++gi) {
@@ -3564,6 +3585,15 @@ int App::runPM1Stage2MarinVTrace() {
             eng->copy((engine::Reg)RBPREV, (engine::Reg)RBCUR);
             eng->copy((engine::Reg)RBCUR, (engine::Reg)RBNEXT);
         }
+        // The baby recurrence touches RMUL_V1 on every step, making an older
+        // prepared VD slot the LRU victim when the first term is prepared.
+        // Refresh VD now so the two hot Stage-2 multiplicands are VD and the
+        // current term.  This is required by Aevum's prepared-multiply contract.
+        // Marin keeps its original preparation schedule outside this helper.
+        if (aevum_vtrace_backend) {
+            eng->set_multiplicand((engine::Reg)RMUL_VD, (engine::Reg)RVD);
+        }
+
         std::cout << "\rV-trace baby window " << (batchStart + 1) << "-" << batchEnd << ": 100%\n";
     };
 
@@ -3649,17 +3679,19 @@ int App::runPM1Stage2MarinVTrace() {
         mpz_t V1t; mpz_init_set(V1t, V1.get_mpz_t());
         eng->set_mpz((engine::Reg)RV1, V1t);
         mpz_clear(V1t);
-        eng->set_multiplicand((engine::Reg)RMUL_V1, (engine::Reg)RV1);
-
         std::cout << "[PM1-VTRACE] V1 = H + H^-1 built with one GMP inverse; precomputing V_j and V_D...\n";
 
+        if (!aevum_vtrace_backend) {
+            eng->set_multiplicand((engine::Reg)RMUL_V1, (engine::Reg)RV1);
+        }
         if (!useBabyBatching) {
             precompute_baby_window(0, babyCount, babyGlobalToLocal);
         } else {
             precompute_baby_window(0, std::min(activeBabyCount, babyCount), babyGlobalToLocal);
         }
-
-        eng->set_multiplicand((engine::Reg)RMUL_VD, (engine::Reg)RVD);
+        if (!aevum_vtrace_backend) {
+            eng->set_multiplicand((engine::Reg)RMUL_VD, (engine::Reg)RVD);
+        }
 
         // Giant recurrence W_k = V_{kD}.  At k=0, W_0=2 and W_-1=V_D because V_-D=V_D.
         eng->copy((engine::Reg)RGPREV, (engine::Reg)RVD);
@@ -3668,16 +3700,25 @@ int App::runPM1Stage2MarinVTrace() {
         cur_k = 0;
     } else {
         cur_k = saved_k;
-        eng->set_multiplicand((engine::Reg)RMUL_V1, (engine::Reg)RV1);
+        bool rebuiltBabyWindow = false;
+        if (!aevum_vtrace_backend) {
+            eng->set_multiplicand((engine::Reg)RMUL_V1, (engine::Reg)RV1);
+        }
         if (!useBabyBatching) {
             if (compactS2Loaded) {
                 std::cout << "[PM1-VTRACE-CKPT] compact checkpoint loaded; recomputing deterministic baby table before resume...\n";
                 precompute_baby_window(0, babyCount, babyGlobalToLocal);
+                rebuiltBabyWindow = true;
             } else {
                 for (size_t gi = 0; gi < babyCount; ++gi) babyGlobalToLocal[gi] = int32_t(gi);
             }
         }
-        eng->set_multiplicand((engine::Reg)RMUL_VD, (engine::Reg)RVD);
+        if (aevum_vtrace_backend && !rebuiltBabyWindow) {
+            eng->set_multiplicand((engine::Reg)RMUL_V1, (engine::Reg)RV1);
+            eng->set_multiplicand((engine::Reg)RMUL_VD, (engine::Reg)RVD);
+        } else if (!aevum_vtrace_backend) {
+            eng->set_multiplicand((engine::Reg)RMUL_VD, (engine::Reg)RVD);
+        }
         std::cout << "[PM1-VTRACE] Resuming Stage 2 V-trace from checkpoint at prime "
                   << resume_p_u64 << " (idx=" << resume_idx << ", k=" << cur_k << ") D=" << D << "\n";
     }
@@ -4268,6 +4309,7 @@ int App::runPM1Stage2MarinVTrace() {
                          " terms=" + std::to_string(termsAccumulated) +
                          " primes=" + std::to_string(primesSeen) + " factor=" + fs.str());
         std::cout << "\n>>>  Factor P-1 (stage 2 V-trace) found : " << fs.str() << "\n";
+        std::cout << "P-1 factor stage 2 found: " << fs.str() << "\n";
     } else {
         writeStageResult(filename, "No factor P-1 V-trace up to B2=" + B2.get_str() +
                          " D=" + std::to_string(D) +
@@ -4280,7 +4322,7 @@ int App::runPM1Stage2MarinVTrace() {
     std::remove((ckpt_file_s2 + ".old").c_str());
     std::remove((ckpt_file_s2 + ".new").c_str());
 
-    std::string json = io::JsonBuilder::generate(options, static_cast<int>(context.getTransformSize()), false, "", "");
+    std::string json = io::JsonBuilder::generate(options, static_cast<int>(eng->get_size()), false, "", "");
     std::cout << "Manual submission JSON:\n" << json << "\n";
     io::WorktodoManager wm(options);
     wm.saveIndividualJson(options.exponent, std::string(options.mode) + "_stage2_vtrace", json);
@@ -4418,8 +4460,16 @@ int App::runPM1Stage2Marin() {
         if (!classicMem.ok) return true;
         const auto [regBytes, totalBytes] = classic_memory_plan(regs);
         const bool pagedDisabled = (std::getenv("PRMERS_MARIN_PAGED_DISABLE") != nullptr);
-        if (pagedDisabled && classicMem.maxAlloc != 0 && regBytes > (long double)classicMem.maxAlloc * classicMaxAllocFrac) return false;
-        if (pagedDisabled && classicMem.global != 0 && totalBytes > (long double)classicMem.global * classicGlobalFrac) return false;
+        const bool appleClassicFlatGuard =
+            classicMem.vendor.find("Apple") != std::string::npos ||
+            classicMem.name.find("Apple") != std::string::npos;
+        // Classic BSGS stores and reuses a dense baby-step table. The segmented
+        // Marin register slab is correct for ordinary register workloads, but
+        // the Apple OpenCL 1.2 segmented classic-BSGS run was observed to miss
+        // a known factor. Require a flat slab only for this Apple/classic path.
+        const bool requireFlatSlab = pagedDisabled || appleClassicFlatGuard;
+        if (requireFlatSlab && classicMem.maxAlloc != 0 && regBytes > (long double)classicMem.maxAlloc * classicMaxAllocFrac) return false;
+        if (requireFlatSlab && classicMem.global != 0 && totalBytes > (long double)classicMem.global * classicGlobalFrac) return false;
         return true;
     };
 
@@ -4429,20 +4479,34 @@ int App::runPM1Stage2Marin() {
         if (forced >= 4 && (forced % 2ULL) == 0) {
             D = forced;
             const size_t forcedRegs = baseRegsStage2 + classic_baby_count_for_D(D);
-            if (classicMem.ok && !classic_mem_fits(forcedRegs) && !allowTightClassicMem) {
+            if (classicMem.ok && !classic_mem_fits(forcedRegs)) {
                 const auto [regBytes, totalBytes] = classic_memory_plan(forcedRegs);
-                std::cerr << "[PM1-CLASSIC-MEM] WARNING: PRMERS_PM1_CLASSIC_D=" << D
+                const bool appleClassicFlatGuard =
+                    classicMem.vendor.find("Apple") != std::string::npos ||
+                    classicMem.name.find("Apple") != std::string::npos;
+                std::cerr << "[PM1-CLASSIC-MEM] " << (appleClassicFlatGuard ? "ERROR" : "WARNING")
+                          << ": PRMERS_PM1_CLASSIC_D=" << D
                           << " uses " << std::fixed << std::setprecision(2) << gib_classic(regBytes)
                           << " GiB register slab and " << gib_classic(totalBytes)
                           << " GiB total before driver overhead on device "
                           << gib_classic((long double)classicMem.global) << " GiB";
                 if (classicMem.maxAlloc != 0) std::cerr << ", max single allocation=" << gib_classic((long double)classicMem.maxAlloc) << " GiB";
+                if (appleClassicFlatGuard) {
+                    std::cerr << ". Apple classic BSGS requires a flat slab; choose a smaller D.\n";
+                    return -2;
+                }
                 std::cerr << ". Set PRMERS_PM1_CLASSIC_ALLOW_TIGHT_MEM=1 only if intentional.\n";
             }
         } else {
             std::cerr << "[PM1-CLASSIC-MEM] Ignoring invalid PRMERS_PM1_CLASSIC_D=" << envD << " (need even D>=4).\n";
         }
     } else if (classicMem.ok) {
+        const bool appleClassicFlatGuard =
+            classicMem.vendor.find("Apple") != std::string::npos ||
+            classicMem.name.find("Apple") != std::string::npos;
+        if (appleClassicFlatGuard) {
+            std::cout << "[PM1-CLASSIC-MEM] Apple correctness guard: segmented classic BSGS is disabled; selecting a flat register slab.\n";
+        }
         std::cout << "[PM1-CLASSIC-MEM] auto-D memory guard: transform=" << classicTransformN
                   << " | device='" << classicMem.name << "'"
                   << " | global=" << std::fixed << std::setprecision(2) << gib_classic((long double)classicMem.global) << " GiB";
@@ -4485,7 +4549,7 @@ int App::runPM1Stage2Marin() {
     static constexpr size_t RSTATE    = 0;   // H (digits)
     static constexpr size_t RACC_L    = 1;   // accumulator Π(H^r - 1) (digits)
     static constexpr size_t RGIANT    = 2;   // (H^D)^k (digits)
-    static constexpr size_t RGIANT_F  = 3;   // forward((H^D)^k)
+    [[maybe_unused]] static constexpr size_t RGIANT_F  = 3; // legacy scratch; canonical classic BSGS no longer stores a partial transform
     static constexpr size_t RSTEP     = 4;   // H^2 (digits)
     static constexpr size_t RX        = 5;   // H^D (digits)
     static constexpr size_t RMUL_STEP = 6;   // multiplicand(H^2)
@@ -4691,6 +4755,8 @@ int App::runPM1Stage2Marin() {
         }
         std::cout << "\rBaby steps: 100%\n";
         std::cout << "Stored baby steps: " << babyCount << " (D=" << D << ")\n";
+        std::cout << "[PM1-CLASSIC] canonical giant/baby multiplication enabled "
+                     "(backend-neutral correctness path).\n";
 
         // ---- RX = H^D (NO aliasing pow) ----
         eng->copy((engine::Reg)RSAVE_Q, (engine::Reg)RSTATE);
@@ -4701,12 +4767,13 @@ int App::runPM1Stage2Marin() {
         const uint64_t k0 = p0u / D;
         eng->copy((engine::Reg)RSAVE_Q, (engine::Reg)RX);
         eng->pow((engine::Reg)RGIANT, (engine::Reg)RSAVE_Q, k0);
-        eng->set_multiplicand2((engine::Reg)RGIANT_F, (engine::Reg)RGIANT);
-
+        // Keep the giant step canonical. The historical mul_new optimization
+        // copied a backend-specific partial forward transform into scratch and
+        // could miss known factors in the classic BSGS path.
         eng->set((engine::Reg)RACC_L, 1);
     } else {
-        // resume: just rebuild forward cache (safe)
-        eng->set_multiplicand2((engine::Reg)RGIANT_F, (engine::Reg)RGIANT);
+        // The checkpoint stores the canonical giant step; no forward cache is
+        // required by the correctness-first classic BSGS multiplication path.
     }
 
     // ---- timers + start prime ----
@@ -4779,7 +4846,6 @@ int App::runPM1Stage2Marin() {
         while (cur_k < k) {
             eng->mul((engine::Reg)RGIANT, (engine::Reg)RMUL_RX);
             ++cur_k;
-            eng->set_multiplicand2((engine::Reg)RGIANT_F, (engine::Reg)RGIANT);
         }
 
         const int32_t bi = (e < D) ? e2i[(size_t)e] : -1;
@@ -4790,8 +4856,8 @@ int App::runPM1Stage2Marin() {
         }
 
         const size_t babyReg = babyBase + (size_t)bi;
-        eng->copy((engine::Reg)RTMP, (engine::Reg)RGIANT_F);   // forward
-        eng->mul_new((engine::Reg)RTMP, (engine::Reg)babyReg); // -> digits H^r
+        eng->copy((engine::Reg)RTMP, (engine::Reg)RGIANT);     // canonical H^(kD)
+        eng->mul((engine::Reg)RTMP, (engine::Reg)babyReg);     // canonical H^(kD+e)=H^r
 
         #if PM1_BSGS_SELFTEST
         if (idx < 20) {
@@ -4905,6 +4971,7 @@ int App::runPM1Stage2Marin() {
         for (size_t i = 0; i < newlyFound.size(); ++i) { if (i) fs << ","; fs << newlyFound[i]; }
         writeStageResult(filename, "B2=" + B2.get_str() + "  factor=" + fs.str());
         std::cout << "\n>>>  Factor P-1 (stage 2) found : " << fs.str() << "\n";
+        std::cout << "P-1 factor stage 2 found: " << fs.str() << "\n";
     } else {
         writeStageResult(filename, "No factor P-1 up to B2=" + B2.get_str());
         std::cout << "\nNo factor P-1 (stage 2) until B2 = " << B2 << "\n";
@@ -4915,7 +4982,7 @@ int App::runPM1Stage2Marin() {
     std::remove((ckpt_file_s2 + ".old").c_str());
     std::remove((ckpt_file_s2 + ".new").c_str());
 
-    std::string json = io::JsonBuilder::generate(options, static_cast<int>(context.getTransformSize()), false, "", "");
+    std::string json = io::JsonBuilder::generate(options, static_cast<int>(eng->get_size()), false, "", "");
     std::cout << "Manual submission JSON:\n" << json << "\n";
     io::WorktodoManager wm(options);
     wm.saveIndividualJson(options.exponent, std::string(options.mode) + "_stage2", json);
@@ -5969,6 +6036,7 @@ int App::runPM1Marin() {
         if (rr.factor_found && !rr.factor.empty() && !rr.known_factor) {
             writeStageResult(result_file, std::string("B2=") + std::to_string(options.B2) + "  factor=" + rr.factor);
             std::cout << "\n>>>  Factor P-1 (stage 2) found : " << rr.factor << '\n';
+            std::cout << "P-1 factor stage 2 found: " << rr.factor << '\n';
             if (guiServer_) {
                 std::ostringstream oss;
                 oss << "\n>>>  Factor P-1 (stage 2) found : " << rr.factor << '\n';
@@ -6808,6 +6876,7 @@ int App::runPM1Marin() {
             std::cout << "[DBG MM31] gcd bits = " << mpz_sizeinbase(g.get_mpz_t(), 2) << "\n";
         }
         bool factorFound = (g != 1) && (g != Mp);
+        bool newStage1FactorFound = false;
 
         std::string filename = "stage1_result_B1_" + std::to_string(B1_new) +
                                "_p_" + std::to_string(options.exponent) + ".txt";
@@ -6822,7 +6891,10 @@ int App::runPM1Marin() {
                 oss << "\nP-1 factor stage 1 found: " << fstr << std::endl;
                 guiServer_->appendLog(oss.str());
             }
-            options.knownFactors.push_back(std::string(fstr));
+            const std::string factor_string(fstr);
+            newStage1FactorFound = !p95_is_known_factor_string(factor_string, options.knownFactors_start);
+            if (!p95_is_known_factor_string(factor_string, options.knownFactors))
+                options.knownFactors.push_back(factor_string);
             std::free(fstr);
             std::cout << "\n";
         } else {
@@ -6839,7 +6911,7 @@ int App::runPM1Marin() {
         // JSON + worktodo removal same as usual ...
         std::string json = io::JsonBuilder::generate(
             options,
-            static_cast<int>(context.getTransformSize()),
+            static_cast<int>(eng->get_size()),
             false,
             "",
             ""
@@ -6850,7 +6922,14 @@ int App::runPM1Marin() {
         wm.saveIndividualJson(options.exponent, std::string(options.mode) + "_stage1_ext", json);
         wm.appendToResultsTxt(json);
         options.B2 = B2save;
-        if(options.B2 > 0){
+        const bool runRequestedStage2 = options.B2 > 0 &&
+            (!newStage1FactorFound || options.pm1_continue_stage2_after_factor);
+        if (options.B2 > 0 && newStage1FactorFound && !options.pm1_continue_stage2_after_factor) {
+            std::cout << "[PM1] New Stage 1 factor found; Stage 2 skipped by default. "
+                         "Use -pm1-continue-stage2-after-factor to run it anyway.\n";
+            if (guiServer_) guiServer_->appendLog("[PM1] New Stage 1 factor found; Stage 2 skipped by default.");
+        }
+        if(runRequestedStage2){
             const double elapsed_time_ck =
                 std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start_clock).count()
                 + restored_time;
@@ -6883,7 +6962,8 @@ int App::runPM1Marin() {
             }
         }
 
-        if(options.nmax > 0 && options.K > 0){
+        if(options.nmax > 0 && options.K > 0 &&
+           (!newStage1FactorFound || options.pm1_continue_stage2_after_factor)){
             const double elapsed_time_ck =
                 std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start_clock).count()
                 + restored_time;
@@ -7212,6 +7292,7 @@ int App::runPM1Marin() {
         convertEcmResumeToPrime95(resume_save_path, resume_p95_path, ds, de);
     }
     bool factorFound = false;
+    bool newStage1FactorFound = false;
     std::string filename = "stage1_result_B1_" + std::to_string(B1) + "_p_" + std::to_string(options.exponent) + ".txt";
     if (options.pm1_no_stage1_gcd) {
         writeStageResult(filename, "Stage 1 GCD skipped at B1=" + std::to_string(B1));
@@ -7227,7 +7308,10 @@ int App::runPM1Marin() {
             writeStageResult(filename, "B1=" + std::to_string(B1) + "  factor=" + std::string(fstr));
             std::cout << "\nP-1 factor stage 1 found: " << fstr << std::endl;
             if (guiServer_) { std::ostringstream oss; oss << "\nP-1 factor stage 1 found: " << fstr << std::endl; guiServer_->appendLog(oss.str()); }
-            options.knownFactors.push_back(std::string(fstr));
+            const std::string factor_string(fstr);
+            newStage1FactorFound = !p95_is_known_factor_string(factor_string, options.knownFactors_start);
+            if (!p95_is_known_factor_string(factor_string, options.knownFactors))
+                options.knownFactors.push_back(factor_string);
             std::free(fstr);
             std::cout << "\n";
         } else {
@@ -7238,7 +7322,7 @@ int App::runPM1Marin() {
     }
     uint64_t B2save = options.B2; 
     options.B2 = 0;
-    std::string json = io::JsonBuilder::generate(options, static_cast<int>(context.getTransformSize()), false, "", "");
+    std::string json = io::JsonBuilder::generate(options, static_cast<int>(eng->get_size()), false, "", "");
     std::cout << "Manual submission JSON:\n" << json << "\n";
     io::WorktodoManager wm(options);
     options.B2 = 0;
@@ -7246,7 +7330,14 @@ int App::runPM1Marin() {
     wm.appendToResultsTxt(json);
     options.B2 = B2save;
 
-    if(options.B2 > 0){
+    const bool runRequestedStage2 = options.B2 > 0 &&
+        (!newStage1FactorFound || options.pm1_continue_stage2_after_factor);
+    if (options.B2 > 0 && newStage1FactorFound && !options.pm1_continue_stage2_after_factor) {
+        std::cout << "[PM1] New Stage 1 factor found; Stage 2 skipped by default. "
+                     "Use -pm1-continue-stage2-after-factor to run it anyway.\n";
+        if (guiServer_) guiServer_->appendLog("[PM1] New Stage 1 factor found; Stage 2 skipped by default.");
+    }
+    if(runRequestedStage2){
         {
             const double elapsed_time_ck =
                 std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start_clock).count()
@@ -7300,7 +7391,8 @@ int App::runPM1Marin() {
             factorFound = runPM1Stage2Marin() || factorFound;
         }
     }
-   if(options.nmax > 0 && options.K > 0){
+   if(options.nmax > 0 && options.K > 0 &&
+      (!newStage1FactorFound || options.pm1_continue_stage2_after_factor)){
         {
             std::cout << "P-1 STAGE 2 IN **** n^K variant  n=" << options.nmax << " K=" << options.K << "******\n";
     

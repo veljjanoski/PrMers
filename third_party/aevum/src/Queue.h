@@ -50,6 +50,7 @@ public:
   void readAsync(cl_mem buf, u32 size, void* out, TimeInfo* tInfo);
   void copyBuf(cl_mem src, cl_mem dst, u32 size, TimeInfo* tInfo);
   void finish();
+  void collectProfileEvents() { events.synced(); }
 
   EventHolder createSyncEvent(void) { return enqueueMarker(get()); }                     // Enqueue a synchronization event.  Used to sync work among multiple queues.
   void waitForSyncEvent(EventHolder* e) { enqueueMarkerWithWaits(get(), {e->get()}); }   // Wait for a synchronization event to complete.
@@ -65,6 +66,9 @@ private:                            // This replaces the "call queue->finish eve
   int squareTime;                   // Time to do one squaring (in microseconds)
   int squareKernels;                // Number of kernels in one squaring
   bool firstSetTime;                // Flag so we can ignore first setSquareTime call (which is inaccurate because of all the initial openCL compiles)
+#if defined(__APPLE__)
+  bool appleMarkerWait;             // Diagnostic opt-in for the old marker polling policy.
+#endif
   void queueMarkerEvent();          // Queue the marker event
   void waitForMarkerEvent();        // Wait for marker event to complete
 };

@@ -1,6 +1,7 @@
 // Copyright (C) Mihai Preda and George Woltman.
 
 #include "Gpu.h"
+#include "UseOptions.h"
 #include "Proof.h"
 #include "TimeInfo.h"
 #include "Trig.h"
@@ -51,6 +52,14 @@
 #define CARRY_LEN 8
 
 namespace {
+
+u32 inverseModSmall(u32 value, u32 modulus) {
+  value %= modulus;
+  for (u32 candidate = 1; candidate < modulus; ++candidate) {
+    if ((value * candidate) % modulus == 1) return candidate;
+  }
+  throw std::runtime_error("transform length is not invertible modulo field shift period");
+}
 
 u32 kAt(u32 H, u32 line, u32 col) { return (line + col * H) * 2; }
 
@@ -259,6 +268,31 @@ string clDefines(const Args& args, cl_device_id id, FFTConfig fft, const vector<
     config.insert(it->second.begin(), it->second.end());
   }
 
+#if defined(__APPLE__)
+  // Keep the stock LDS transpose algorithms on Apple, but lower the middle
+  // work-group pressure for the legacy OpenCL-to-Metal compiler. Explicit
+  // command-line/per-FFT values above always win over these defaults.
+  config.try_emplace("IN_WG", "64");
+  config.try_emplace("OUT_WG", "64");
+  config.try_emplace("IN_SIZEX", "16");
+  config.try_emplace("OUT_SIZEX", "16");
+  config.try_emplace("MIDDLE_IN_LDS_TRANSPOSE", "1");
+  config.try_emplace("MIDDLE_OUT_LDS_TRANSPOSE", "1");
+  config.try_emplace("NO_ASM", "1");
+  config.try_emplace("PAD", "0");
+#endif
+
+  // Correctness-first PFA defaults.  Explicit engine configuration (for
+  // example AEVUM_PFA_USE after exact validation) has higher priority and
+  // can benchmark the existing upstream tail variants without rebuilding.
+  if (fft.isPfa()) {
+    config.try_emplace("TAIL_KERNELS", "1");
+    config.try_emplace("INPLACE", "0");
+    config.try_emplace("TAIL_TRIGS32", "2");
+    config.try_emplace("TAIL_TRIGS31", "0");
+    config.try_emplace("TAIL_TRIGS61", "0");
+  }
+
   // Default value for -use options that must also be parsed in C++ code
   tail_single_wide = 0, tail_single_kernel = 1;         // Default tailSquare is double-wide in one kernel
   in_place = 0;                                         // Default is not in-place
@@ -267,40 +301,7 @@ string clDefines(const Args& args, cl_device_id id, FFTConfig fft, const vector<
 
   // Validate -use options
   for (const auto& [k, v] : config) {
-    bool isValid = isInList(k, {
-                              "FAST_BARRIER",
-                              "STATS",
-                              "IN_SIZEX",
-                              "IN_WG",
-                              "OUT_SIZEX",
-                              "OUT_WG",
-                              "UNROLL_H",
-                              "UNROLL_W",
-                              "ZEROHACK_H",
-                              "ZEROHACK_W",
-                              "NO_ASM",
-                              "DEBUG",
-                              "CARRY64",
-                              "BIGLIT",                 // Deprecated
-                              "NONTEMPORAL",            // Deprecated
-                              "INPLACE",
-                              "PAD",
-                              "MIDDLE_IN_LDS_TRANSPOSE",
-                              "MIDDLE_OUT_LDS_TRANSPOSE",
-                              "TAIL_KERNELS",
-                              "TAIL_TRIGS",
-                              "TAIL_TRIGS31",
-                              "TAIL_TRIGS32",
-                              "TAIL_TRIGS61",
-                              "TABMUL_CHAIN",
-                              "TABMUL_CHAIN31",
-                              "TABMUL_CHAIN32",
-                              "TABMUL_CHAIN61",
-                              "MODM31",
-                              "LOADS","STORES",
-                              "NOREG",                  // CUDA - experimental
-                              "WMUL"
-                            });
+    bool isValid = aevumUseKey(k);
     if (!isValid) {
       log("Warning: unrecognized -use key '%s'\n", k.c_str());
     }
@@ -316,6 +317,46 @@ string clDefines(const Args& args, cl_device_id id, FFTConfig fft, const vector<
     if (k == "WMUL") wmul = atoi(v.c_str());
     if (k == "PAD") pad_size = atoi(v.c_str());
   }
+
+  if (fft.isPfa() && in_place != 0) {
+    log("Native PFA fused fftW scatter requires INPLACE=0; overriding requested INPLACE=%u.\n", in_place);
+    in_place = 0;
+    config["INPLACE"] = "0";
+  }
+
+  if (fft.shape.fft_type == FFT323161 && fft.isPfa() &&
+      (!tail_single_wide || tail_single_kernel)) {
+    log("Experimental FFT323161 PFA9 requires single-wide two-kernel tails; forcing TAIL_KERNELS=1.\n");
+    tail_single_wide = true;
+    tail_single_kernel = false;
+    config["TAIL_KERNELS"] = "1";
+  }
+
+#if defined(__APPLE__)
+  // Apple's OpenCL-to-Metal compiler rejects the combined double-wide
+  // tailSquareGF61 pipeline (TAIL_KERNELS=2) after successfully creating the
+  // staged GF61 middle-in chain.  Keep the same double-wide LDS algorithm,
+  // but split the two exceptional lines (0 and H/2) into tailSquareZeroGF61.
+  // TAIL_KERNELS=3 is an existing upstream execution mode; only Apple FFT3161
+  // is forced to it.  Linux, Windows and CUDA retain the requested/default mode.
+  if (fft.shape.fft_type == FFT3161 && (tail_single_wide || tail_single_kernel)) {
+    log("Apple OpenCL 1.2 compatibility: forcing TAIL_KERNELS=3 (double-wide, two kernels) for GF61 tailSquare.\n");
+    tail_single_wide = false;
+    tail_single_kernel = false;
+    config["TAIL_KERNELS"] = "3";
+  }
+#endif
+
+#if defined(__APPLE__)
+  // The staged GF61 middle-in path uses the existing non-in-place scratch/output
+  // ping-pong. Keep Apple FFT3161 on that validated layout even if a tune file
+  // requests INPLACE=1. Other platforms and FFT types retain the request.
+  if (fft.shape.fft_type == FFT3161 && in_place != 0) {
+    log("Apple OpenCL 1.2 compatibility: forcing INPLACE=0 for staged GF61 middle-in.\n");
+    in_place = 0;
+    config["INPLACE"] = "0";
+  }
+#endif
 
   // Maximum WMUL is 32KB / (WIDTH * SHUFL_BYTES_W).  If using the 32KB maximum, LDS padding must be disabled.
   // Furthermore, I've seen the CUDA compiler refuse to create a kernel with 1024 threads.  Thus, we limit WMUL to 2 for a 1K width and to 1 for a 4K width.
@@ -345,8 +386,39 @@ string clDefines(const Args& args, cl_device_id id, FFTConfig fft, const vector<
                     {"MIDDLE", fft.shape.middle},
                     {"CARRY_LEN", CARRY_LEN},
                     {"NW", fft.shape.nW()},
-                    {"NH", fft.shape.nH()}
+                    {"NH", fft.shape.nH()},
+                    {"PFA_RADIX", fft.pfa_radix}
                   });
+
+  if (fft.isPfa()) {
+    const u32 binary_length = 2u * fft.shape.width * fft.shape.height;
+    const u32 lmod = binary_length % fft.pfa_radix;
+    u32 linv = 0;
+    for (u32 x = 1; x < fft.pfa_radix; ++x) if ((lmod * x) % fft.pfa_radix == 1) { linv = x; break; }
+    if (!linv) throw std::runtime_error("PFA binary length is not coprime to odd radix");
+    defines += toDefine("PFA_BINARY_LENGTH", binary_length);
+    defines += toDefine("PFA_L_INV", linv);
+
+    // Consecutive width-register values advance by a fixed CRT step while
+    // staying in the same odd row.  Export it so fftP/fftW can replace the
+    // per-register modulo/multiply Good-Thomas map with one add and wrap.
+    const u32 binary_step = binary_length / fft.shape.nW();
+    u32 logical_step = 0;
+    for (u32 k = 0; k < fft.pfa_radix; ++k) {
+      const u32 candidate = binary_step + binary_length * k;
+      if (candidate % fft.pfa_radix == 0) { logical_step = candidate; break; }
+    }
+    if (!logical_step || logical_step >= fft.shape.size())
+      throw std::runtime_error("invalid PFA logical register step");
+    defines += toDefine("PFA_LOGICAL_STEP", logical_step);
+
+    // GPUOwl's stock formula uses division by NWORDS and is exact only when
+    // NWORDS is a power of two. Mixed 3*2^m and 9*2^m transforms require
+    // the modular inverse of NWORDS in the M31/M61 cyclic shift periods.
+    const u32 nwords = fft.shape.size();
+    defines += toDefine("PFA_LOG2_ROOT_TWO31", inverseModSmall(nwords % 31u, 31u));
+    defines += toDefine("PFA_LOG2_ROOT_TWO61", inverseModSmall(nwords % 61u, 61u));
+  }
 
   if (isAmdGpu(id)) { defines += toDefine("AMDGPU", 1); }
   if (isNvidiaGpu(id)) { defines += toDefine("NVIDIAGPU", 1); }
@@ -769,13 +841,16 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
 
 #define K(name, ...) name(#name, &compiler, profile.make(#name), &queue, __VA_ARGS__)
 
+  K(kprpMiddle1, "tailsquare.cl", "tailSquare", hN / nH, (kernelDefines(KFP) + " -DAEVUM_PRP_MIDDLE1=1").c_str()),
+  K(kprpMiddle1GF31, "tailsquare.cl", "tailSquareGF31", hN / nH, (kernelDefines(K31) + " -DAEVUM_PRP_MIDDLE1=1").c_str()),
+  K(kprpMiddle1GF61, "tailsquare.cl", "tailSquareGF61", hN / nH, (kernelDefines(K61) + " -DAEVUM_PRP_MIDDLE1=1").c_str()),
   K(kfftMidIn,             "fftmiddlein.cl",  "fftMiddleIn",  hN / (BIG_H / SMALL_H), (kernelDefines(KFP) + numCudaRegisters(MIDIN)).c_str()),
   K(kfftHin,               "ffthin.cl",  "fftHin",  hN / nH, kernelDefines(KFP).c_str()),
-  K(ktailSquareZero,       "tailsquare.cl", "tailSquareZero", SMALL_H / nH * 2, kernelDefines(KFP).c_str()),
+  K(ktailSquareZero,       "tailsquare.cl", "tailSquareZero", SMALL_H / nH * 2 * (fft.isPfa() ? fft.pfa_radix : 1), kernelDefines(KFP).c_str()),
   K(ktailSquare,           "tailsquare.cl", "tailSquare",
                                                !tail_single_wide && !tail_single_kernel ? hN / nH - SMALL_H / nH * 2 : // Double-wide tailSquare with two kernels
                                                !tail_single_wide ? hN / nH :                                           // Double-wide tailSquare with one kernel
-                                               !tail_single_kernel ? hN / nH / 2 - SMALL_H / nH :                      // Single-wide tailSquare with two kernels
+                                               !tail_single_kernel ? hN / nH / 2 - SMALL_H / nH * (fft.isPfa() ? fft.pfa_radix : 1) : // Single-wide tailSquare with two kernels
                                                hN / nH / 2, (kernelDefines(KFP) + numCudaRegisters(TAIL)).c_str()),    // Single-wide tailSquare with one kernel
   K(ktailMul,              "tailmul.cl", "tailMul", hN / nH / 2, kernelDefines(KFP).c_str()),
   K(ktailMulLow,           "tailmul.cl", "tailMul", hN / nH / 2, (kernelDefines(KFP) + "-DMUL_LOW=1").c_str()),
@@ -784,11 +859,11 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
 
   K(kfftMidInGF31,         "fftmiddlein.cl",  "fftMiddleInGF31",  hN / (BIG_H / SMALL_H), (kernelDefines(K31) + numCudaRegisters(MIDIN31)).c_str()),
   K(kfftHinGF31,           "ffthin.cl",  "fftHinGF31",  hN / nH, kernelDefines(K31).c_str()),
-  K(ktailSquareZeroGF31,   "tailsquare.cl", "tailSquareZeroGF31", SMALL_H / nH * 2, kernelDefines(K31).c_str()),
+  K(ktailSquareZeroGF31,   "tailsquare.cl", "tailSquareZeroGF31", SMALL_H / nH * 2 * (fft.isPfa() ? fft.pfa_radix : 1), kernelDefines(K31).c_str()),
   K(ktailSquareGF31,       "tailsquare.cl", "tailSquareGF31",
                                                !tail_single_wide && !tail_single_kernel ? hN / nH - SMALL_H / nH * 2 : // Double-wide tailSquare with two kernels
                                                !tail_single_wide ? hN / nH :                                           // Double-wide tailSquare with one kernel
-                                               !tail_single_kernel ? hN / nH / 2 - SMALL_H / nH :                      // Single-wide tailSquare with two kernels
+                                               !tail_single_kernel ? hN / nH / 2 - SMALL_H / nH * (fft.isPfa() ? fft.pfa_radix : 1) : // Single-wide, two kernels
                                                hN / nH / 2, (kernelDefines(K31) + numCudaRegisters(TAIL31)).c_str()),  // Single-wide tailSquare with one kernel
   K(ktailMulGF31,          "tailmul.cl", "tailMulGF31", hN / nH / 2, kernelDefines(K31).c_str()),
   K(ktailMulLowGF31,       "tailmul.cl", "tailMulGF31", hN / nH / 2, (kernelDefines(K31) + "-DMUL_LOW=1").c_str()),
@@ -796,19 +871,160 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
   K(kfftWGF31,             "fftw.cl", "fftWGF31", hN / nW, kernelDefines(K31).c_str()),
 
   K(kfftMidInGF61,         "fftmiddlein.cl",  "fftMiddleInGF61",  hN / (BIG_H / SMALL_H), (kernelDefines(K61) + numCudaRegisters(MIDIN61)).c_str()),
+#if defined(__APPLE__)
+  K(kfftHinGF61,           "ffthin.cl",  "fftHinGF61ApplePlaceholder", hN / nH, kernelDefines(K61).c_str()),
+  K(kfftHinGF61LoadScalarApple, "ffthin.cl", "fftHinGF61LoadScalarApple", hN, kernelDefines(K61).c_str()),
+  K(kfftHinGF61FftRadixApple,   "ffthin.cl", "fftHinGF61FftRadixApple", hN / nH, kernelDefines(K61).c_str()),
+  K(kfftHinGF61FftTwiddleApple, "ffthin.cl", "fftHinGF61FftTwiddleApple", hN, kernelDefines(K61).c_str()),
+  K(kfftHinGF61FftShuffleApple, "ffthin.cl", "fftHinGF61FftShuffleApple", hN, kernelDefines(K61).c_str()),
+  K(kfftHinGF61FftFinalApple,   "ffthin.cl", "fftHinGF61FftFinalApple", hN / nH, kernelDefines(K61).c_str()),
+#else
   K(kfftHinGF61,           "ffthin.cl",  "fftHinGF61",  hN / nH, kernelDefines(K61).c_str()),
-  K(ktailSquareZeroGF61,   "tailsquare.cl", "tailSquareZeroGF61", SMALL_H / nH * 2, kernelDefines(K61).c_str()),
+#endif
+  K(ktailSquareZeroGF61,   "tailsquare.cl", "tailSquareZeroGF61", SMALL_H / nH * 2 * (fft.isPfa() ? fft.pfa_radix : 1), kernelDefines(K61).c_str()),
+#if defined(__APPLE__)
+  K(ktailSquareGF61,       "tailsquare.cl", "tailSquareGF61ApplePlaceholder", SMALL_H / nH, kernelDefines(K61).c_str()),
+#else
   K(ktailSquareGF61,       "tailsquare.cl", "tailSquareGF61",
                                                !tail_single_wide && !tail_single_kernel ? hN / nH - SMALL_H / nH * 2 : // Double-wide tailSquare with two kernels
                                                !tail_single_wide ? hN / nH :                                           // Double-wide tailSquare with one kernel
-                                               !tail_single_kernel ? hN / nH / 2 - SMALL_H / nH :                      // Single-wide tailSquare with two kernels
+                                               !tail_single_kernel ? hN / nH / 2 - SMALL_H / nH * (fft.isPfa() ? fft.pfa_radix : 1) : // Single-wide, two kernels
                                                hN / nH / 2, (kernelDefines(K61) + numCudaRegisters(TAIL61)).c_str()),  // Single-wide tailSquare with one kernel
+#endif
+#if defined(__APPLE__)
+  K(ktailMulGF61,          "tailmul.cl", "tailMulGF61ApplePlaceholder", hN / nH / 2, kernelDefines(K61).c_str()),
+  K(ktailMulGF61LoadScalarApple, "tailmul.cl", "tailMulGF61LoadScalarApple", hN, kernelDefines(K61).c_str()),
+  K(ktailMulGF61FftRadixApple, "tailmul.cl", "tailMulGF61FftRadixApple", hN / nH, kernelDefines(K61).c_str()),
+  K(ktailMulGF61FftTwiddleApple, "tailmul.cl", "tailMulGF61FftTwiddleApple", hN, kernelDefines(K61).c_str()),
+  K(ktailMulGF61FftShuffleApple, "tailmul.cl", "tailMulGF61FftShuffleApple", hN, kernelDefines(K61).c_str()),
+  K(ktailMulGF61FftFinalApple, "tailmul.cl", "tailMulGF61FftFinalApple", hN / nH, kernelDefines(K61).c_str()),
+  K(ktailMulGF61PairSpecialScalarApple, "tailmul.cl", "tailMulGF61PairSpecialScalarApple",
+      SMALL_H, kernelDefines(K61).c_str()),
+  K(ktailMulGF61PairNormalScalarApple, "tailmul.cl", "tailMulGF61PairNormalScalarApple",
+      (hN / nH - SMALL_H / nH * 2) * nH / 2, kernelDefines(K61).c_str()),
+#else
   K(ktailMulGF61,          "tailmul.cl", "tailMulGF61", hN / nH / 2, kernelDefines(K61).c_str()),
+#endif
   K(ktailMulLowGF61,       "tailmul.cl", "tailMulGF61", hN / nH / 2, (kernelDefines(K61) + "-DMUL_LOW=1").c_str()),
+#if defined(__APPLE__)
+  K(kfftMidOutGF61,        "fftmiddleout.cl", "fftMiddleOutGF61ApplePlaceholder", hN / (BIG_H / SMALL_H), (kernelDefines(K61) + numCudaRegisters(MIDOUT61)).c_str()),
+  K(kfftMidOutGF61LoadScalarApple, "fftmiddleout.cl", "fftMiddleOutGF61LoadScalarApple",
+      hN / (BIG_H / SMALL_H) * fft.shape.middle, kernelDefines(K61).c_str()),
+  K(kfftMidOutGF61MulScalarApple, "fftmiddleout.cl", "fftMiddleOutGF61MulScalarApple",
+      hN / (BIG_H / SMALL_H) * fft.shape.middle, kernelDefines(K61).c_str()),
+  K(kfftMidOutGF61FftApple, "fftmiddleout.cl", "fftMiddleOutGF61FftApple",
+      hN / (BIG_H / SMALL_H), kernelDefines(K61).c_str()),
+  K(kfftMidOutGF61Mul2ScalarApple, "fftmiddleout.cl", "fftMiddleOutGF61Mul2ScalarApple",
+      hN / (BIG_H / SMALL_H) * fft.shape.middle, kernelDefines(K61).c_str()),
+  K(kfftMidOutGF61WriteScalarApple, "fftmiddleout.cl", "fftMiddleOutGF61WriteScalarApple",
+      hN / (BIG_H / SMALL_H) * fft.shape.middle, kernelDefines(K61).c_str()),
+#else
   K(kfftMidOutGF61,        "fftmiddleout.cl", "fftMiddleOutGF61", hN / (BIG_H / SMALL_H), (kernelDefines(K61) + numCudaRegisters(MIDOUT61)).c_str()),
+#endif
+#if defined(__APPLE__)
+  K(kfftWGF61,             "fftw.cl", "fftWGF61ApplePlaceholder", hN / nW, kernelDefines(K61).c_str()),
+  K(kfftWGF61LoadScalarApple, "fftw.cl", "fftWGF61LoadScalarApple", hN, kernelDefines(K61).c_str()),
+  K(kfftWGF61WidthRadixApple, "fftw.cl", "fftWGF61WidthRadixApple", hN / nW, kernelDefines(K61).c_str()),
+  K(kfftWGF61TwiddleShuffle1Apple,   "fftw.cl", "fftWGF61TwiddleShuffle1Apple",   hN, kernelDefines(K61).c_str()),
+  K(kfftWGF61TwiddleShuffle4Apple,   "fftw.cl", "fftWGF61TwiddleShuffle4Apple",   hN, kernelDefines(K61).c_str()),
+  K(kfftWGF61TwiddleShuffle8Apple,   "fftw.cl", "fftWGF61TwiddleShuffle8Apple",   hN, kernelDefines(K61).c_str()),
+  K(kfftWGF61TwiddleShuffle16Apple,  "fftw.cl", "fftWGF61TwiddleShuffle16Apple",  hN, kernelDefines(K61).c_str()),
+  K(kfftWGF61TwiddleShuffle64Apple,  "fftw.cl", "fftWGF61TwiddleShuffle64Apple",  hN, kernelDefines(K61).c_str()),
+  K(kfftWGF61TwiddleShuffle256Apple, "fftw.cl", "fftWGF61TwiddleShuffle256Apple", hN, kernelDefines(K61).c_str()),
+  K(kfftWGF61TwiddleShuffle512Apple, "fftw.cl", "fftWGF61TwiddleShuffle512Apple", hN, kernelDefines(K61).c_str()),
+  K(kfftWGF61WidthFinalApple, "fftw.cl", "fftWGF61WidthFinalApple", hN / nW, kernelDefines(K61).c_str()),
+  K(kfftWGF61LoadStage1FusedApple, "fftw.cl", "fftWGF61LoadStage1FusedApple", hN / nW, kernelDefines(K61).c_str()),
+  K(kfftWGF61WidthStageFused1Apple,   "fftw.cl", "fftWGF61WidthStageFused1Apple",   hN / nW, kernelDefines(K61).c_str()),
+  K(kfftWGF61WidthStageFused4Apple,   "fftw.cl", "fftWGF61WidthStageFused4Apple",   hN / nW, kernelDefines(K61).c_str()),
+  K(kfftWGF61WidthStageFused8Apple,   "fftw.cl", "fftWGF61WidthStageFused8Apple",   hN / nW, kernelDefines(K61).c_str()),
+  K(kfftWGF61WidthStageFused16Apple,  "fftw.cl", "fftWGF61WidthStageFused16Apple",  hN / nW, kernelDefines(K61).c_str()),
+  K(kfftWGF61WidthStageFused64Apple,  "fftw.cl", "fftWGF61WidthStageFused64Apple",  hN / nW, kernelDefines(K61).c_str()),
+  K(kfftWGF61WidthStageFused256Apple, "fftw.cl", "fftWGF61WidthStageFused256Apple", hN / nW, kernelDefines(K61).c_str()),
+  K(kfftWGF61WidthStageFused512Apple, "fftw.cl", "fftWGF61WidthStageFused512Apple", hN / nW, kernelDefines(K61).c_str()),
+#else
   K(kfftWGF61,             "fftw.cl", "fftWGF61", hN / nW, kernelDefines(K61).c_str()),
+#endif
 
   K(kfftP,                 "fftp.cl", "fftP", hN / nW, kernelDefines(KALL).c_str()),
+  K(kfftPCarryB,           "fftp.cl", "fftPCarryB", hN / nW, kernelDefines(KALL).c_str()),
+#if defined(__APPLE__)
+  K(kfftMidInGF61LoadScalarApple, "fftmiddlein.cl", "fftMiddleInGF61LoadScalarApple",
+      hN / (BIG_H / SMALL_H) * fft.shape.middle, kernelDefines(K61).c_str()),
+  K(kfftMidInGF61Mul2FactorScalarApple, "fftmiddlein.cl", "fftMiddleInGF61Mul2FactorScalarApple",
+      hN / (BIG_H / SMALL_H) * fft.shape.middle, kernelDefines(K61).c_str()),
+  K(kfftMidInGF61ApplyScalarApple, "fftmiddlein.cl", "fftMiddleInGF61ApplyScalarApple",
+      hN / (BIG_H / SMALL_H) * fft.shape.middle, kernelDefines(K61).c_str()),
+  K(kfftMidInGF61FftApple,      "fftmiddlein.cl", "fftMiddleInGF61FftApple",      hN / (BIG_H / SMALL_H), kernelDefines(K61).c_str()),
+  K(kfftMidInGF61MulApple,      "fftmiddlein.cl", "fftMiddleInGF61MulApple",      hN / (BIG_H / SMALL_H), kernelDefines(K61).c_str()),
+  K(kfftMidInGF61TransposeApple,"fftmiddlein.cl", "fftMiddleInGF61TransposeApple",hN / (BIG_H / SMALL_H), kernelDefines(K61).c_str()),
+  K(ktailSquareZeroGF61LoadApple,       "tailsquare.cl", "tailSquareZeroGF61LoadApple",       SMALL_H / nH * 2, kernelDefines(K61).c_str()),
+  K(ktailSquareZeroGF61FftRadixApple,   "tailsquare.cl", "tailSquareZeroGF61FftRadixApple",   SMALL_H / nH * 2, kernelDefines(K61).c_str()),
+  K(ktailSquareZeroGF61FftTwiddleApple, "tailsquare.cl", "tailSquareZeroGF61FftTwiddleApple", SMALL_H * 2,      kernelDefines(K61).c_str()),
+  K(ktailSquareZeroGF61FftShuffleApple, "tailsquare.cl", "tailSquareZeroGF61FftShuffleApple", SMALL_H * 2,      kernelDefines(K61).c_str()),
+  K(ktailSquareZeroGF61FftFinalApple,   "tailsquare.cl", "tailSquareZeroGF61FftFinalApple",   SMALL_H / nH * 2, kernelDefines(K61).c_str()),
+  K(ktailSquareZeroGF61ReverseGlobalApple, "tailsquare.cl", "tailSquareZeroGF61ReverseGlobalApple", SMALL_H * 2, kernelDefines(K61).c_str()),
+  K(ktailSquareZeroGF61PairApple,    "tailsquare.cl", "tailSquareZeroGF61PairApple",    SMALL_H,          kernelDefines(K61).c_str()),
+  K(ktailSquareZeroGF61WriteDirectApple,   "tailsquare.cl", "tailSquareZeroGF61WriteDirectApple",   SMALL_H, kernelDefines(K61).c_str()),
+  K(ktailSquareGF61LoadScalarApple, "tailsquare.cl", "tailSquareGF61LoadScalarApple",
+      (hN / nH - SMALL_H / nH * 2) * nH, kernelDefines(K61).c_str()),
+  K(ktailSquareGF61FftRadixApple, "tailsquare.cl", "tailSquareGF61FftRadixApple",
+      hN / nH - SMALL_H / nH * 2, kernelDefines(K61).c_str()),
+  K(ktailSquareGF61FftTwiddleApple, "tailsquare.cl", "tailSquareGF61FftTwiddleApple",
+      (hN / nH - SMALL_H / nH * 2) * nH, kernelDefines(K61).c_str()),
+  K(ktailSquareGF61FftShuffleApple, "tailsquare.cl", "tailSquareGF61FftShuffleApple",
+      (hN / nH - SMALL_H / nH * 2) * nH, kernelDefines(K61).c_str()),
+  K(ktailSquareGF61FftFinalApple, "tailsquare.cl", "tailSquareGF61FftFinalApple",
+      hN / nH - SMALL_H / nH * 2, kernelDefines(K61).c_str()),
+  K(ktailSquareGF61ReverseCrossApple, "tailsquare.cl", "tailSquareGF61ReverseCrossApple",
+      (hN / nH - SMALL_H / nH * 2) * nH, kernelDefines(K61).c_str()),
+  K(ktailSquareGF61PairApple, "tailsquare.cl", "tailSquareGF61PairApple",
+      (hN / nH - SMALL_H / nH * 2) * nH / 2, kernelDefines(K61).c_str()),
+  K(ktailSquareGF61LoadStageFusedApple, "tailsquare.cl", "tailSquareGF61LoadStageFusedApple",
+      hN / nH - SMALL_H / nH * 2, kernelDefines(K61).c_str()),
+  K(ktailSquareGF61StageFusedApple, "tailsquare.cl", "tailSquareGF61StageFusedApple",
+      hN / nH - SMALL_H / nH * 2, kernelDefines(K61).c_str()),
+  K(ktailSquareGF61PairCrossFusedApple, "tailsquare.cl", "tailSquareGF61PairCrossFusedApple",
+      (hN / nH - SMALL_H / nH * 2) * nH / 2, kernelDefines(K61).c_str()),
+  K(ktailSquareGF61FinalPairFirstFusedApple, "tailsquare.cl", "tailSquareGF61FinalPairFirstFusedApple",
+      (hN / nH - SMALL_H / nH * 2) / 2, kernelDefines(K61).c_str()),
+  K(kfftP31Apple,          "fftp.cl", "fftP31Apple", hN / nW, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP31WeightScalarApple, "fftp.cl", "fftP31WeightScalarApple", hN, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP31WidthRadixApple,   "fftp.cl", "fftP31WidthRadixApple", hN / nW, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP31TwiddleShuffle1Apple,   "fftp.cl", "fftP31TwiddleShuffle1Apple",   hN, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP31TwiddleShuffle4Apple,   "fftp.cl", "fftP31TwiddleShuffle4Apple",   hN, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP31TwiddleShuffle8Apple,   "fftp.cl", "fftP31TwiddleShuffle8Apple",   hN, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP31TwiddleShuffle16Apple,  "fftp.cl", "fftP31TwiddleShuffle16Apple",  hN, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP31TwiddleShuffle64Apple,  "fftp.cl", "fftP31TwiddleShuffle64Apple",  hN, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP31TwiddleShuffle256Apple, "fftp.cl", "fftP31TwiddleShuffle256Apple", hN, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP31TwiddleShuffle512Apple, "fftp.cl", "fftP31TwiddleShuffle512Apple", hN, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP31WidthFinalApple,        "fftp.cl", "fftP31WidthFinalApple", hN / nW, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP31WeightStage1FusedApple, "fftp.cl", "fftP31WeightStage1FusedApple", hN / nW, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP31WidthStageFused1Apple,   "fftp.cl", "fftP31WidthStageFused1Apple",   hN / nW, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP31WidthStageFused4Apple,   "fftp.cl", "fftP31WidthStageFused4Apple",   hN / nW, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP31WidthStageFused8Apple,   "fftp.cl", "fftP31WidthStageFused8Apple",   hN / nW, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP31WidthStageFused16Apple,  "fftp.cl", "fftP31WidthStageFused16Apple",  hN / nW, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP31WidthStageFused64Apple,  "fftp.cl", "fftP31WidthStageFused64Apple",  hN / nW, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP31WidthStageFused256Apple, "fftp.cl", "fftP31WidthStageFused256Apple", hN / nW, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP31WidthStageFused512Apple, "fftp.cl", "fftP31WidthStageFused512Apple", hN / nW, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP61WeightScalarApple, "fftp.cl", "fftP61WeightScalarApple", hN, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP61WidthRadixApple,   "fftp.cl", "fftP61WidthRadixApple", hN / nW, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP61TwiddleShuffle1Apple,   "fftp.cl", "fftP61TwiddleShuffle1Apple",   hN, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP61TwiddleShuffle4Apple,   "fftp.cl", "fftP61TwiddleShuffle4Apple",   hN, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP61TwiddleShuffle8Apple,   "fftp.cl", "fftP61TwiddleShuffle8Apple",   hN, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP61TwiddleShuffle16Apple,  "fftp.cl", "fftP61TwiddleShuffle16Apple",  hN, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP61TwiddleShuffle64Apple,  "fftp.cl", "fftP61TwiddleShuffle64Apple",  hN, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP61TwiddleShuffle256Apple, "fftp.cl", "fftP61TwiddleShuffle256Apple", hN, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP61TwiddleShuffle512Apple, "fftp.cl", "fftP61TwiddleShuffle512Apple", hN, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP61WidthFinalApple,    "fftp.cl", "fftP61WidthFinalApple", hN / nW, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP61WeightStage1FusedApple, "fftp.cl", "fftP61WeightStage1FusedApple", hN / nW, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP61WidthStageFused1Apple,   "fftp.cl", "fftP61WidthStageFused1Apple",   hN / nW, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP61WidthStageFused4Apple,   "fftp.cl", "fftP61WidthStageFused4Apple",   hN / nW, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP61WidthStageFused8Apple,   "fftp.cl", "fftP61WidthStageFused8Apple",   hN / nW, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP61WidthStageFused16Apple,  "fftp.cl", "fftP61WidthStageFused16Apple",  hN / nW, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP61WidthStageFused64Apple,  "fftp.cl", "fftP61WidthStageFused64Apple",  hN / nW, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP61WidthStageFused256Apple, "fftp.cl", "fftP61WidthStageFused256Apple", hN / nW, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+  K(kfftP61WidthStageFused512Apple, "fftp.cl", "fftP61WidthStageFused512Apple", hN / nW, (kernelDefines(KALL) + "-DAEVUM_APPLE_SPLIT_FFTP=1").c_str()),
+#endif
   K(kCarryA,               "carry.cl", "carry", hN / CARRY_LEN, kernelDefines(KALL).c_str()),
   K(kCarryAROE,            "carry.cl", "carry", hN / CARRY_LEN, (kernelDefines(KALL) + "-DROE=1").c_str()),
   K(kCarryM,               "carry.cl", "carry", hN / CARRY_LEN, (kernelDefines(KALL) + "-DMUL3=1").c_str()),
@@ -823,8 +1039,16 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
   K(carryB,                "carryb.cl", "carryB",   hN / CARRY_LEN, kernelDefines(KALL).c_str()),
 
   // 64
+#if defined(__APPLE__)
+  // Apple OpenCL-to-Metal corrupts the stock 64x64 LDS transpose even on an
+  // all-zero register.  The direct global kernels launch one work-item per
+  // Word2 and preserve the exact sequential<->transposed index mapping.
+  K(transpIn,  "transpose.cl", "transposeInAppleGlobal",  hN),
+  K(transpOut, "transpose.cl", "transposeOutAppleGlobal", hN),
+#else
   K(transpIn,  "transpose.cl", "transposeIn",  hN / 64),
   K(transpOut, "transpose.cl", "transposeOut", hN / 64),
+#endif
 
   K(readResidue, "etc.cl", "readResidue", 32, "-DREADRESIDUE=1"),
 
@@ -871,6 +1095,12 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
   BUF(buf1, TOTAL_DATA_SIZE(fft, WIDTH, fft.shape.middle, SMALL_H, in_place, pad_size)),
   BUF(buf2, TOTAL_DATA_SIZE(fft, WIDTH, fft.shape.middle, SMALL_H, in_place, pad_size)),
   BUF(buf3, TOTAL_DATA_SIZE(fft, WIDTH, fft.shape.middle, SMALL_H, in_place, pad_size)),
+#if defined(__APPLE__)
+  BUF(bufAppleTailZeroGF61, fft.NTT_GF61 ? 8 * SMALL_H : 0),
+  // One GF61-only plane for Apple tailMul ping-pong.  This is smaller than a
+  // full combined GF31/GF61 transform buffer and is unused on other platforms.
+  BUF(bufAppleTailMulGF61, fft.NTT_GF61 ? GF61_DATA_SIZE(WIDTH, fft.shape.middle, SMALL_H, in_place, pad_size) : 0),
+#endif
 #undef BUF
 
   statsBits{u32(args.value("STATS", 0))},
@@ -880,9 +1110,232 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
   recorded_kernel_args{}
 {    
 
+#if defined(__APPLE__)
+  apple_fused_tailsquare_gf61 = fft.shape.fft_type == FFT3161 && fft.NTT_GF61 && nH > 1;
+  // v0.3.56 does not ship the matching OpenCL bridge kernel.
+  // Keep the validated v0.3.54 tailSquare path; width fusions remain enabled.
+  apple_bridge_fused_tailsquare_gf61 = false;
+  auto envEnabled = [](const char* name) {
+    if (const char* value = std::getenv(name)) return *value != '\0' && std::strcmp(value, "0") != 0;
+    return false;
+  };
+  if (envEnabled("AEVUM_APPLE_STAGE_FINISH")) {
+    apple_stage_finish = true;
+    log("Apple Aevum diagnostic: strict staged clFinish serialization enabled.\n");
+  }
+  apple_fused_fftp_width = fft.shape.fft_type == FFT3161 && fft.NTT_GF31 && fft.NTT_GF61 && nW > 1;
+  apple_fused_fftp_weight_first = apple_fused_fftp_width;
+  if (envEnabled("AEVUM_APPLE_FFTP_V55")) {
+    apple_fused_fftp_width = false;
+    apple_fused_fftp_weight_first = false;
+  }
+  if (envEnabled("AEVUM_APPLE_FFTP_STAGE_ONLY")) {
+    apple_fused_fftp_weight_first = false;
+  }
+  auto preloadFftpStage = [&](u32 stage, bool gf61) {
+    Kernel* k = nullptr;
+    if (!gf61) {
+      switch (stage) {
+        case 1: k=&kfftP31WidthStageFused1Apple; break;
+        case 4: k=&kfftP31WidthStageFused4Apple; break;
+        case 8: k=&kfftP31WidthStageFused8Apple; break;
+        case 16: k=&kfftP31WidthStageFused16Apple; break;
+        case 64: k=&kfftP31WidthStageFused64Apple; break;
+        case 256: k=&kfftP31WidthStageFused256Apple; break;
+        case 512: k=&kfftP31WidthStageFused512Apple; break;
+      }
+    } else {
+      switch (stage) {
+        case 1: k=&kfftP61WidthStageFused1Apple; break;
+        case 4: k=&kfftP61WidthStageFused4Apple; break;
+        case 8: k=&kfftP61WidthStageFused8Apple; break;
+        case 16: k=&kfftP61WidthStageFused16Apple; break;
+        case 64: k=&kfftP61WidthStageFused64Apple; break;
+        case 256: k=&kfftP61WidthStageFused256Apple; break;
+        case 512: k=&kfftP61WidthStageFused512Apple; break;
+      }
+    }
+    if (!k) throw std::runtime_error("Unsupported Apple fused fftP stage " + std::to_string(stage));
+    k->startLoad(&compiler);
+    k->finishLoad();
+  };
+  const u32 apple_width_workgroup = WIDTH / nW;
+  if (apple_fused_fftp_width) {
+    try {
+      for (u32 stage=1; stage<apple_width_workgroup; stage*=nW) {
+        preloadFftpStage(stage, false);
+        preloadFftpStage(stage, true);
+      }
+    } catch (const std::exception& e) {
+      apple_fused_fftp_width = false;
+      apple_fused_fftp_weight_first = false;
+      log("Apple Aevum performance: fused fftP width stages unavailable (%s); using v0.3.55 split fftP.\n", e.what());
+    } catch (...) {
+      apple_fused_fftp_width = false;
+      apple_fused_fftp_weight_first = false;
+      log("Apple Aevum performance: fused fftP width stages unavailable; using v0.3.55 split fftP.\n");
+    }
+  }
+  if (apple_fused_fftp_weight_first) {
+    try {
+      kfftP31WeightStage1FusedApple.startLoad(&compiler);
+      kfftP31WeightStage1FusedApple.finishLoad();
+      kfftP61WeightStage1FusedApple.startLoad(&compiler);
+      kfftP61WeightStage1FusedApple.finishLoad();
+    } catch (const std::exception& e) {
+      apple_fused_fftp_weight_first = false;
+      log("Apple Aevum performance: fused fftP weight+stage1 unavailable (%s); using stage-only fusion.\n", e.what());
+    } catch (...) {
+      apple_fused_fftp_weight_first = false;
+      log("Apple Aevum performance: fused fftP weight+stage1 unavailable; using stage-only fusion.\n");
+    }
+  }
+  u32 apple_fftp_stages = 0;
+  for (u32 stage=1; stage<apple_width_workgroup; stage*=nW) ++apple_fftp_stages;
+  const u32 apple_fftp_v55_dispatches = 2 * (2 * apple_fftp_stages + 2);
+  const u32 apple_fftp_stage_dispatches = 2 * (apple_fftp_stages + 2);
+  const u32 apple_fftp_turbo_dispatches = 2 * (apple_fftp_stages + 1);
+  if (apple_fused_fftp_weight_first) {
+    log("Apple Aevum performance: fused CRT fftP enabled (weight+stage1 and radix+twiddle+shuffle); dispatches %u -> %u -> %u.\n",
+        apple_fftp_v55_dispatches, apple_fftp_stage_dispatches, apple_fftp_turbo_dispatches);
+  } else if (apple_fused_fftp_width) {
+    log("Apple Aevum performance: fused CRT fftP width stages enabled; dispatches %u -> %u.\n",
+        apple_fftp_v55_dispatches, apple_fftp_stage_dispatches);
+  } else if (envEnabled("AEVUM_APPLE_FFTP_V55")) {
+    log("Apple Aevum diagnostic: v0.3.55 split fftP selected by AEVUM_APPLE_FFTP_V55.\n");
+  }
+  apple_fused_fftw_width = fft.shape.fft_type == FFT3161 && fft.NTT_GF61 && nW > 1;
+  apple_fused_fftw_load_first = apple_fused_fftw_width;
+  if (envEnabled("AEVUM_APPLE_FFTW_V55")) {
+    apple_fused_fftw_width = false;
+    apple_fused_fftw_load_first = false;
+  }
+  if (envEnabled("AEVUM_APPLE_FFTW_STAGE_ONLY")) {
+    apple_fused_fftw_load_first = false;
+  }
+  auto preloadFftwStage = [&](u32 stage) {
+    Kernel* k = nullptr;
+    switch (stage) {
+      case 1: k=&kfftWGF61WidthStageFused1Apple; break;
+      case 4: k=&kfftWGF61WidthStageFused4Apple; break;
+      case 8: k=&kfftWGF61WidthStageFused8Apple; break;
+      case 16: k=&kfftWGF61WidthStageFused16Apple; break;
+      case 64: k=&kfftWGF61WidthStageFused64Apple; break;
+      case 256: k=&kfftWGF61WidthStageFused256Apple; break;
+      case 512: k=&kfftWGF61WidthStageFused512Apple; break;
+    }
+    if (!k) throw std::runtime_error("Unsupported Apple fused fftW stage " + std::to_string(stage));
+    k->startLoad(&compiler);
+    k->finishLoad();
+  };
+  if (apple_fused_fftw_width) {
+    try {
+      for (u32 stage=1; stage<apple_width_workgroup; stage*=nW) preloadFftwStage(stage);
+    } catch (const std::exception& e) {
+      apple_fused_fftw_width = false;
+      apple_fused_fftw_load_first = false;
+      log("Apple Aevum performance: fused GF61 fftW width stages unavailable (%s); using v0.3.55 split fftW.\n", e.what());
+    } catch (...) {
+      apple_fused_fftw_width = false;
+      apple_fused_fftw_load_first = false;
+      log("Apple Aevum performance: fused GF61 fftW width stages unavailable; using v0.3.55 split fftW.\n");
+    }
+  }
+  if (apple_fused_fftw_load_first) {
+    try {
+      kfftWGF61LoadStage1FusedApple.startLoad(&compiler);
+      kfftWGF61LoadStage1FusedApple.finishLoad();
+    } catch (const std::exception& e) {
+      apple_fused_fftw_load_first = false;
+      log("Apple Aevum performance: fused GF61 fftW load+stage1 unavailable (%s); using stage-only fusion.\n", e.what());
+    } catch (...) {
+      apple_fused_fftw_load_first = false;
+      log("Apple Aevum performance: fused GF61 fftW load+stage1 unavailable; using stage-only fusion.\n");
+    }
+  }
+  const u32 apple_fftw_v55_dispatches = 2 * apple_fftp_stages + 2;
+  const u32 apple_fftw_stage_dispatches = apple_fftp_stages + 2;
+  const u32 apple_fftw_turbo_dispatches = apple_fftp_stages + 1;
+  if (apple_fused_fftw_load_first) {
+    log("Apple Aevum performance: fused GF61 fftW enabled (load+stage1 and radix+twiddle+shuffle); dispatches %u -> %u -> %u.\n",
+        apple_fftw_v55_dispatches, apple_fftw_stage_dispatches, apple_fftw_turbo_dispatches);
+  } else if (apple_fused_fftw_width) {
+    log("Apple Aevum performance: fused GF61 fftW width stages enabled; dispatches %u -> %u.\n",
+        apple_fftw_v55_dispatches, apple_fftw_stage_dispatches);
+  } else if (envEnabled("AEVUM_APPLE_FFTW_V55")) {
+    log("Apple Aevum diagnostic: v0.3.55 split GF61 fftW selected by AEVUM_APPLE_FFTW_V55.\n");
+  }
+  if (envEnabled("AEVUM_APPLE_TAILSQUARE_LEGACY")) {
+    apple_fused_tailsquare_gf61 = false;
+    apple_bridge_fused_tailsquare_gf61 = false;
+  }
+  if (apple_fused_tailsquare_gf61) {
+    // Apple compiles OpenCL kernels to Metal when clCreateKernel is reached.
+    // Preload the v0.3.54 kernels before any arithmetic is modified; if the
+    // driver rejects one of them, retain the validated v0.3.53 staged path.
+    try {
+      ktailSquareGF61LoadStageFusedApple.startLoad(&compiler);
+      ktailSquareGF61LoadStageFusedApple.finishLoad();
+      ktailSquareGF61StageFusedApple.startLoad(&compiler);
+      ktailSquareGF61StageFusedApple.finishLoad();
+      ktailSquareGF61PairCrossFusedApple.startLoad(&compiler);
+      ktailSquareGF61PairCrossFusedApple.finishLoad();
+    } catch (const std::exception& e) {
+      apple_fused_tailsquare_gf61 = false;
+      apple_bridge_fused_tailsquare_gf61 = false;
+      log("Apple Aevum performance: fused GF61 tailSquare unavailable (%s); using validated legacy staging.\n", e.what());
+    } catch (...) {
+      apple_fused_tailsquare_gf61 = false;
+      apple_bridge_fused_tailsquare_gf61 = false;
+      log("Apple Aevum performance: fused GF61 tailSquare unavailable; using validated legacy staging.\n");
+    }
+  }
+  if (envEnabled("AEVUM_APPLE_TAILSQUARE_V54")) {
+    apple_bridge_fused_tailsquare_gf61 = false;
+  }
+  if (apple_bridge_fused_tailsquare_gf61) {
+    // v0.3.55 additionally composes final-forward radix, both directional
+    // pairings and the first inverse stage.  Preload it separately so a Metal
+    // compiler rejection falls back to the already validated v0.3.54 path.
+    try {
+      ktailSquareGF61FinalPairFirstFusedApple.startLoad(&compiler);
+      ktailSquareGF61FinalPairFirstFusedApple.finishLoad();
+    } catch (const std::exception& e) {
+      apple_bridge_fused_tailsquare_gf61 = false;
+      log("Apple Aevum performance: bridge-fused GF61 tailSquare unavailable (%s); using v0.3.54 fused staging.\n", e.what());
+    } catch (...) {
+      apple_bridge_fused_tailsquare_gf61 = false;
+      log("Apple Aevum performance: bridge-fused GF61 tailSquare unavailable; using v0.3.54 fused staging.\n");
+    }
+  }
+  u32 stage_count = 0;
+  for (u32 stage = 1; stage < SMALL_H / nH; stage *= nH) ++stage_count;
+  const u32 legacy_dispatches = 6 * stage_count + 6;
+  const u32 fused_dispatches = 2 * stage_count + 3;
+  const u32 bridge_dispatches = 2 * stage_count + 1;
+  if (apple_bridge_fused_tailsquare_gf61) {
+    log("Apple Aevum performance: bridge-fused GF61 tailSquare enabled (final-forward radix + R-pair-R + first inverse stage); normal-tail dispatches %u -> %u -> %u.\n",
+        legacy_dispatches, fused_dispatches, bridge_dispatches);
+  } else if (apple_fused_tailsquare_gf61) {
+    log("Apple Aevum performance: v0.3.54 fused GF61 tailSquare stages enabled; normal-tail dispatches %u -> %u.\n",
+        legacy_dispatches, fused_dispatches);
+    if (envEnabled("AEVUM_APPLE_TAILSQUARE_V54")) {
+      log("Apple Aevum diagnostic: v0.3.54 fused tailSquare selected by AEVUM_APPLE_TAILSQUARE_V54.\n");
+    }
+  } else if (envEnabled("AEVUM_APPLE_TAILSQUARE_LEGACY")) {
+    log("Apple Aevum diagnostic: legacy staged GF61 tailSquare selected by AEVUM_APPLE_TAILSQUARE_LEGACY.\n");
+  }
+#endif
+
   float bitsPerWord = E / float(N);
   if (logFftSize) {
     log("FFT: %s %s (%.2f bpw)\n", numberK(N).c_str(), fft.spec().c_str(), bitsPerWord);
+    if (fft.isPfa()) {
+      if (fft.shape.fft_type == FFT323161)
+        log("Aevum experimental type-4 PFA active: radix-%u Good-Thomas digit map, FP32+GF31+GF61 planes, binary half-real rows.\n", fft.pfa_radix);
+      else
+        log("Aevum native PFA active: radix-%u Good-Thomas digit map, binary half-real rows, native GF31/GF61 carry.\n", fft.pfa_radix);
+    }
 
     // Sometimes we do want to run a FFT beyond a reasonable BPW (e.g. during -ztune), and these situations
     // coincide with logFftSize == false
@@ -899,6 +1352,11 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
   useLongCarry = useLongCarry || (bitsPerWord < 10.0);
 
   if (useLongCarry) { log("Using long carry!\n"); }
+#if defined(__APPLE__)
+  if (fft.shape.fft_type == FFT3161) {
+    log("Apple OpenCL 1.2 compatibility: targeted fftP, GF61 middle-in, tail staging and fftW global ping-pong staging; middle LDS transposes retained (IN_WG=64, OUT_WG=64).\n");
+  }
+#endif
 
   if (fft.FFT_FP64 || fft.FFT_FP32) {
     kfftMidIn.setFixedArgs(2, bufTrigM);
@@ -924,13 +1382,33 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
 
   if (fft.NTT_GF61) {
     kfftMidInGF61.setFixedArgs(2, bufTrigM);
+#if defined(__APPLE__)
+    kfftMidInGF61Mul2FactorScalarApple.setFixedArgs(1, bufTrigM);
+    kfftMidInGF61MulApple.setFixedArgs(1, bufTrigM);
+#endif
     kfftHinGF61.setFixedArgs(2, bufTrigH);
+#if defined(__APPLE__)
+    kfftHinGF61FftTwiddleApple.setFixedArgs(2, bufTrigH);
+#endif
     ktailSquareZeroGF61.setFixedArgs(2, bufTrigH);
     ktailSquareGF61.setFixedArgs(2, bufTrigH);
     ktailMulLowGF61.setFixedArgs(3, bufTrigH);
     ktailMulGF61.setFixedArgs(3, bufTrigH);
     kfftMidOutGF61.setFixedArgs(2, bufTrigM);
     kfftWGF61.setFixedArgs(2, bufTrigW);
+#if defined(__APPLE__)
+    for (Kernel* k : {&kfftWGF61TwiddleShuffle1Apple, &kfftWGF61TwiddleShuffle4Apple,
+                      &kfftWGF61TwiddleShuffle8Apple, &kfftWGF61TwiddleShuffle16Apple,
+                      &kfftWGF61TwiddleShuffle64Apple, &kfftWGF61TwiddleShuffle256Apple,
+                      &kfftWGF61TwiddleShuffle512Apple,
+                      &kfftWGF61LoadStage1FusedApple,
+                      &kfftWGF61WidthStageFused1Apple, &kfftWGF61WidthStageFused4Apple,
+                      &kfftWGF61WidthStageFused8Apple, &kfftWGF61WidthStageFused16Apple,
+                      &kfftWGF61WidthStageFused64Apple, &kfftWGF61WidthStageFused256Apple,
+                      &kfftWGF61WidthStageFused512Apple}) {
+      k->setFixedArgs(2, bufTrigW);
+    }
+#endif
   }
 
   if (fft.FFT_FP64 || fft.FFT_FP32) {                         // The FP versions take bufWeight arguments
@@ -945,6 +1423,30 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
     for (Kernel* k : {&kCarryFused, &kCarryFusedMul, &kCarryFusedLL}) { k->setFixedArgs(8, bufStatsCarry); }
   } else {
     kfftP.setFixedArgs(2, bufTrigW);
+    kfftPCarryB.setFixedArgs(2, bufCarry, bufTrigW);
+#if defined(__APPLE__)
+    kfftP31Apple.setFixedArgs(2, bufTrigW);
+    for (Kernel* k : {&kfftP31TwiddleShuffle1Apple, &kfftP31TwiddleShuffle4Apple,
+                      &kfftP31TwiddleShuffle8Apple, &kfftP31TwiddleShuffle16Apple,
+                      &kfftP31TwiddleShuffle64Apple, &kfftP31TwiddleShuffle256Apple,
+                      &kfftP31TwiddleShuffle512Apple,
+                      &kfftP61TwiddleShuffle1Apple, &kfftP61TwiddleShuffle4Apple,
+                      &kfftP61TwiddleShuffle8Apple, &kfftP61TwiddleShuffle16Apple,
+                      &kfftP61TwiddleShuffle64Apple, &kfftP61TwiddleShuffle256Apple,
+                      &kfftP61TwiddleShuffle512Apple,
+                      &kfftP31WeightStage1FusedApple,
+                      &kfftP31WidthStageFused1Apple, &kfftP31WidthStageFused4Apple,
+                      &kfftP31WidthStageFused8Apple, &kfftP31WidthStageFused16Apple,
+                      &kfftP31WidthStageFused64Apple, &kfftP31WidthStageFused256Apple,
+                      &kfftP31WidthStageFused512Apple,
+                      &kfftP61WeightStage1FusedApple,
+                      &kfftP61WidthStageFused1Apple, &kfftP61WidthStageFused4Apple,
+                      &kfftP61WidthStageFused8Apple, &kfftP61WidthStageFused16Apple,
+                      &kfftP61WidthStageFused64Apple, &kfftP61WidthStageFused256Apple,
+                      &kfftP61WidthStageFused512Apple}) {
+      k->setFixedArgs(2, bufTrigW);
+    }
+#endif
     for (Kernel* k : {&kCarryA, &kCarryAROE, &kCarryM, &kCarryMROE, &kCarryLL}) { k->setFixedArgs(3, bufCarry); }
     for (Kernel* k : {&kCarryA, &kCarryM, &kCarryLL}) { k->setFixedArgs(4, bufStatsCarry); }
     for (Kernel* k : {&kCarryAROE, &kCarryMROE})      { k->setFixedArgs(4, bufROE); }
@@ -976,6 +1478,12 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
     queue.setSquareKernels(5 + ((fft.FFT_FP64 + fft.FFT_FP32 + fft.NTT_GF31 + fft.NTT_GF61) - 1));
   else
     queue.setSquareKernels(1 + 3 * (fft.FFT_FP64 + fft.FFT_FP32 + fft.NTT_GF31 + fft.NTT_GF61));
+  prpMiddle1 = args.value("PRP_MIDDLE1", 0) && fft.shape.middle == 1 &&
+      !fft.isPfa() && !in_place && !useLongCarry && !tail_single_wide && tail_single_kernel;
+#if defined(__APPLE__) || defined(CUDA_BACKEND)
+  prpMiddle1 = false;
+#endif
+  if (prpMiddle1) log("AEVUM_PRP_PATH middle1 fused input+tail+output; LL unchanged\n");
   queue.finish();
 }
 
@@ -1008,13 +1516,77 @@ void Gpu::splitQueue(void) {
   if (fft.NTT_GF61) {
     if (which_queue != -1) {
       kfftMidInGF61.setQueue(&auxQueues[which_queue]);
+#if defined(__APPLE__)
+      kfftMidInGF61LoadScalarApple.setQueue(&auxQueues[which_queue]);
+      kfftMidInGF61Mul2FactorScalarApple.setQueue(&auxQueues[which_queue]);
+      kfftMidInGF61ApplyScalarApple.setQueue(&auxQueues[which_queue]);
+      kfftMidInGF61FftApple.setQueue(&auxQueues[which_queue]);
+      kfftMidInGF61MulApple.setQueue(&auxQueues[which_queue]);
+      kfftMidInGF61TransposeApple.setQueue(&auxQueues[which_queue]);
+      ktailSquareZeroGF61LoadApple.setQueue(&auxQueues[which_queue]);
+      ktailSquareZeroGF61FftRadixApple.setQueue(&auxQueues[which_queue]);
+      ktailSquareZeroGF61FftTwiddleApple.setQueue(&auxQueues[which_queue]);
+      ktailSquareZeroGF61FftShuffleApple.setQueue(&auxQueues[which_queue]);
+      ktailSquareZeroGF61FftFinalApple.setQueue(&auxQueues[which_queue]);
+      ktailSquareZeroGF61ReverseGlobalApple.setQueue(&auxQueues[which_queue]);
+      ktailSquareZeroGF61PairApple.setQueue(&auxQueues[which_queue]);
+      ktailSquareZeroGF61WriteDirectApple.setQueue(&auxQueues[which_queue]);
+      ktailSquareGF61LoadStageFusedApple.setQueue(&auxQueues[which_queue]);
+      ktailSquareGF61StageFusedApple.setQueue(&auxQueues[which_queue]);
+      ktailSquareGF61PairCrossFusedApple.setQueue(&auxQueues[which_queue]);
+      ktailSquareGF61FinalPairFirstFusedApple.setQueue(&auxQueues[which_queue]);
+#endif
       kfftHinGF61.setQueue(&auxQueues[which_queue]);
+#if defined(__APPLE__)
+      kfftHinGF61LoadScalarApple.setQueue(&auxQueues[which_queue]);
+      kfftHinGF61FftRadixApple.setQueue(&auxQueues[which_queue]);
+      kfftHinGF61FftTwiddleApple.setQueue(&auxQueues[which_queue]);
+      kfftHinGF61FftShuffleApple.setQueue(&auxQueues[which_queue]);
+      kfftHinGF61FftFinalApple.setQueue(&auxQueues[which_queue]);
+#endif
       ktailSquareZeroGF61.setQueue(&auxQueues[which_queue]);
       ktailSquareGF61.setQueue(&auxQueues[which_queue]);
+      kprpMiddle1GF61.setQueue(&auxQueues[which_queue]);
       ktailMulGF61.setQueue(&auxQueues[which_queue]);
+#if defined(__APPLE__)
+      ktailMulGF61LoadScalarApple.setQueue(&auxQueues[which_queue]);
+      ktailMulGF61FftRadixApple.setQueue(&auxQueues[which_queue]);
+      ktailMulGF61FftTwiddleApple.setQueue(&auxQueues[which_queue]);
+      ktailMulGF61FftShuffleApple.setQueue(&auxQueues[which_queue]);
+      ktailMulGF61FftFinalApple.setQueue(&auxQueues[which_queue]);
+      ktailMulGF61PairSpecialScalarApple.setQueue(&auxQueues[which_queue]);
+      ktailMulGF61PairNormalScalarApple.setQueue(&auxQueues[which_queue]);
+#endif
       ktailMulLowGF61.setQueue(&auxQueues[which_queue]);
       kfftMidOutGF61.setQueue(&auxQueues[which_queue]);
+#if defined(__APPLE__)
+      kfftMidOutGF61LoadScalarApple.setQueue(&auxQueues[which_queue]);
+      kfftMidOutGF61MulScalarApple.setQueue(&auxQueues[which_queue]);
+      kfftMidOutGF61FftApple.setQueue(&auxQueues[which_queue]);
+      kfftMidOutGF61Mul2ScalarApple.setQueue(&auxQueues[which_queue]);
+      kfftMidOutGF61WriteScalarApple.setQueue(&auxQueues[which_queue]);
+#endif
       kfftWGF61.setQueue(&auxQueues[which_queue]);
+#if defined(__APPLE__)
+      kfftWGF61LoadScalarApple.setQueue(&auxQueues[which_queue]);
+      kfftWGF61WidthRadixApple.setQueue(&auxQueues[which_queue]);
+      kfftWGF61TwiddleShuffle1Apple.setQueue(&auxQueues[which_queue]);
+      kfftWGF61TwiddleShuffle4Apple.setQueue(&auxQueues[which_queue]);
+      kfftWGF61TwiddleShuffle8Apple.setQueue(&auxQueues[which_queue]);
+      kfftWGF61TwiddleShuffle16Apple.setQueue(&auxQueues[which_queue]);
+      kfftWGF61TwiddleShuffle64Apple.setQueue(&auxQueues[which_queue]);
+      kfftWGF61TwiddleShuffle256Apple.setQueue(&auxQueues[which_queue]);
+      kfftWGF61TwiddleShuffle512Apple.setQueue(&auxQueues[which_queue]);
+      kfftWGF61WidthFinalApple.setQueue(&auxQueues[which_queue]);
+      kfftWGF61LoadStage1FusedApple.setQueue(&auxQueues[which_queue]);
+      kfftWGF61WidthStageFused1Apple.setQueue(&auxQueues[which_queue]);
+      kfftWGF61WidthStageFused4Apple.setQueue(&auxQueues[which_queue]);
+      kfftWGF61WidthStageFused8Apple.setQueue(&auxQueues[which_queue]);
+      kfftWGF61WidthStageFused16Apple.setQueue(&auxQueues[which_queue]);
+      kfftWGF61WidthStageFused64Apple.setQueue(&auxQueues[which_queue]);
+      kfftWGF61WidthStageFused256Apple.setQueue(&auxQueues[which_queue]);
+      kfftWGF61WidthStageFused512Apple.setQueue(&auxQueues[which_queue]);
+#endif
     }
     which_queue++;
   }
@@ -1025,6 +1597,7 @@ void Gpu::splitQueue(void) {
       kfftHin.setQueue(&auxQueues[which_queue]);
       ktailSquareZero.setQueue(&auxQueues[which_queue]);
       ktailSquare.setQueue(&auxQueues[which_queue]);
+      kprpMiddle1.setQueue(&auxQueues[which_queue]);
       ktailMul.setQueue(&auxQueues[which_queue]);
       ktailMulLow.setQueue(&auxQueues[which_queue]);
       kfftMidOut.setQueue(&auxQueues[which_queue]);
@@ -1042,6 +1615,7 @@ void Gpu::splitQueue(void) {
       kfftHinGF31.setQueue(&auxQueues[which_queue]);
       ktailSquareZeroGF31.setQueue(&auxQueues[which_queue]);
       ktailSquareGF31.setQueue(&auxQueues[which_queue]);
+      kprpMiddle1GF31.setQueue(&auxQueues[which_queue]);
       ktailMulGF31.setQueue(&auxQueues[which_queue]);
       ktailMulLowGF31.setQueue(&auxQueues[which_queue]);
       kfftMidOutGF31.setQueue(&auxQueues[which_queue]);
@@ -1066,19 +1640,84 @@ void Gpu::mergeQueue(void) {
   // NOTE: I believe there is no need to switch queues back and forth between the main and auxiliary queues.  No one currently uses the cache_group == 0 option.
   if (fft.NTT_GF61) {
     kfftMidInGF61.setQueue(&queue);
+#if defined(__APPLE__)
+    kfftMidInGF61LoadScalarApple.setQueue(&queue);
+    kfftMidInGF61Mul2FactorScalarApple.setQueue(&queue);
+    kfftMidInGF61ApplyScalarApple.setQueue(&queue);
+    kfftMidInGF61FftApple.setQueue(&queue);
+    kfftMidInGF61MulApple.setQueue(&queue);
+    kfftMidInGF61TransposeApple.setQueue(&queue);
+    ktailSquareZeroGF61LoadApple.setQueue(&queue);
+    ktailSquareZeroGF61FftRadixApple.setQueue(&queue);
+    ktailSquareZeroGF61FftTwiddleApple.setQueue(&queue);
+    ktailSquareZeroGF61FftShuffleApple.setQueue(&queue);
+    ktailSquareZeroGF61FftFinalApple.setQueue(&queue);
+    ktailSquareZeroGF61ReverseGlobalApple.setQueue(&queue);
+    ktailSquareZeroGF61PairApple.setQueue(&queue);
+    ktailSquareZeroGF61WriteDirectApple.setQueue(&queue);
+    ktailSquareGF61LoadStageFusedApple.setQueue(&queue);
+    ktailSquareGF61StageFusedApple.setQueue(&queue);
+    ktailSquareGF61PairCrossFusedApple.setQueue(&queue);
+    ktailSquareGF61FinalPairFirstFusedApple.setQueue(&queue);
+#endif
     kfftHinGF61.setQueue(&queue);
+#if defined(__APPLE__)
+    kfftHinGF61LoadScalarApple.setQueue(&queue);
+    kfftHinGF61FftRadixApple.setQueue(&queue);
+    kfftHinGF61FftTwiddleApple.setQueue(&queue);
+    kfftHinGF61FftShuffleApple.setQueue(&queue);
+    kfftHinGF61FftFinalApple.setQueue(&queue);
+#endif
     ktailSquareZeroGF61.setQueue(&queue);
     ktailSquareGF61.setQueue(&queue);
+    kprpMiddle1GF61.setQueue(&queue);
     ktailMulGF61.setQueue(&queue);
+#if defined(__APPLE__)
+    ktailMulGF61LoadScalarApple.setQueue(&queue);
+    ktailMulGF61FftRadixApple.setQueue(&queue);
+    ktailMulGF61FftTwiddleApple.setQueue(&queue);
+    ktailMulGF61FftShuffleApple.setQueue(&queue);
+    ktailMulGF61FftFinalApple.setQueue(&queue);
+    ktailMulGF61PairSpecialScalarApple.setQueue(&queue);
+    ktailMulGF61PairNormalScalarApple.setQueue(&queue);
+#endif
     ktailMulLowGF61.setQueue(&queue);
     kfftMidOutGF61.setQueue(&queue);
+#if defined(__APPLE__)
+    kfftMidOutGF61LoadScalarApple.setQueue(&queue);
+    kfftMidOutGF61MulScalarApple.setQueue(&queue);
+    kfftMidOutGF61FftApple.setQueue(&queue);
+    kfftMidOutGF61Mul2ScalarApple.setQueue(&queue);
+    kfftMidOutGF61WriteScalarApple.setQueue(&queue);
+#endif
     kfftWGF61.setQueue(&queue);
+#if defined(__APPLE__)
+    kfftWGF61LoadScalarApple.setQueue(&queue);
+    kfftWGF61WidthRadixApple.setQueue(&queue);
+    kfftWGF61TwiddleShuffle1Apple.setQueue(&queue);
+    kfftWGF61TwiddleShuffle4Apple.setQueue(&queue);
+    kfftWGF61TwiddleShuffle8Apple.setQueue(&queue);
+    kfftWGF61TwiddleShuffle16Apple.setQueue(&queue);
+    kfftWGF61TwiddleShuffle64Apple.setQueue(&queue);
+    kfftWGF61TwiddleShuffle256Apple.setQueue(&queue);
+    kfftWGF61TwiddleShuffle512Apple.setQueue(&queue);
+    kfftWGF61WidthFinalApple.setQueue(&queue);
+    kfftWGF61LoadStage1FusedApple.setQueue(&queue);
+    kfftWGF61WidthStageFused1Apple.setQueue(&queue);
+    kfftWGF61WidthStageFused4Apple.setQueue(&queue);
+    kfftWGF61WidthStageFused8Apple.setQueue(&queue);
+    kfftWGF61WidthStageFused16Apple.setQueue(&queue);
+    kfftWGF61WidthStageFused64Apple.setQueue(&queue);
+    kfftWGF61WidthStageFused256Apple.setQueue(&queue);
+    kfftWGF61WidthStageFused512Apple.setQueue(&queue);
+#endif
   }
   if (fft.FFT_FP64 || fft.FFT_FP32) {
     kfftMidIn.setQueue(&queue);
     kfftHin.setQueue(&queue);
     ktailSquareZero.setQueue(&queue);
     ktailSquare.setQueue(&queue);
+    kprpMiddle1.setQueue(&queue);
     ktailMul.setQueue(&queue);
     ktailMulLow.setQueue(&queue);
     kfftMidOut.setQueue(&queue);
@@ -1089,6 +1728,7 @@ void Gpu::mergeQueue(void) {
     kfftHinGF31.setQueue(&queue);
     ktailSquareZeroGF31.setQueue(&queue);
     ktailSquareGF31.setQueue(&queue);
+    kprpMiddle1GF31.setQueue(&queue);
     ktailMulGF31.setQueue(&queue);
     ktailMulLowGF31.setQueue(&queue);
     kfftMidOutGF31.setQueue(&queue);
@@ -1116,6 +1756,12 @@ void Gpu::replay(void) {
     for (auto kern : recorded_kernels) {
 
       // Call the appropriate kernel
+      if (kern == KPRPMIDDLE1) {
+        Buffer<double>* out = recorded_kernel_args[arg++];
+        if (cache_group == 1) kprpMiddle1(*out, buf3, bufTrigH, bufTrigM);
+        if (cache_group == 2) kprpMiddle1GF31(*out, buf3, bufTrigH, bufTrigM);
+        if (cache_group == 3) kprpMiddle1GF61(*out, buf3, bufTrigH, bufTrigM);
+      }
       if (kern == KMIDIN) {
         Buffer<double> *buf = recorded_kernel_args[arg++];
         // If not in place, the input is from the scratch buffer
@@ -1123,7 +1769,27 @@ void Gpu::replay(void) {
         Buffer<double> *out = buf;
         if (cache_group == 1) kfftMidIn(*out, *in);
         if (cache_group == 2) kfftMidInGF31(*out, *in);
-        if (cache_group == 3) kfftMidInGF61(*out, *in);
+        if (cache_group == 3) {
+#if defined(__APPLE__)
+          if (fft.shape.fft_type == FFT3161) {
+            // Apple scalarizes the first middle-in phase: source load, trig
+            // factor generation, and element-wise application are separate
+            // pipelines with one GF61 value per work-item. The original input
+            // scratch becomes the factor buffer after the load. FFT and final
+            // LDS transpose preserve the stock algorithm and data layout.
+            kfftMidInGF61LoadScalarApple(*out, *in); appleStageFinish();
+            kfftMidInGF61Mul2FactorScalarApple(*in); appleStageFinish();
+            kfftMidInGF61ApplyScalarApple(*out, *in); appleStageFinish();
+            kfftMidInGF61FftApple(*in, *out); appleStageFinish();
+            kfftMidInGF61MulApple(*in); appleStageFinish();
+            kfftMidInGF61TransposeApple(*out, *in); appleStageFinish();
+          } else {
+            kfftMidInGF61(*out, *in);
+          }
+#else
+          kfftMidInGF61(*out, *in);
+#endif
+        }
       }
 
       if (kern == KFFTHIN) {
@@ -1131,7 +1797,31 @@ void Gpu::replay(void) {
         Buffer<double> *in = recorded_kernel_args[arg++];
         if (cache_group == 1) kfftHin(*out, *in);
         if (cache_group == 2) kfftHinGF31(*out, *in);
-        if (cache_group == 3) kfftHinGF61(*out, *in);
+        if (cache_group == 3) {
+#if defined(__APPLE__)
+          if (fft.shape.fft_type == FFT3161) {
+            // Exact global-memory decomposition of the upstream fftHinGF61.
+            // The source GF61 plane is free after the scalar load and serves
+            // as the alternate ping-pong bank; no extra transform allocation.
+            kfftHinGF61LoadScalarApple(*out, *in);
+            Buffer<double>* current = out;
+            const u32 groupSize = SMALL_H / nH;
+            for (u32 stage = 1; stage < groupSize; stage *= nH) {
+              kfftHinGF61FftRadixApple(*current);
+              kfftHinGF61FftTwiddleApple(*current, stage);
+              Buffer<double>* next = current == out ? in : out;
+              kfftHinGF61FftShuffleApple(*current, *next, stage);
+              current = next;
+            }
+            if (current == out) kfftHinGF61FftRadixApple(*out);
+            else kfftHinGF61FftFinalApple(*current, *out);
+          } else {
+            kfftHinGF61(*out, *in);
+          }
+#else
+          kfftHinGF61(*out, *in);
+#endif
+        }
       }
 
       if (kern == KTAILSQUARE) {
@@ -1142,11 +1832,132 @@ void Gpu::replay(void) {
         if (!tail_single_kernel) {
           if (cache_group == 1) ktailSquareZero(*out, *in);
           if (cache_group == 2) ktailSquareZeroGF31(*out, *in);
-          if (cache_group == 3) ktailSquareZeroGF61(*out, *in);
+          if (cache_group == 3) {
+#if defined(__APPLE__)
+            if (fft.shape.fft_type == FFT3161) {
+              ktailSquareZeroGF61LoadApple(bufAppleTailZeroGF61, *in);
+              appleStageFinish();
+              auto runAppleTailZeroGF61Fft = [&]() {
+                const u32 groupSize = SMALL_H / nH;
+                u32 bank = 0;
+                for (u32 stage = 1; stage < groupSize; stage *= nH) {
+                  ktailSquareZeroGF61FftRadixApple(bufAppleTailZeroGF61, bank);
+                  appleStageFinish();
+                  ktailSquareZeroGF61FftTwiddleApple(bufAppleTailZeroGF61, bufTrigH, bank, stage);
+                  appleStageFinish();
+                  const u32 nextBank = bank ^ 1u;
+                  ktailSquareZeroGF61FftShuffleApple(bufAppleTailZeroGF61, bank, nextBank, stage);
+                  appleStageFinish();
+                  bank = nextBank;
+                }
+                ktailSquareZeroGF61FftFinalApple(bufAppleTailZeroGF61, bank);
+                appleStageFinish();
+              };
+              runAppleTailZeroGF61Fft();
+              ktailSquareZeroGF61ReverseGlobalApple(bufAppleTailZeroGF61, 0u, 1u);
+              appleStageFinish();
+              ktailSquareZeroGF61PairApple(bufAppleTailZeroGF61, bufTrigH, 1u);
+              appleStageFinish();
+              ktailSquareZeroGF61ReverseGlobalApple(bufAppleTailZeroGF61, 1u, 0u);
+              appleStageFinish();
+              runAppleTailZeroGF61Fft();
+              ktailSquareZeroGF61WriteDirectApple(*out, bufAppleTailZeroGF61, 0u, 0u);
+              appleStageFinish();
+              ktailSquareZeroGF61WriteDirectApple(*out, bufAppleTailZeroGF61, SMALL_H, (fft.shape.middle / 2u) * SMALL_H);
+              appleStageFinish();
+            } else {
+              ktailSquareZeroGF61(*out, *in);
+            }
+#else
+            ktailSquareZeroGF61(*out, *in);
+#endif
+          }
         }
         if (cache_group == 1) ktailSquare(*out, *in);
         if (cache_group == 2) ktailSquareGF31(*out, *in);
-        if (cache_group == 3) ktailSquareGF61(*out, *in);
+        if (cache_group == 3) {
+#if defined(__APPLE__)
+          if (fft.shape.fft_type == FFT3161) {
+            const u32 groupSize = SMALL_H / nH;
+            if (apple_fused_tailsquare_gf61 && groupSize > 1) {
+              // First height FFT: fuse transpose load with the first
+              // radix/twiddle/shuffle stage, then use one fused global
+              // scatter kernel per remaining stage.
+              ktailSquareGF61LoadStageFusedApple(*out, *in, bufTrigH, 1u);
+              appleStageFinish();
+              Buffer<double> *current = out;
+              for (u32 stage = nH; stage < groupSize; stage *= nH) {
+                Buffer<double> *next = current == out ? in : out;
+                ktailSquareGF61StageFusedApple(*current, *next, bufTrigH, stage);
+                appleStageFinish();
+                current = next;
+              }
+              if (apple_bridge_fused_tailsquare_gf61) {
+                // Compose the forward final radix, exact R-pair-R operation
+                // and inverse f=1 stage into one private-register bridge.
+                Buffer<double> *next = current == out ? in : out;
+                ktailSquareGF61FinalPairFirstFusedApple(*current, *next, bufTrigH);
+                appleStageFinish();
+                current = next;
+                for (u32 stage = nH; stage < groupSize; stage *= nH) {
+                  next = current == out ? in : out;
+                  ktailSquareGF61StageFusedApple(*current, *next, bufTrigH, stage);
+                  appleStageFinish();
+                  current = next;
+                }
+              } else {
+                // Validated v0.3.54 path retained for differential testing and
+                // automatic fallback when the bridge kernel is unavailable.
+                ktailSquareGF61FftFinalApple(*current, *out);
+                appleStageFinish();
+                ktailSquareGF61PairCrossFusedApple(*out, *in, bufTrigH);
+                appleStageFinish();
+                current = in;
+                for (u32 stage = 1; stage < groupSize; stage *= nH) {
+                  Buffer<double> *next = current == out ? in : out;
+                  ktailSquareGF61StageFusedApple(*current, *next, bufTrigH, stage);
+                  appleStageFinish();
+                  current = next;
+                }
+              }
+              ktailSquareGF61FftFinalApple(*current, *out);
+              appleStageFinish();
+            } else {
+              // Conservative v0.3.53 path.  It remains available for
+              // differential validation with AEVUM_APPLE_TAILSQUARE_LEGACY=1.
+              ktailSquareGF61LoadScalarApple(*out, *in);
+              appleStageFinish();
+              auto runAppleTailGF61FftLegacy = [&]() {
+                Buffer<double> *current = out;
+                for (u32 stage = 1; stage < groupSize; stage *= nH) {
+                  ktailSquareGF61FftRadixApple(*current);
+                  appleStageFinish();
+                  ktailSquareGF61FftTwiddleApple(*current, bufTrigH, stage);
+                  appleStageFinish();
+                  Buffer<double> *next = current == out ? in : out;
+                  ktailSquareGF61FftShuffleApple(*current, *next, stage);
+                  appleStageFinish();
+                  current = next;
+                }
+                ktailSquareGF61FftFinalApple(*current, *out);
+                appleStageFinish();
+              };
+              runAppleTailGF61FftLegacy();
+              ktailSquareGF61ReverseCrossApple(*out, *in);
+              appleStageFinish();
+              ktailSquareGF61PairApple(*in, bufTrigH);
+              appleStageFinish();
+              ktailSquareGF61ReverseCrossApple(*in, *out);
+              appleStageFinish();
+              runAppleTailGF61FftLegacy();
+            }
+          } else {
+            ktailSquareGF61(*out, *in);
+          }
+#else
+          ktailSquareGF61(*out, *in);
+#endif
+        }
       }
 
       if (kern == KTAILMUL) {
@@ -1157,7 +1968,56 @@ void Gpu::replay(void) {
         Buffer<double> *out = in_place ? buf : &buf3;
         if (cache_group == 1) ktailMul(*out, *in1, *in2);
         if (cache_group == 2) ktailMulGF31(*out, *in1, *in2);
-        if (cache_group == 3) ktailMulGF61(*out, *in1, *in2);
+        if (cache_group == 3) {
+#if defined(__APPLE__)
+          if (fft.shape.fft_type == FFT3161) {
+            if (in_place || out == in1 || out == in2 || in1 == in2)
+              throw std::runtime_error("Apple staged GF61 tailMul requires three distinct transform buffers");
+            if (!(fft.NTT_GF31 && fft.NTT_GF61) || fft.FFT_FP32 || fft.FFT_FP64)
+              throw std::runtime_error("Apple staged GF61 tailMul expects the GF31/GF61 Aevum layout");
+            const u32 fullBase = GF31_DATA_SIZE(WIDTH, fft.shape.middle, SMALL_H, in_place, pad_size) / 2;
+            const u32 rawBase = 0;
+            Buffer<double>* raw = &bufAppleTailMulGF61;
+
+            auto runAppleTailMulGF61Fft = [&](Buffer<double>* start, u32 startBase,
+                                               Buffer<double>* alternate, u32 alternateBase,
+                                               Buffer<double>* final, u32 finalBase) {
+              Buffer<double>* current = start;
+              u32 currentBase = startBase;
+              Buffer<double>* next = alternate;
+              u32 nextBase = alternateBase;
+              const u32 groupSize = SMALL_H / nH;
+              for (u32 stage = 1; stage < groupSize; stage *= nH) {
+                ktailMulGF61FftRadixApple(*current, currentBase);
+                ktailMulGF61FftTwiddleApple(*current, currentBase, bufTrigH, stage);
+                ktailMulGF61FftShuffleApple(*current, currentBase, *next, nextBase, stage);
+                std::swap(current, next);
+                std::swap(currentBase, nextBase);
+              }
+              ktailMulGF61FftFinalApple(*current, currentBase, *final, finalBase);
+            };
+
+            // First operand: consumed temporary in1 -> final transformed data in out.
+            ktailMulGF61LoadScalarApple(*out, fullBase, *in1, fullBase);
+            runAppleTailMulGF61Fft(out, fullBase, in1, fullBase, out, fullBase);
+
+            // Preserved multiplicand: copy/transform through in1 and the GF61-only scratch.
+            ktailMulGF61LoadScalarApple(*in1, fullBase, *in2, fullBase);
+            runAppleTailMulGF61Fft(in1, fullBase, raw, rawBase, in1, fullBase);
+
+            // Scalar direct composition of the stock reverse/pairMul/reverse
+            // sequence.  Special self-paired lines and normal partner lines
+            // are separate pipelines, each keeping only four GF61 values.
+            ktailMulGF61PairSpecialScalarApple(*raw, rawBase, *out, fullBase, *in1, fullBase, bufTrigH);
+            ktailMulGF61PairNormalScalarApple(*raw, rawBase, *out, fullBase, *in1, fullBase, bufTrigH);
+            runAppleTailMulGF61Fft(raw, rawBase, in1, fullBase, out, fullBase);
+          } else {
+            ktailMulGF61(*out, *in1, *in2);
+          }
+#else
+          ktailMulGF61(*out, *in1, *in2);
+#endif
+        }
       }
 
       if (kern == KTAILMULLOW) {
@@ -1168,7 +2028,60 @@ void Gpu::replay(void) {
         Buffer<double> *out = in_place ? buf : &buf3;
         if (cache_group == 1) ktailMulLow(*out, *in1, *in2);
         if (cache_group == 2) ktailMulLowGF31(*out, *in1, *in2);
-        if (cache_group == 3) ktailMulLowGF61(*out, *in1, *in2);
+        if (cache_group == 3) {
+#if defined(__APPLE__)
+          if (fft.shape.fft_type == FFT3161) {
+            // `in2` is already in the exact fully height-transformed layout
+            // produced by fftHinGF61 during regPrepare.  Apple rejects only
+            // the stock monolithic MUL_LOW tail kernel, so transform the live
+            // operand with the same staged fft_HEIGHT used by generic
+            // tailMulGF61, pair it directly with the preserved prepared
+            // operand, then apply the unchanged staged output transform.
+            if (in_place || out == in1 || out == in2 || in1 == in2)
+              throw std::runtime_error("Apple staged GF61 tailMulLow requires three distinct transform buffers");
+            if (!(fft.NTT_GF31 && fft.NTT_GF61) || fft.FFT_FP32 || fft.FFT_FP64)
+              throw std::runtime_error("Apple staged GF61 tailMulLow expects the GF31/GF61 Aevum layout");
+            const u32 fullBase = GF31_DATA_SIZE(WIDTH, fft.shape.middle, SMALL_H, in_place, pad_size) / 2;
+            const u32 rawBase = 0;
+            Buffer<double>* raw = &bufAppleTailMulGF61;
+
+            auto runAppleTailMulLowGF61Fft = [&](Buffer<double>* start, u32 startBase,
+                                                  Buffer<double>* alternate, u32 alternateBase,
+                                                  Buffer<double>* final, u32 finalBase) {
+              Buffer<double>* current = start;
+              u32 currentBase = startBase;
+              Buffer<double>* next = alternate;
+              u32 nextBase = alternateBase;
+              const u32 groupSize = SMALL_H / nH;
+              for (u32 stage = 1; stage < groupSize; stage *= nH) {
+                ktailMulGF61FftRadixApple(*current, currentBase);
+                ktailMulGF61FftTwiddleApple(*current, currentBase, bufTrigH, stage);
+                ktailMulGF61FftShuffleApple(*current, currentBase, *next, nextBase, stage);
+                std::swap(current, next);
+                std::swap(currentBase, nextBase);
+              }
+              ktailMulGF61FftFinalApple(*current, currentBase, *final, finalBase);
+            };
+
+            // Live operand: fftMiddleIn layout -> fully height transformed.
+            ktailMulGF61LoadScalarApple(*out, fullBase, *in1, fullBase);
+            runAppleTailMulLowGF61Fft(out, fullBase, in1, fullBase, out, fullBase);
+
+            // Prepared operand `in2` is read-only and already in the stock
+            // MUL_LOW p/q layout.  Compose the exact reverse/pairMul/reverse
+            // coordinates directly into the GF61 scratch plane.
+            ktailMulGF61PairSpecialScalarApple(*raw, rawBase, *out, fullBase, *in2, fullBase, bufTrigH);
+            ktailMulGF61PairNormalScalarApple(*raw, rawBase, *out, fullBase, *in2, fullBase, bufTrigH);
+
+            // Exact stock fft_HEIGHT2 result back in the fused output layout.
+            runAppleTailMulLowGF61Fft(raw, rawBase, in1, fullBase, out, fullBase);
+          } else {
+            ktailMulLowGF61(*out, *in1, *in2);
+          }
+#else
+          ktailMulLowGF61(*out, *in1, *in2);
+#endif
+        }
       }
 
       if (kern == KMIDOUT) {
@@ -1178,7 +2091,21 @@ void Gpu::replay(void) {
         Buffer<double> *out = buf;
         if (cache_group == 1) kfftMidOut(*out, *in);
         if (cache_group == 2) kfftMidOutGF31(*out, *in);
-        if (cache_group == 3) kfftMidOutGF61(*out, *in);
+        if (cache_group == 3) {
+#if defined(__APPLE__)
+          if (fft.shape.fft_type == FFT3161) {
+            kfftMidOutGF61LoadScalarApple(bufAppleTailMulGF61, *in);
+            kfftMidOutGF61MulScalarApple(bufAppleTailMulGF61, bufTrigM);
+            kfftMidOutGF61FftApple(bufAppleTailMulGF61);
+            kfftMidOutGF61Mul2ScalarApple(bufAppleTailMulGF61, bufTrigM);
+            kfftMidOutGF61WriteScalarApple(*out, bufAppleTailMulGF61);
+          } else {
+            kfftMidOutGF61(*out, *in);
+          }
+#else
+          kfftMidOutGF61(*out, *in);
+#endif
+        }
       }
 
       if (kern == KFFTW) {
@@ -1186,7 +2113,68 @@ void Gpu::replay(void) {
         Buffer<double> *in = recorded_kernel_args[arg++];
         if (cache_group == 1) kfftW(*out, *in);
         if (cache_group == 2) kfftWGF31(*out, *in);
-        if (cache_group == 3) kfftWGF61(*out, *in);
+        if (cache_group == 3) {
+#if defined(__APPLE__)
+          if (fft.shape.fft_type == FFT3161) {
+            if (out == in) throw std::runtime_error("Apple staged GF61 fftW requires distinct input/output buffers");
+            Buffer<double>* current = out;
+            Buffer<double>* alternate = in;
+            const u32 width_workgroup = WIDTH / nW;
+            u32 firstStage = 1;
+            if (apple_fused_fftw_load_first) {
+              kfftWGF61LoadStage1FusedApple(*out, *in);
+              appleStageFinish();
+              current = out;
+              alternate = in;
+              firstStage = nW;
+            } else {
+              kfftWGF61LoadScalarApple(*out, *in);
+              appleStageFinish();
+            }
+            for (u32 stage = firstStage; stage < width_workgroup; stage *= nW) {
+              if (apple_fused_fftw_width) {
+                switch (stage) {
+                  case 1:   kfftWGF61WidthStageFused1Apple(*alternate, *current); break;
+                  case 4:   kfftWGF61WidthStageFused4Apple(*alternate, *current); break;
+                  case 8:   kfftWGF61WidthStageFused8Apple(*alternate, *current); break;
+                  case 16:  kfftWGF61WidthStageFused16Apple(*alternate, *current); break;
+                  case 64:  kfftWGF61WidthStageFused64Apple(*alternate, *current); break;
+                  case 256: kfftWGF61WidthStageFused256Apple(*alternate, *current); break;
+                  case 512: kfftWGF61WidthStageFused512Apple(*alternate, *current); break;
+                  default: throw std::runtime_error("Unsupported Apple fused GF61 fftW width stage " + std::to_string(stage));
+                }
+                appleStageFinish();
+              } else {
+                kfftWGF61WidthRadixApple(*current);
+                appleStageFinish();
+                switch (stage) {
+                  case 1:   kfftWGF61TwiddleShuffle1Apple(*alternate, *current); break;
+                  case 4:   kfftWGF61TwiddleShuffle4Apple(*alternate, *current); break;
+                  case 8:   kfftWGF61TwiddleShuffle8Apple(*alternate, *current); break;
+                  case 16:  kfftWGF61TwiddleShuffle16Apple(*alternate, *current); break;
+                  case 64:  kfftWGF61TwiddleShuffle64Apple(*alternate, *current); break;
+                  case 256: kfftWGF61TwiddleShuffle256Apple(*alternate, *current); break;
+                  case 512: kfftWGF61TwiddleShuffle512Apple(*alternate, *current); break;
+                  default: throw std::runtime_error("Unsupported Apple GF61 fftW width stage " + std::to_string(stage));
+                }
+                appleStageFinish();
+              }
+              std::swap(current, alternate);
+            }
+            if (current == out) {
+              kfftWGF61WidthRadixApple(*out);
+              appleStageFinish();
+            } else {
+              kfftWGF61WidthFinalApple(*out, *current);
+              appleStageFinish();
+            }
+          } else {
+            kfftWGF61(*out, *in);
+          }
+#else
+          kfftWGF61(*out, *in);
+#endif
+        }
       }
     }
   }
@@ -1204,7 +2192,132 @@ void Gpu::replay(void) {
 void Gpu::fftP(Buffer<double>& buf, Buffer<Word>& in) {
   // If not in place, instead write the output to the scratch buffer
   Buffer<double> *out = in_place ? &buf : &buf3;
+#if defined(__APPLE__)
+  if (fft.shape.fft_type == FFT3161) {
+    // Apple-only fully global fftP. The v0.3.48 trace showed that normal and
+    // serialized runs already diverged at fftP. GF31 was the last fftP plane
+    // still using LDS. Decompose both CRT planes into scalar weighting plus
+    // global radix/twiddle/permutation stages. Non-Apple dispatch remains the
+    // original monolithic kfftP call below.
+    Buffer<double>* alternate = (out == &buf3) ? &buf : &buf3;
+    const u32 width_workgroup = WIDTH / nW;
+
+    auto runGF31 = [&]() {
+      Buffer<double>* current = out;
+      Buffer<double>* next = alternate;
+      u32 firstStage = 1;
+      if (apple_fused_fftp_weight_first) {
+        kfftP31WeightStage1FusedApple(*alternate, in);
+        appleStageFinish();
+        current = alternate;
+        next = out;
+        firstStage = nW;
+      } else {
+        kfftP31WeightScalarApple(*out, in);
+        appleStageFinish();
+      }
+      for (u32 stage = firstStage; stage < width_workgroup; stage *= nW) {
+        if (apple_fused_fftp_width) {
+          switch (stage) {
+            case 1:   kfftP31WidthStageFused1Apple(*next, *current); break;
+            case 4:   kfftP31WidthStageFused4Apple(*next, *current); break;
+            case 8:   kfftP31WidthStageFused8Apple(*next, *current); break;
+            case 16:  kfftP31WidthStageFused16Apple(*next, *current); break;
+            case 64:  kfftP31WidthStageFused64Apple(*next, *current); break;
+            case 256: kfftP31WidthStageFused256Apple(*next, *current); break;
+            case 512: kfftP31WidthStageFused512Apple(*next, *current); break;
+            default: throw std::runtime_error("Unsupported Apple fused GF31 width stage " + std::to_string(stage));
+          }
+          appleStageFinish();
+        } else {
+          kfftP31WidthRadixApple(*current);
+          appleStageFinish();
+          switch (stage) {
+            case 1:   kfftP31TwiddleShuffle1Apple(*next, *current); break;
+            case 4:   kfftP31TwiddleShuffle4Apple(*next, *current); break;
+            case 8:   kfftP31TwiddleShuffle8Apple(*next, *current); break;
+            case 16:  kfftP31TwiddleShuffle16Apple(*next, *current); break;
+            case 64:  kfftP31TwiddleShuffle64Apple(*next, *current); break;
+            case 256: kfftP31TwiddleShuffle256Apple(*next, *current); break;
+            case 512: kfftP31TwiddleShuffle512Apple(*next, *current); break;
+            default: throw std::runtime_error("Unsupported Apple GF31 width stage " + std::to_string(stage));
+          }
+          appleStageFinish();
+        }
+        std::swap(current, next);
+      }
+      if (current == out) kfftP31WidthRadixApple(*out);
+      else kfftP31WidthFinalApple(*out, *current);
+      appleStageFinish();
+    };
+
+    auto runGF61 = [&]() {
+      Buffer<double>* current = out;
+      Buffer<double>* next = alternate;
+      u32 firstStage = 1;
+      if (apple_fused_fftp_weight_first) {
+        kfftP61WeightStage1FusedApple(*alternate, in);
+        appleStageFinish();
+        current = alternate;
+        next = out;
+        firstStage = nW;
+      } else {
+        kfftP61WeightScalarApple(*out, in);
+        appleStageFinish();
+      }
+      for (u32 stage = firstStage; stage < width_workgroup; stage *= nW) {
+        if (apple_fused_fftp_width) {
+          switch (stage) {
+            case 1:   kfftP61WidthStageFused1Apple(*next, *current); break;
+            case 4:   kfftP61WidthStageFused4Apple(*next, *current); break;
+            case 8:   kfftP61WidthStageFused8Apple(*next, *current); break;
+            case 16:  kfftP61WidthStageFused16Apple(*next, *current); break;
+            case 64:  kfftP61WidthStageFused64Apple(*next, *current); break;
+            case 256: kfftP61WidthStageFused256Apple(*next, *current); break;
+            case 512: kfftP61WidthStageFused512Apple(*next, *current); break;
+            default: throw std::runtime_error("Unsupported Apple fused GF61 width stage " + std::to_string(stage));
+          }
+          appleStageFinish();
+        } else {
+          kfftP61WidthRadixApple(*current);
+          appleStageFinish();
+          switch (stage) {
+            case 1:   kfftP61TwiddleShuffle1Apple(*next, *current); break;
+            case 4:   kfftP61TwiddleShuffle4Apple(*next, *current); break;
+            case 8:   kfftP61TwiddleShuffle8Apple(*next, *current); break;
+            case 16:  kfftP61TwiddleShuffle16Apple(*next, *current); break;
+            case 64:  kfftP61TwiddleShuffle64Apple(*next, *current); break;
+            case 256: kfftP61TwiddleShuffle256Apple(*next, *current); break;
+            case 512: kfftP61TwiddleShuffle512Apple(*next, *current); break;
+            default: throw std::runtime_error("Unsupported Apple GF61 width stage " + std::to_string(stage));
+          }
+          appleStageFinish();
+        }
+        std::swap(current, next);
+      }
+      if (current == out) kfftP61WidthRadixApple(*out);
+      else kfftP61WidthFinalApple(*out, *current);
+      appleStageFinish();
+    };
+
+    runGF31();
+    runGF61();
+    return;
+  }
+#endif
   kfftP(*out, in);
+}
+
+void Gpu::fftPCarryB(Buffer<double>& buf, Buffer<Word>& in) {
+#if defined(__APPLE__)
+  (void) buf; (void) in;
+  throw std::runtime_error("PFA carry bridge is disabled on Apple");
+#else
+  if (!fft.isPfa() || fft.shape.fft_type != FFT3161 || useLongCarry)
+    throw std::runtime_error("PFA carry bridge requires a short-carry FFT3161 PFA plan");
+  Buffer<double>* out = in_place ? &buf : &buf3;
+  kfftPCarryB(*out, in);
+#endif
 }
 
 void Gpu::fftMidIn(Buffer<double>& buf) {
@@ -1253,6 +2366,8 @@ void Gpu::fftW(Buffer<double>& out, Buffer<double>& in) {
   recorded_kernel_args.push_back(&in);
   // This kernel always ends the "bottom half".  Replay the recorded kernel calls.
   replay();
+  // PFA fftW now scatters directly into canonical carry order.  The former
+  // pfaUnpack full-memory pass is intentionally eliminated.
 }
 
 void Gpu::carryA(Buffer<Word>& out, Buffer<double>& in) {
@@ -1343,7 +2458,134 @@ vector<Buffer<double>> Gpu::makeTransformBufVector(u32 size) {
   return r;
 }
 
+
+#if defined(__APPLE__)
+void Gpu::appleStageFinish() {
+  if (apple_stage_finish) queue.finish();
+}
+#endif
+
+namespace {
+uint64_t aevumTraceHashBytes(const void* data, size_t bytes) {
+  const auto* p = static_cast<const unsigned char*>(data);
+  uint64_t h = 1469598103934665603ULL;
+  for (size_t i = 0; i < bytes; ++i) {
+    h ^= static_cast<uint64_t>(p[i]);
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
+}
+
+void Gpu::regDebugSquareTrace(Buffer<Word>& io, u64* trace, size_t trace_count) {
+  if (!trace || trace_count < 12) throw std::runtime_error("square trace requires 12 uint64 values");
+  std::fill(trace, trace + trace_count, 0);
+
+  const size_t gf31_doubles = fft.NTT_GF31 ? GF31_DATA_SIZE(WIDTH, fft.shape.middle, SMALL_H, in_place, pad_size) : 0;
+  const size_t gf61_doubles = fft.NTT_GF61 ? GF61_DATA_SIZE(WIDTH, fft.shape.middle, SMALL_H, in_place, pad_size) : 0;
+
+  auto hashTransform = [&](Buffer<double>& b, size_t slot) {
+    queue.finish();
+    auto values = b.read();
+    if (gf31_doubles) trace[slot] = aevumTraceHashBytes(values.data(), gf31_doubles * sizeof(double));
+    if (gf61_doubles) trace[slot + 1] = aevumTraceHashBytes(values.data() + gf31_doubles, gf61_doubles * sizeof(double));
+  };
+
+  fftP(buf1, io);
+  hashTransform(in_place ? buf1 : buf3, 0);
+
+  fftMidIn(buf1);
+  replay();
+  hashTransform(buf1, 2);
+
+  tailSquare(buf1);
+  replay();
+  hashTransform(in_place ? buf1 : buf3, 4);
+
+  fftMidOut(buf1);
+  replay();
+  hashTransform(buf1, 6);
+
+  fftW(buf3, buf1);
+  hashTransform(buf3, 8);
+
+  carryA(io, buf3);
+  carryB(io);
+  queue.finish();
+  auto words = io.read();
+  trace[10] = aevumTraceHashBytes(words.data(), words.size() * sizeof(Word));
+  trace[11] = words.empty() ? 0 : static_cast<uint64_t>(words[0]);
+}
+
 void Gpu::regSync() { queue.finish(); }
+
+double Gpu::regPrpRoe(bool begin) {
+  regSync();auto [a,b]=readROE();wantROE=begin?256:0;
+  if (!std::isfinite(a.max) || !std::isfinite(b.max)) return 1.0;
+  return std::max(a.max,b.max);
+}
+
+bool Gpu::regSupportsLeadCache() const {
+#if defined(__APPLE__)
+  // Keep the already validated Apple canonical-boundary path unchanged.
+  return false;
+#else
+  return !useLongCarry && (!fft.isPfa() ||
+         (fft.shape.fft_type == FFT3161 && fft.pfa_radix == 9));
+#endif
+}
+
+bool Gpu::regSupportsFusedLL() const {
+  return regSupportsLeadCache() && !fft.isPfa();
+}
+
+bool Gpu::regSupportsPreparedMulLead() const {
+#if defined(__APPLE__)
+  return false;
+#else
+  // The prepared-multiply bridge reuses the same short-carry LEAD_WIDTH
+  // representation as the validated square chain.  PFA has a different
+  // carry/gather bridge and is intentionally excluded until independently
+  // validated.
+  return !useLongCarry && !fft.isPfa();
+#endif
+}
+
+void Gpu::regSquareStep(Buffer<Word>& io, bool lead_in, bool lead_out, bool ll) {
+  if ((lead_in || lead_out) && !regSupportsLeadCache())
+    throw std::runtime_error("Aevum register lead cache requires a supported short-carry plan");
+  square(io, io,
+         lead_in ? LEAD_WIDTH : LEAD_NONE,
+         lead_out ? LEAD_WIDTH : LEAD_NONE,
+         false, ll, true);
+}
+
+void Gpu::regMulPreparedStep(Buffer<Word>& dst, Buffer<double>& prepared, bool lead_in, bool lead_out) {
+  if ((lead_in || lead_out) && !regSupportsPreparedMulLead())
+    throw std::runtime_error("Aevum prepared-multiply lead bridge requires a non-PFA short-carry plan");
+
+  // Canonical prepared multiplication is:
+  //   fftP -> fftMidIn -> tailMul -> fftMidOut -> fftW -> carryA -> carryB.
+  // When adjacent arithmetic already owns a LEAD_WIDTH transform, skip the
+  // input fftP.  When another arithmetic operation follows, replace the
+  // canonical fftW/carryA/carryB boundary by carryFused and retain WIDTH.
+  // This removes a complete global-memory round trip without changing the
+  // residue representation visible at API boundaries.
+  if (!lead_in) fftP(buf1, dst);
+  fftMidIn(buf1);
+  tailMul(buf1, prepared);
+  fftMidOut(buf1);
+
+  if (mulRoePos.empty() || mulRoePos.back() < roePos) mulRoePos.push_back(roePos);
+
+  if (lead_out) {
+    carryFused(buf1);
+  } else {
+    fftW(buf3, buf1);
+    carryA(dst, buf3);
+    carryB(dst);
+  }
+}
 
 void Gpu::regCopy(Buffer<Word>& dst, const Buffer<Word>& src) { dst << src; }
 
@@ -1355,7 +2597,19 @@ void Gpu::regAddWords(Buffer<Word>& dst, const Buffer<Word>& src) { regAdd(dst, 
 
 void Gpu::regSubWords(Buffer<Word>& dst, const Buffer<Word>& src) { regSub(dst, src); }
 
-void Gpu::regSetU32(Buffer<Word>& dst, u32 value) { dst.set(static_cast<Word>(value)); }
+void Gpu::regSetU32(Buffer<Word>& dst, u32 value) {
+#if defined(__APPLE__)
+  // The register representation is balanced-digit and transposed.  Writing a
+  // raw first device word is not equivalent to importing an integer (notably
+  // once the low digit overflows its signed range), and Apple OpenCL may also
+  // return stale data after clEnqueueFillBuffer on these large register
+  // buffers.  Reuse the canonical compact-word upload path instead.
+  writeIn(dst, makeWords(E, value));
+#else
+  // Preserve the upstream fast constant initialization on non-Apple builds.
+  dst.set(static_cast<Word>(value));
+#endif
+}
 
 void Gpu::regSubU32(Buffer<Word>& dst, u32 value) { regSubValue(dst, value); }
 
@@ -1366,38 +2620,64 @@ void Gpu::regSquare(Buffer<Word>& io, u32 factor) {
   square(io, io, LEAD_NONE, LEAD_NONE, false, false);
 }
 
-// n consecutive squarings of io (x := x^2, or x := x^2 - 2 when doLL).  When fused, the data
-// stays in the transform domain between squarings and the carryFused kernel replaces the
-// fftW + carryA + carryB + fftP sequence that a lone regSquare() needs, like squareLoop().
-void Gpu::regSquareLoop(Buffer<Word>& io, u64 n, bool doLL, bool fused) {
-  enum LEAD_TYPE leadIn = LEAD_NONE;
-  for (u64 k = 0; k < n; ++k) {
-    const enum LEAD_TYPE leadOut = (!fused || useLongCarry || k + 1 == n) ? LEAD_NONE : LEAD_WIDTH;
-    square(io, io, leadIn, leadOut, false, doLL);
-    leadIn = leadOut;
-  }
-}
-
 void Gpu::regPrepare(Buffer<Word>& src) {
+#if defined(__APPLE__)
+  // Preserve the exact FFT3161 arithmetic while avoiding the Apple-only
+  // staged generic tailMulGF61 path.  The prepared multiplicand is advanced
+  // one unchanged upstream step further (fftHin) and is then consumed by the
+  // existing MUL_LOW tail kernel.
   fftP(buf1, src);
   fftMidIn(buf1);
+  fftHin(buf2, buf1);
+#else
+  fftP(buf1, src);
+  fftMidIn(buf1);
+#endif
   replay();
 }
 
 void Gpu::regPrepare(Buffer<double>& prepared, Buffer<Word>& src) {
+#if defined(__APPLE__)
+  fftP(buf1, src);
+  fftMidIn(buf1);
+  fftHin(prepared, buf1);
+#else
   fftP(prepared, src);
   fftMidIn(prepared);
+#endif
   replay();
 }
 
 void Gpu::regMulPrepared(Buffer<Word>& dst, u32 factor) {
   if (factor != 1) throw std::runtime_error("regMulPrepared factor must be handled by EngineApi");
+#if defined(__APPLE__)
+  fftP(buf1, dst);
+  fftMidIn(buf1);
+  tailMulLow(buf1, buf2);
+  fftMidOut(buf1);
+  fftW(buf3, buf1);
+  if (mulRoePos.empty() || mulRoePos.back() < roePos) mulRoePos.push_back(roePos);
+  carryA(dst, buf3);
+  carryB(dst);
+#else
   mul(dst, buf1, buf2, false);
+#endif
 }
 
 void Gpu::regMulPrepared(Buffer<Word>& dst, Buffer<double>& prepared, u32 factor) {
   if (factor != 1) throw std::runtime_error("regMulPrepared factor must be handled by EngineApi");
+#if defined(__APPLE__)
+  fftP(buf1, dst);
+  fftMidIn(buf1);
+  tailMulLow(buf1, prepared);
+  fftMidOut(buf1);
+  fftW(buf3, buf1);
+  if (mulRoePos.empty() || mulRoePos.back() < roePos) mulRoePos.push_back(roePos);
+  carryA(dst, buf3);
+  carryB(dst);
+#else
   mul(dst, prepared, buf1, false);
+#endif
 }
 
 void Gpu::regMul(Buffer<Word>& dst, Buffer<Word>& src, u32 factor) {
@@ -1457,8 +2737,35 @@ RoeInfo Gpu::readCarryStats() {
 template<typename T>
 static bool isAllZero(vector<T> v) { return std::all_of(v.begin(), v.end(), [](T x) { return x == 0;}); }
 
-// Read from GPU, verifying the transfer with a sum, and retry on failure.
+// Read from GPU, verifying the transfer, and retry on failure.
 vector<Word> Gpu::readChecked(Buffer<Word>& buf) {
+#if defined(__APPLE__)
+  // Apple's legacy OpenCL implementation gives nondeterministic results for
+  // the highly contended 64-bit checksum assembled from global 32-bit atomics.
+  // Verify the transfer instead with two independently enqueued synchronous
+  // transpose/read operations and compare every word.  This is only used on
+  // infrequent host reads (save/check/residue), not in the arithmetic hot path.
+  for (int nRetry = 0; nRetry < 3; ++nRetry) {
+    queue.finish();
+    vector<Word> first = readOut(buf);
+    queue.finish();
+    vector<Word> second = readOut(buf);
+    if (first == second) {
+      if (isAllZero(first)) {
+        log("Read ZERO\n");
+        return {};
+      }
+      return first;
+    }
+
+    size_t mismatch = 0;
+    while (mismatch < first.size() && first[mismatch] == second[mismatch]) ++mismatch;
+    log("GPU double-read mismatch at word %zu: %016" PRIx64 " != %016" PRIx64 "\n",
+        mismatch, mismatch < first.size() ? u64(first[mismatch]) : 0,
+        mismatch < second.size() ? u64(second[mismatch]) : 0);
+  }
+  throw "GPU persistent double-read errors";
+#else
   for (int nRetry = 0; nRetry < 3; ++nRetry) {
     bufSumOut.zero();
     sum64(bufSumOut, N, buf);
@@ -1482,6 +2789,7 @@ vector<Word> Gpu::readChecked(Buffer<Word>& buf) {
     log("GPU read failed: %016" PRIx64 " (gpu) != %016" PRIx64 " (host)\n", gpuSum, hostSum);
   }
   throw "GPU persistent read errors";
+#endif
 }
 
 Words Gpu::readAndCompress(Buffer<Word>& buf)  { return compactBits(readChecked(buf), E); }
@@ -1499,7 +2807,8 @@ void Gpu::mul(Buffer<Word>& ioA, Buffer<double>& inB, Buffer<double>& tmp1, bool
   // Register the current ROE pos as multiplication (vs. a squaring)
   if (mulRoePos.empty() || mulRoePos.back() < roePos) { mulRoePos.push_back(roePos); }
 
-  if (mul3) { carryM(ioA, buf3); } else { carryA(ioA, buf3); }
+  Buffer<double>& carryInput = buf3;
+  if (mul3) { carryM(ioA, carryInput); } else { carryA(ioA, carryInput); }
   carryB(ioA);
 }
 
@@ -1697,9 +3006,11 @@ void Gpu::exponentiate(Buffer<Word>& bufInOut, u64 exp) {
   }
 }
 
-// does either carryFused() or the expanded version depending on useLongCarry
+// PFA still uses the canonical carry sequence, but fftW performs its
+// Good-Thomas scatter directly and no longer needs a separate unpack kernel.
+// The stock fused carry remains byte-for-byte selected when PFA is disabled.
 void Gpu::doCarry(Buffer<double>& in, Buffer<Word>& wordBuf) {
-  if (useLongCarry) {
+  if (useLongCarry || fft.isPfa()) {
     fftW(buf3, in);
     carryA(wordBuf, buf3);
     carryB(wordBuf);
@@ -1710,7 +3021,7 @@ void Gpu::doCarry(Buffer<double>& in, Buffer<Word>& wordBuf) {
 }
 
 // Use buf1 (and buf23 if not in place) to do a single squaring.
-void Gpu::square(Buffer<Word>& out, Buffer<Word>& in, enum LEAD_TYPE leadIn, enum LEAD_TYPE leadOut, bool doMul3, bool doLL) {
+void Gpu::square(Buffer<Word>& out, Buffer<Word>& in, enum LEAD_TYPE leadIn, enum LEAD_TYPE leadOut, bool doMul3, bool doLL, bool prp) {
   // leadOut = LEAD_MIDDLE is not supported (slower than LEAD_WIDTH)
   assert(leadOut != LEAD_MIDDLE);
   // LL does not do Mul3
@@ -1722,28 +3033,44 @@ void Gpu::square(Buffer<Word>& out, Buffer<Word>& in, enum LEAD_TYPE leadIn, enu
   // If leadIn is LEAD_MIDDLE, buf1 contains the input data, squaring starts at tailSquare
   // If leadOut is LEAD_WIDTH, then buf1 (or buf3 if not in place) will contain the output of carryFused -- to be used as input to the next squaring.
   if (leadIn == LEAD_NONE) fftP(buf1, in);
-  if (leadIn != LEAD_MIDDLE) fftMidIn(buf1);
-  tailSquare(buf1);
-  fftMidOut(buf1);
+  if (prp && prpMiddle1 && !doLL && !doMul3 && leadIn != LEAD_MIDDLE) {
+    // Input is the existing retained width transform in buf3.  The tail writes
+    // directly to carry's input layout in buf1; neither middle is materialized.
+    recorded_kernels.push_back(KPRPMIDDLE1);
+    recorded_kernel_args.push_back(&buf1);
+  } else {
+    if (leadIn != LEAD_MIDDLE) fftMidIn(buf1);
+    tailSquare(buf1);
+    fftMidOut(buf1);
+  }
 
   // If leadOut is not allowed then we cannot use the faster carryFused kernel
   if (leadOut == LEAD_NONE) {
     fftW(buf3, buf1);
+    Buffer<double>& carryInput = buf3;
     if (!doLL && !doMul3) {
-      carryA(out, buf3);
+      carryA(out, carryInput);
     } else if (doLL) {
-      carryLL(out, buf3);
+      carryLL(out, carryInput);
     } else {
-      carryM(out, buf3);
+      carryM(out, carryInput);
     }
     carryB(out);
   }
 
-  // Use CarryFused
+  // Retain LEAD_WIDTH.  Power-of-two plans use the stock carryFused kernel.
+  // Native PFA cannot use that canonical-order stairway directly; instead,
+  // fftW+carryA produces provisional canonical words and fftPCarryB applies
+  // carryB while gathering those words into the next PFA width transform.
   else {
     assert(!useLongCarry);
     assert(!doMul3);
-    if (doLL) {
+    if (fft.isPfa()) {
+      assert(!doLL);
+      fftW(buf3, buf1);
+      carryA(out, buf3);
+      fftPCarryB(buf1, out);
+    } else if (doLL) {
       carryFusedLL(buf1);
     } else {
       carryFused(buf1);
@@ -1755,7 +3082,7 @@ u32 Gpu::squareLoop(Buffer<Word>& out, Buffer<Word>& in, u64 from, u64 to, bool 
   assert(from < to);
   enum LEAD_TYPE leadIn = LEAD_NONE;
   for (u64 k = from; k < to; ++k) {
-    enum LEAD_TYPE leadOut = useLongCarry || (k == to - 1) ? LEAD_NONE : LEAD_WIDTH;
+    enum LEAD_TYPE leadOut = fft.isPfa() || useLongCarry || (k == to - 1) ? LEAD_NONE : LEAD_WIDTH;
     square(out, (k==from) ? in : out, leadIn, leadOut, doTailMul3 && (k == to - 1));
     leadIn = leadOut;
   }
@@ -2588,4 +3915,17 @@ void Gpu::clear(bool isPRP) {
 Saver<PRPState> *Gpu::getSaver() {
   if (!saver) { saver = make_unique<Saver<PRPState>>(E, args.blockSize, args.nSavefiles); }
   return saver.get();
+}
+
+void Gpu::regProfileReport(bool emit) {
+  // Profile-only drain: auxiliary events otherwise remain uncollected until destruction.
+  if (args.profile) for (auto& q : auxQueues) {
+    ::finish(q.get());
+    q.collectProfileEvents();
+  }
+  if (emit) for (const TimeInfo* p : profile.get()) {
+    log("AEVUM_PROFILE name=%s calls=%u exec_ns=%lld\n", p->name.c_str(), p->n,
+        static_cast<long long>(p->times[2]));
+  }
+  profile.reset();
 }

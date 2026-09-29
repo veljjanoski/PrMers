@@ -284,15 +284,25 @@ ProofMarin ProofSetMarin::computeProof() const {
       std::cerr << "Warning: expected bufIndex=1, got " << bufIndex << std::endl;
     }
     
-    // convertFromGMP(0) returns one zero word, so test the value itself.
     if (bufferPool[0] == 0) {
-      throw std::runtime_error("Read ZERO during proof generation at level " + std::to_string(p));
+      throw std::runtime_error(
+          "Read ZERO during proof generation at level " +
+          std::to_string(p));
     }
 
-    // Convert the final result to words format, ceil(E/32) words like the residues of the proof file
+    // Canonical proof residue: exactly ceil(E/32) little-endian words.
     auto levelResult = util::convertFromGMP(bufferPool[0]);
-    levelResult.resize((static_cast<size_t>(E) + 31) / 32, 0u);
+    const size_t expectedWords =
+        (static_cast<size_t>(E) + 31u) / 32u;
 
+    if (levelResult.size() > expectedWords) {
+      throw std::runtime_error(
+          "Proof residue exceeds exponent width at level " +
+          std::to_string(p));
+    }
+
+    levelResult.resize(expectedWords, 0u);
+    
     // Store the result as middle for this level
     middles.push_back(levelResult);
     
@@ -394,9 +404,9 @@ ProofMarin ProofSetMarin::computeProof(const engine& eng) const {
       throw std::runtime_error("Read ZERO during proof generation at level " + std::to_string(p));
     }
 
-    // ceil(E/32) words, as computeProof() stores them.
+    // Canonical proof residue: exactly ceil(E/32) little-endian words, as in computeProof().
     auto levelResult = util::convertFromGMP(mpz_class(z));
-    levelResult.resize((static_cast<size_t>(E) + 31) / 32, 0u);
+    levelResult.resize((static_cast<size_t>(E) + 31u) / 32u, 0u);
 
     middles.push_back(levelResult);
 
