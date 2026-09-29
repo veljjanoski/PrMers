@@ -130,6 +130,13 @@ test-square-loop-gpu: engine-lib
 	$(CXX) -O2 -std=c++20 tests/engine_square_loop_gpu_test.cpp $(LOADER_LIBS) -lgmp -o build-tests/aevum-engine-square-loop-gpu-test
 	build-tests/aevum-engine-square-loop-gpu-test build-engine/libaevum_engine.so $${AEVUM_TEST_DEVICE:-0} . $${AEVUM_TEST_EXPONENTS:-}
 
+# Times the FFT3161 shapes and kernel settings for an exponent (see tests/run_aevum_tune.sh at the top level).
+.PHONY: tune-gpu
+tune-gpu: engine-lib
+	@mkdir -p build-tests
+	$(CXX) -O2 -std=c++20 tests/engine_tune_gpu.cpp $(LOADER_LIBS) -lgmp -o build-tests/aevum-engine-tune-gpu
+	build-tests/aevum-engine-tune-gpu build-engine/libaevum_engine.so $${AEVUM_TEST_DEVICE:-0} . $${AEVUM_TUNE_EXPONENT:-136279841} $${AEVUM_TUNE_MODE:-full}
+
 clean:
 	rm -rf build-debug build-release build-cuda build-engine build-tests build-examples
 

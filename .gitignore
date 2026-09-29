@@ -38,6 +38,7 @@ lastcurve.gp
 /package
 /tests/build-*/
 /tests/gpu-speedup-check/
+/tests/aevum-tune/
 .aevum-*/
 /.vscode
 prmers.log
