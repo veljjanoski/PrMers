@@ -284,13 +284,15 @@ ProofMarin ProofSetMarin::computeProof() const {
       std::cerr << "Warning: expected bufIndex=1, got " << bufIndex << std::endl;
     }
     
-    // Convert the final result to words format
-    auto levelResult = util::convertFromGMP(bufferPool[0]);
-    
-    if (levelResult.empty()) {
+    // convertFromGMP(0) returns one zero word, so test the value itself.
+    if (bufferPool[0] == 0) {
       throw std::runtime_error("Read ZERO during proof generation at level " + std::to_string(p));
     }
-    
+
+    // Convert the final result to words format, ceil(E/32) words like the residues of the proof file
+    auto levelResult = util::convertFromGMP(bufferPool[0]);
+    levelResult.resize((static_cast<size_t>(E) + 31) / 32, 0u);
+
     // Store the result as middle for this level
     middles.push_back(levelResult);
     
@@ -387,12 +389,14 @@ ProofMarin ProofSetMarin::computeProof(const engine& eng) const {
 
     eng.get_mpz(z, STACK);
     mpz_mod(z, z, Mp);
-    auto levelResult = util::convertFromGMP(mpz_class(z));
-
-    if (levelResult.empty()) {
+    if (mpz_sgn(z) == 0) {
       mpz_clears(z, Mp, nullptr);
       throw std::runtime_error("Read ZERO during proof generation at level " + std::to_string(p));
     }
+
+    // ceil(E/32) words, as computeProof() stores them.
+    auto levelResult = util::convertFromGMP(mpz_class(z));
+    levelResult.resize((static_cast<size_t>(E) + 31) / 32, 0u);
 
     middles.push_back(levelResult);
 

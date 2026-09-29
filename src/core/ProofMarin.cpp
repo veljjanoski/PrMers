@@ -21,6 +21,7 @@
  */
 #include "core/ProofMarin.hpp"
 #include "io/Sha3Hash.h"
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -198,22 +199,37 @@ ProofMarin ProofMarin::load(const std::filesystem::path& filePath) {
   return ProofMarin(exponent, std::move(B), std::move(middles), std::move(factors));
 }
 
+namespace {
+// A residue is hashed as its first (E - 1) / 8 + 1 little-endian bytes. A residue converted from
+// GMP has no leading zero words, so a shorter vector is zero-padded here: reading past its end
+// made the prover's hash differ from the verifier's, which reads the zero-padded proof file.
+const uint32_t* hashableWords(uint32_t E, const std::vector<uint32_t>& words, std::vector<uint32_t>& padded) {
+  const size_t nWords = (static_cast<size_t>(E) + 31) / 32;
+  if (words.size() >= nWords) return words.data();
+  padded.assign(nWords, 0);
+  std::copy(words.begin(), words.end(), padded.begin());
+  return padded.data();
+}
+}  // namespace
+
 // Hash functions for ProofMarin generation
 std::array<uint64_t, 4> ProofMarin::hashWords(uint32_t E, const std::vector<uint32_t>& words) {
   // Hash the words data
   io::SHA3 hasher;
   uint32_t nBytes = (E - 1) / 8 + 1;
-  return std::move(hasher.update(words.data(), nBytes)).finish();
+  std::vector<uint32_t> padded;
+  return std::move(hasher.update(hashableWords(E, words, padded), nBytes)).finish();
 }
 
-std::array<uint64_t, 4> ProofMarin::hashWords(uint32_t E, 
+std::array<uint64_t, 4> ProofMarin::hashWords(uint32_t E,
                                          const std::array<uint64_t, 4>& prefix,
                                          const std::vector<uint32_t>& words) {
   // Hash the prefix first, then the words data
   io::SHA3 hasher;
   uint32_t nBytes = (E - 1) / 8 + 1;
   hasher.update(prefix.data(), static_cast<uint32_t>(prefix.size()) * sizeof(uint64_t));
-  return std::move(hasher.update(words.data(), nBytes)).finish();
+  std::vector<uint32_t> padded;
+  return std::move(hasher.update(hashableWords(E, words, padded), nBytes)).finish();
 }
 
 uint64_t ProofMarin::res64(const std::vector<uint32_t>& words) {
