@@ -25,6 +25,12 @@ DL_LIBS =
 ENGINE_LINK_FLAGS = -dynamiclib
 EXAMPLE_RPATH = -Wl,-rpath,@loader_path/../$(ENGINE_BIN)
 endif
+# Programs that load the engine with dlopen() need DL_LIBS, except on Windows where
+# LoadLibrary is used and MinGW has no libdl. The engine library itself never calls dlopen.
+LOADER_LIBS = $(DL_LIBS)
+ifneq ($(findstring _NT,$(HOST_OS)),)
+LOADER_LIBS =
+endif
 
 ifeq ($(CUDA), 1)
  BIN=build-cuda
@@ -92,7 +98,7 @@ ENGINE_LIB = $(ENGINE_BIN)/libaevum_engine.so
 engine-lib: $(ENGINE_LIB)
 
 $(ENGINE_LIB): $(ENGINE_OBJS)
-	$(CXX) $(ENGINE_LINK_FLAGS) -o $@ $^ $(LIBPATH) $(OPENCL_LIBS) $(DL_LIBS)
+	$(CXX) $(ENGINE_LINK_FLAGS) -o $@ $^ $(LIBPATH) $(OPENCL_LIBS)
 
 $(ENGINE_BIN)/%.o: src/%.cpp
 	@mkdir -p $(dir $@) $(ENGINE_DEPDIR)
@@ -121,7 +127,7 @@ test-small-factor-gpu: engine-lib
 .PHONY: test-square-loop-gpu
 test-square-loop-gpu: engine-lib
 	@mkdir -p build-tests
-	$(CXX) -O2 -std=c++20 tests/engine_square_loop_gpu_test.cpp $(DL_LIBS) -lgmp -o build-tests/aevum-engine-square-loop-gpu-test
+	$(CXX) -O2 -std=c++20 tests/engine_square_loop_gpu_test.cpp $(LOADER_LIBS) -lgmp -o build-tests/aevum-engine-square-loop-gpu-test
 	build-tests/aevum-engine-square-loop-gpu-test build-engine/libaevum_engine.so $${AEVUM_TEST_DEVICE:-0} . $${AEVUM_TEST_EXPONENTS:-}
 
 clean:

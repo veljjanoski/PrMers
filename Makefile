@@ -25,7 +25,11 @@ ifeq ($(UNAME_S),Darwin)
   CPPFLAGS += -I/System/Library/Frameworks/OpenCL.framework/Headers
   LDFLAGS  += -framework OpenCL
 else
-  LDFLAGS  += -lOpenCL -ldl
+  LDFLAGS  += -lOpenCL
+  # dlopen() of the Aevum engine; Windows uses LoadLibrary and MinGW has no libdl.
+  ifneq ($(shell case $(UNAME_S) in (*_NT*) echo 1;; esac),1)
+    LDFLAGS  += -ldl
+  endif
 endif
 
 ifeq ($(shell case $(UNAME_S) in (*_NT*) echo 1;; esac),1)
