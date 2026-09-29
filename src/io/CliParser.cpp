@@ -104,6 +104,7 @@ void printUsage(const char* progName) {
     std::cout << "  -b2start <value>     : (Optional) Stage 2 lower bound/start for split ranges. With -pm1-s2-resume2reg, -b1 remains the Stage-1 resume bound and primes in (-b2start,-b2] are tested" << std::endl;
     std::cout << "  -nogcd-stage1        : (Optional) skip the ordinary P-1 Stage 1 GCD after writing PM1 resume/checkpoint; useful before Stage 2" << std::endl;
     std::cout << "  -checklevel <value>  : (Optional) Will force gerbicz check every B*<value> by default check is done every 10 min and at the end." << std::endl;
+    std::cout << "  -glblock <B>         : (Optional) Gerbicz-Li block size B for a new PRP test (default 1000, at most sqrt(p))" << std::endl;
     std::cout << "  -wagstaff            : (Optional) will check PRP if (2^p + 1)/3 is probably prime" << std::endl;
     std::cout << "  -ecm -b1 <B1> [-b2 <B2>] -K <curves> : Run ECM factoring with bounds B1 [and optional B2], on given number of curves" << std::endl;
     
@@ -458,6 +459,9 @@ CliOptions CliParser::parse(int argc, char** argv ) {
         }
         else if (std::strcmp(argv[i], "-checklevel") == 0 && i + 1 < argc) {
             opts.checklevel = to_u64(argv[++i]);
+        }
+        else if (std::strcmp(argv[i], "-glblock") == 0 && i + 1 < argc) {
+            opts.gl_block = to_u64(argv[++i]);
         }
         else if (std::strcmp(argv[i], "-chunk256") == 0 && i + 1 < argc) {
             opts.chunk256 = to_u64(argv[++i]);
