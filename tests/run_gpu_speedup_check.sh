@@ -11,7 +11,8 @@
 #   PRMERS_CHECK_SECONDS=<s>    seconds per speed run (default 90)
 #   PRMERS_CHECK_QUICK=1        skip the full PRP of M6972593 and LL of M3021377
 #
-# Build first with ./build_with_aevum_engine.sh. Writes summary.txt and one log per step.
+# Build first with make (the default target builds the Aevum engine and prmers). Writes summary.txt
+# and one log per step.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -22,7 +23,7 @@ SECONDS_PER_RUN="${PRMERS_CHECK_SECONDS:-90}"
 PRMERS="$ROOT/prmers"
 
 if [[ ! -x "$PRMERS" ]]; then
-    echo "prmers is not built: run ./build_with_aevum_engine.sh first" >&2
+    echo "prmers is not built: run make first" >&2
     exit 2
 fi
 
