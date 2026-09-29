@@ -313,7 +313,16 @@ FFTConfig FFTConfig::bestFit(const Args& args, u64 E, const string& spec) {
 
   // The standard GPUOwl tune file contains FP64 shapes, including non-power-of-two
   // middle dimensions.  Aevum is NTT-only, so select directly from FFT3161 shapes.
-  for (const FFTShape& shape : FFTShape::allShapes()) {
+  // Within a size, width = height = 512 comes first: it is the reference wavefront NTT of Aevum's
+  // tuner, and on an RTX 3090 the 4M shape 512:8:512 ran 9% faster than 1K:8:256 and faster than
+  // every other 4M shape.
+  vector<FFTShape> shapes = FFTShape::allShapes();
+  auto square512 = [](const FFTShape& s) { return s.width == 512 && s.height == 512 && s.middle >= 4; };
+  std::stable_sort(shapes.begin(), shapes.end(), [&](const FFTShape& a, const FFTShape& b) {
+    if (a.size() != b.size()) { return a.size() < b.size(); }
+    return square512(a) && !square512(b);
+  });
+  for (const FFTShape& shape : shapes) {
     if (shape.fft_type != FFT3161) continue;
     for (u32 v : {101, 202}) {
       FFTConfig fft{shape, v, CARRY_AUTO};
