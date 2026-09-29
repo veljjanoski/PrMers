@@ -576,7 +576,7 @@ KERNEL(G_W * WMUL) carryFused(P(GF31) out, CP(GF31) in, u32 posROE, P(i64) carry
   // Weight is 2^[ceil(qj / n) - qj/n] where j is the word index, q is the Mersenne exponent, and n is the number of words.
   // Weights can be applied with shifts because 2 is the 60th root GF31.
   // Let s be the shift amount for word 1.  The shift amount for word x is ceil(x * (s - 1) + num_big_words_less_than_x) % 31.
-  const u32 log2_root_two = (u32) (((1ULL << 30) / NWORDS) % 31);
+  const u32 log2_root_two = LOG2_ROOT_TWO31;
   const u32 bigword_weight_shift = (NWORDS - EXP % NWORDS) * log2_root_two % 31;
   const u32 bigword_weight_shift_minus1 = (bigword_weight_shift + 30) % 31;
 
@@ -798,7 +798,7 @@ KERNEL(G_W * WMUL) carryFused(P(GF61) out, CP(GF61) in, u32 posROE, P(i64) carry
   // Weight is 2^[ceil(qj / n) - qj/n] where j is the word index, q is the Mersenne exponent, and n is the number of words.
   // Weights can be applied with shifts because 2 is the 60th root GF61.
   // Let s be the shift amount for word 1.  The shift amount for word x is ceil(x * (s - 1) + num_big_words_less_than_x) % 61.
-  const u32 log2_root_two = (u32) (((1ULL << 60) / NWORDS) % 61);
+  const u32 log2_root_two = LOG2_ROOT_TWO61;
   const u32 bigword_weight_shift = (NWORDS - EXP % NWORDS) * log2_root_two % 61;
   const u32 bigword_weight_shift_minus1 = (bigword_weight_shift + 60) % 61;
 
@@ -1033,7 +1033,7 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
 
   // Weight is 2^[ceil(qj / n) - qj/n] where j is the word index, q is the Mersenne exponent, and n is the number of words.
   // Let s be the shift amount for word 1.  The shift amount for word x is ceil(x * (s - 1) + num_big_words_less_than_x) % 31.
-  const u32 log2_root_two = (u32) (((1ULL << 30) / NWORDS) % 31);
+  const u32 log2_root_two = LOG2_ROOT_TWO31;
   const u32 bigword_weight_shift = (NWORDS - EXP % NWORDS) * log2_root_two % 31;
   const u32 bigword_weight_shift_minus1 = (bigword_weight_shift + 30) % 31;
 
@@ -1297,7 +1297,7 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
 
   // Weight is 2^[ceil(qj / n) - qj/n] where j is the word index, q is the Mersenne exponent, and n is the number of words.
   // Let s be the shift amount for word 1.  The shift amount for word x is ceil(x * (s - 1) + num_big_words_less_than_x) % 31.
-  const u32 log2_root_two = (u32) (((1ULL << 30) / NWORDS) % 31);
+  const u32 log2_root_two = LOG2_ROOT_TWO31;
   const u32 bigword_weight_shift = (NWORDS - EXP % NWORDS) * log2_root_two % 31;
   const u32 bigword_weight_shift_minus1 = (bigword_weight_shift + 30) % 31;
 
@@ -1556,7 +1556,7 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
 
   // Weight is 2^[ceil(qj / n) - qj/n] where j is the word index, q is the Mersenne exponent, and n is the number of words.
   // Let s be the shift amount for word 1.  The shift amount for word x is ceil(x * (s - 1) + num_big_words_less_than_x) % 61.
-  const u32 log2_root_two = (u32) (((1ULL << 60) / NWORDS) % 61);
+  const u32 log2_root_two = LOG2_ROOT_TWO61;
   const u32 bigword_weight_shift = (NWORDS - EXP % NWORDS) * log2_root_two % 61;
   const u32 bigword_weight_shift_minus1 = (bigword_weight_shift + 60) % 61;
 
@@ -1797,10 +1797,10 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
 
   // Weight is 2^[ceil(qj / n) - qj/n] where j is the word index, q is the Mersenne exponent, and n is the number of words.
   // Let s be the shift amount for word 1.  The shift amount for word x is ceil(x * (s - 1) + num_big_words_less_than_x) % 31.
-  const u32 m31_log2_root_two = (u32) (((1ULL << 30) / NWORDS) % 31);
+  const u32 m31_log2_root_two = LOG2_ROOT_TWO31;
   const u32 m31_bigword_weight_shift = (NWORDS - EXP % NWORDS) * m31_log2_root_two % 31;
   const u32 m31_bigword_weight_shift_minus1 = (m31_bigword_weight_shift + 30) % 31;
-  const u32 m61_log2_root_two = (u32) (((1ULL << 60) / NWORDS) % 61);
+  const u32 m61_log2_root_two = LOG2_ROOT_TWO61;
   const u32 m61_bigword_weight_shift = (NWORDS - EXP % NWORDS) * m61_log2_root_two % 61;
   const u32 m61_bigword_weight_shift_minus1 = (m61_bigword_weight_shift + 60) % 61;
 
@@ -2082,10 +2082,10 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
 
   // Weight is 2^[ceil(qj / n) - qj/n] where j is the word index, q is the Mersenne exponent, and n is the number of words.
   // Let s be the shift amount for word 1.  The shift amount for word x is ceil(x * (s - 1) + num_big_words_less_than_x) % 31.
-  const u32 m31_log2_root_two = (u32) (((1ULL << 30) / NWORDS) % 31);
+  const u32 m31_log2_root_two = LOG2_ROOT_TWO31;
   const u32 m31_bigword_weight_shift = (NWORDS - EXP % NWORDS) * m31_log2_root_two % 31;
   const u32 m31_bigword_weight_shift_minus1 = (m31_bigword_weight_shift + 30) % 31;
-  const u32 m61_log2_root_two = (u32) (((1ULL << 60) / NWORDS) % 61);
+  const u32 m61_log2_root_two = LOG2_ROOT_TWO61;
   const u32 m61_bigword_weight_shift = (NWORDS - EXP % NWORDS) * m61_log2_root_two % 61;
   const u32 m61_bigword_weight_shift_minus1 = (m61_bigword_weight_shift + 60) % 61;
 

@@ -208,6 +208,14 @@ G_H        "group height" == SMALL_HEIGHT / NH
 #define NWORDS (ND * 2u)
 #define NWORDS_IS_POWER_OF_TWO  !(NWORDS & (NWORDS - 1))
 
+// log2 of an NWORDS-th root of two for the NTT weights: NWORDS^-1 mod 31 (resp. 61), set by the host.
+#if NTT_GF31 && !defined(LOG2_ROOT_TWO31)
+#error LOG2_ROOT_TWO31 is not defined
+#endif
+#if NTT_GF61 && !defined(LOG2_ROOT_TWO61)
+#error LOG2_ROOT_TWO61 is not defined
+#endif
+
 #if (NW != 4 && NW != 8) || (NH != 4 && NH != 8)
 #error NW and NH must be passed in, expected value 4 or 8.
 #endif

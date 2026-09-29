@@ -92,7 +92,7 @@ KERNEL(G_W) fftP(P(GF31) out, CP(Word2) in, TrigGF31 smallTrig) {
   u32 word_index = (me * BIG_HEIGHT + g) * 2;
 
   // Weight is 2^[ceil(qj / n) - qj/n] where j is the word index, q is the Mersenne exponent, and n is the number of words.
-  const u32 log2_root_two = (u32) (((1ULL << 30) / NWORDS) % 31);
+  const u32 log2_root_two = LOG2_ROOT_TWO31;
   const u32 bigword_weight_shift = (NWORDS - EXP % NWORDS) * log2_root_two % 31;
   const u32 bigword_weight_shift_minus1 = (bigword_weight_shift + 30) % 31;
 
@@ -149,7 +149,7 @@ KERNEL(G_W) fftP(P(GF61) out, CP(Word2) in, TrigGF61 smallTrig) {
   // Weight is 2^[ceil(qj / n) - qj/n] where j is the word index, q is the Mersenne exponent, and n is the number of words.
   // Weights can be applied with shifts because 2 is the 60th root GF61.
   // Let s be the shift amount for word 1.  The shift amount for word x is ceil(x * (s - 1) + num_big_words_less_than_x) % 61.
-  const u32 log2_root_two = (u32) (((1ULL << 60) / NWORDS) % 61);
+  const u32 log2_root_two = LOG2_ROOT_TWO61;
   const u32 bigword_weight_shift = (NWORDS - EXP % NWORDS) * log2_root_two % 61;
   const u32 bigword_weight_shift_minus1 = (bigword_weight_shift + 60) % 61;
 
@@ -212,7 +212,7 @@ KERNEL(G_W) fftP(P(T2) out, CP(Word2) in, Trig smallTrig, BigTab THREAD_WEIGHTS)
 
   // Weight is 2^[ceil(qj / n) - qj/n] where j is the word index, q is the Mersenne exponent, and n is the number of words.
   // Let s be the shift amount for word 1.  The shift amount for word x is ceil(x * (s - 1) + num_big_words_less_than_x) % 31.
-  const u32 log2_root_two = (u32) (((1ULL << 30) / NWORDS) % 31);
+  const u32 log2_root_two = LOG2_ROOT_TWO31;
   const u32 bigword_weight_shift = (NWORDS - EXP % NWORDS) * log2_root_two % 31;
   const u32 bigword_weight_shift_minus1 = (bigword_weight_shift + 30) % 31;
 
@@ -285,7 +285,7 @@ KERNEL(G_W) fftP(P(T2) out, CP(Word2) in, Trig smallTrig, BigTabFP32 THREAD_WEIG
 
   // Weight is 2^[ceil(qj / n) - qj/n] where j is the word index, q is the Mersenne exponent, and n is the number of words.
   // Let s be the shift amount for word 1.  The shift amount for word x is ceil(x * (s - 1) + num_big_words_less_than_x) % 31.
-  const u32 log2_root_two = (u32) (((1ULL << 30) / NWORDS) % 31);
+  const u32 log2_root_two = LOG2_ROOT_TWO31;
   const u32 bigword_weight_shift = (NWORDS - EXP % NWORDS) * log2_root_two % 31;
   const u32 bigword_weight_shift_minus1 = (bigword_weight_shift + 30) % 31;
 
@@ -359,7 +359,7 @@ KERNEL(G_W) fftP(P(T2) out, CP(Word2) in, Trig smallTrig, BigTabFP32 THREAD_WEIG
 
   // Weight is 2^[ceil(qj / n) - qj/n] where j is the word index, q is the Mersenne exponent, and n is the number of words.
   // Let s be the shift amount for word 1.  The shift amount for word x is ceil(x * (s - 1) + num_big_words_less_than_x) % 61.
-  const u32 log2_root_two = (u32) (((1ULL << 60) / NWORDS) % 61);
+  const u32 log2_root_two = LOG2_ROOT_TWO61;
   const u32 bigword_weight_shift = (NWORDS - EXP % NWORDS) * log2_root_two % 61;
   const u32 bigword_weight_shift_minus1 = (bigword_weight_shift + 60) % 61;
 
@@ -428,10 +428,10 @@ KERNEL(G_W) fftP(P(T2) out, CP(Word2) in, Trig smallTrig) {
   // Weight is 2^[ceil(qj / n) - qj/n] where j is the word index, q is the Mersenne exponent, and n is the number of words.
   // Weights can be applied with shifts because 2 is the 60th root GF61.
   // Let s be the shift amount for word 1.  The shift amount for word x is ceil(x * (s - 1) + num_big_words_less_than_x) % 61.
-  const u32 m31_log2_root_two = (u32) (((1ULL << 30) / NWORDS) % 31);
+  const u32 m31_log2_root_two = LOG2_ROOT_TWO31;
   const u32 m31_bigword_weight_shift = (NWORDS - EXP % NWORDS) * m31_log2_root_two % 31;
   const u32 m31_bigword_weight_shift_minus1 = (m31_bigword_weight_shift + 30) % 31;
-  const u32 m61_log2_root_two = (u32) (((1ULL << 60) / NWORDS) % 61);
+  const u32 m61_log2_root_two = LOG2_ROOT_TWO61;
   const u32 m61_bigword_weight_shift = (NWORDS - EXP % NWORDS) * m61_log2_root_two % 61;
   const u32 m61_bigword_weight_shift_minus1 = (m61_bigword_weight_shift + 60) % 61;
 
@@ -520,10 +520,10 @@ KERNEL(G_W) fftP(P(T2) out, CP(Word2) in, Trig smallTrig, BigTabFP32 THREAD_WEIG
   // Weight is 2^[ceil(qj / n) - qj/n] where j is the word index, q is the Mersenne exponent, and n is the number of words.
   // Weights can be applied with shifts because 2 is the 60th root GF61.
   // Let s be the shift amount for word 1.  The shift amount for word x is ceil(x * (s - 1) + num_big_words_less_than_x) % 61.
-  const u32 m31_log2_root_two = (u32) (((1ULL << 30) / NWORDS) % 31);
+  const u32 m31_log2_root_two = LOG2_ROOT_TWO31;
   const u32 m31_bigword_weight_shift = (NWORDS - EXP % NWORDS) * m31_log2_root_two % 31;
   const u32 m31_bigword_weight_shift_minus1 = (m31_bigword_weight_shift + 30) % 31;
-  const u32 m61_log2_root_two = (u32) (((1ULL << 60) / NWORDS) % 61);
+  const u32 m61_log2_root_two = LOG2_ROOT_TWO61;
   const u32 m61_bigword_weight_shift = (NWORDS - EXP % NWORDS) * m61_log2_root_two % 61;
   const u32 m61_bigword_weight_shift_minus1 = (m61_bigword_weight_shift + 60) % 61;
 

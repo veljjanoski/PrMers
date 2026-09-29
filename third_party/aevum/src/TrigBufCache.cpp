@@ -530,6 +530,26 @@ vector<float2> genMiddleTrigFP32(u32 smallH, u32 middle, u32 width) {
 
 // Z31 and GF31 code copied from Yves Gallot's mersenne2 program
 
+namespace {
+
+// Inverse of an odd d modulo 2^k, k <= 64 (Newton iteration: each step doubles the correct low bits).
+u64 invModPow2(u64 d, u32 k) {
+  assert(d & 1);
+  u64 x = d;                                    // correct to 3 bits
+  for (int i = 0; i < 5; ++i) { x *= 2 - d * x; }
+  return k >= 64 ? x : x & ((u64(1) << k) - 1);
+}
+
+// Inverse of a modulo a small m, gcd(a, m) = 1.
+u32 invModSmall(u64 a, u32 m) {
+  a %= m;
+  for (u32 x = 1; x < m; ++x) { if (a * x % m == 1) { return x; } }
+  assert(m == 1);
+  return 0;
+}
+
+} // namespace
+
 // Z/{2^31 - 1}Z: the prime field of order p = 2^31 - 1
 class Z31
 {
@@ -582,6 +602,8 @@ private:
         // a primitive root of order 2^32 which is a root of (0, 1).
         static const uint64_t _h_order = uint64_t(1) << 32;
         static const uint32_t _h_0 = 7735u, _h_1 = 748621u;
+        // An element of order 63 of GF(p): 3^((p - 1) / 63), p - 1 = 2 * 3^2 * 7 * 11 * 31 * 151 * 331.
+        static const uint32_t _g63 = 579530712u;
 
 public:
         GF31() {}
@@ -605,8 +627,22 @@ public:
                 return r.mul(y);
         }
 
-        static const GF31 root_one(const size_t n) { return GF31(Z31(_h_0), Z31(_h_1)).pow(_h_order / n); }
-        static uint8_t log2_root_two(const size_t n) { return uint8_t(((uint64_t(1) << 30) / n) % 31); }
+        // Primitive root of unity of order n = d * 2^k, d dividing 63: the root h^(2^32 / 2^k) raised to
+        // d^-1 mod 2^k times the d-th root g63^(63 / d) of GF(p) raised to (2^k)^-1 mod d. Then
+        // root_one(m)^(m / n) == root_one(n) whenever n divides m, so the roots of all transform lengths
+        // agree, and power-of-two lengths keep their previous roots.
+        static const GF31 root_one(const size_t n) {
+                size_t d = n;
+                uint32_t k = 0;
+                while (d % 2 == 0) { d /= 2; ++k; }
+                const GF31 r2 = GF31(Z31(_h_0), Z31(_h_1)).pow(_h_order >> k);
+                if (d == 1) return r2;
+                assert(k <= 32 && 63 % d == 0);
+                const GF31 rd = GF31(Z31(_g63), Z31(0u)).pow(63 / d * invModSmall(uint64_t(1) << k, d));
+                return r2.pow(invModPow2(d, k)).mul(rd);
+        }
+        // log2 of an n-th root of two, a power of two since 2 has order 31: n^-1 mod 31.
+        static uint8_t log2_root_two(const size_t n) { return uint8_t(invModSmall(n, 31)); }
 };
 
 // Returns the primitive root of unity of order N, to the power k.
@@ -618,6 +654,34 @@ uint2 root1GF31(u32 N, u32 k) {
   assert(k < N);
   GF31 root1N = GF31::root_one(N);
   return root1GF31(root1N, k);
+}
+
+u32 log2RootTwoGF31(u32 n) { return GF31::log2_root_two(n); }
+
+// Constants of the radix-7 butterfly fft7 (cl/fft7.cl), Nussbaumer's 7-point DFT with z = root_one(7),
+// which lies in GF(p), in place of e^(2 pi i / 7): cos(2 pi k / 7) becomes c[k] = (z^k + z^-k) / 2 and
+// i * sin(2 pi k / 7) becomes s[k] = (z^k - z^-k) / 2. Returns C1, -C2, C3, -C4, S1, -S2, S3, S4 with
+// C1 = (c1 + c2 + c3) / 3, C2 = (2 c1 - c2 - c3) / 3, C3 = (c1 - 2 c2 + c3) / 3, C4 = (c1 + c2 - 2 c3) / 3,
+// S1 = (s1 + s2 - s3) / 3, S2 = (2 s1 - s2 + s3) / 3, S3 = (s1 - 2 s2 - s3) / 3, S4 = (s1 + s2 + 2 s3) / 3.
+std::array<u32, 8> fft7ConstantsGF31() {
+  const GF31 z = GF31::root_one(7);
+  if (z.s1().get() != 0 || z.pow(7).s0().get() != 1 || z.s0().get() == 1) { throw "GF31 7th root of unity"; }
+  const Z31 zero(0u), half(1u << 30);                                // 2 * 2^30 == 1 mod 2^31 - 1
+  const Z31 third = GF31(Z31(3u), zero).pow((uint64_t(1) << 31) - 3).s0();
+  Z31 c[4], s[4];
+  for (u32 k = 1; k <= 3; ++k) {
+    const Z31 zk = z.pow(k).s0(), zki = z.pow(7 - k).s0();
+    c[k] = (zk + zki) * half;
+    s[k] = (zk - zki) * half;
+  }
+  const Z31 k[8] = {
+    (c[1] + c[2] + c[3]) * third,         zero - (c[1] + c[1] - c[2] - c[3]) * third,
+    (c[1] - c[2] - c[2] + c[3]) * third,  zero - (c[1] + c[2] - c[3] - c[3]) * third,
+    (s[1] + s[2] - s[3]) * third,         zero - (s[1] + s[1] - s[2] + s[3]) * third,
+    (s[1] - s[2] - s[2] - s[3]) * third,  (s[1] + s[2] + s[3] + s[3]) * third};
+  std::array<u32, 8> out;
+  for (u32 i = 0; i < 8; ++i) { out[i] = k[i].get(); }
+  return out;
 }
 
 vector<uint2> genSmallTrigGF31(u32 size, u32 radix) {
@@ -744,6 +808,8 @@ private:
         // Primitive root of order 2^62 which is a root of (0, -1).  This root corresponds to -2*pi*i*j/N in FFTs.
         //static const uint64_t _h_0 = 481139922016222ull, _h_1 = 814659809902011ull;
         static const uint64_t _h_order = uint64_t(1) << 62;
+        // An element of order 63 of GF(p): 3^((p - 1) / 63), 63 divides p - 1.
+        static const uint64_t _g63 = 848087885351018712ull;
 
 public:
         GF61() {}
@@ -767,8 +833,19 @@ public:
                 return r.mul(y);
         }
 
-        static const GF61 root_one(const size_t n) { return GF61(Z61(_h_0), Z61(_h_1)).pow(_h_order / n); }
-        static uint8_t log2_root_two(const size_t n) { return uint8_t(((uint64_t(1) << 60) / n) % 61); }
+        // Primitive root of unity of order n = d * 2^k, d dividing 63, built as in GF31::root_one.
+        static const GF61 root_one(const size_t n) {
+                size_t d = n;
+                uint32_t k = 0;
+                while (d % 2 == 0) { d /= 2; ++k; }
+                const GF61 r2 = GF61(Z61(_h_0), Z61(_h_1)).pow(_h_order >> k);
+                if (d == 1) return r2;
+                assert(k <= 62 && 63 % d == 0);
+                const GF61 rd = GF61(Z61(_g63), Z61(uint64_t(0))).pow(63 / d * invModSmall(uint64_t(1) << k, d));
+                return r2.pow(invModPow2(d, k)).mul(rd);
+        }
+        // log2 of an n-th root of two, a power of two since 2 has order 61: n^-1 mod 61.
+        static uint8_t log2_root_two(const size_t n) { return uint8_t(invModSmall(n, 61)); }
 };
 
 // Returns the primitive root of unity of order N, to the power k.
@@ -780,6 +857,30 @@ ulong2 root1GF61(u32 N, u32 k) {
   assert(k < N);
   GF61 root1N = GF61::root_one(N);
   return root1GF61(root1N, k);
+}
+
+u32 log2RootTwoGF61(u32 n) { return GF61::log2_root_two(n); }
+
+// As fft7ConstantsGF31, for GF(M61^2).
+std::array<u64, 8> fft7ConstantsGF61() {
+  const GF61 z = GF61::root_one(7);
+  if (z.s1().get() != 0 || z.pow(7).s0().get() != 1 || z.s0().get() == 1) { throw "GF61 7th root of unity"; }
+  const Z61 zero(uint64_t(0)), half(uint64_t(1) << 60);             // 2 * 2^60 == 1 mod 2^61 - 1
+  const Z61 third = GF61(Z61(uint64_t(3)), zero).pow((uint64_t(1) << 61) - 3).s0();
+  Z61 c[4], s[4];
+  for (u32 k = 1; k <= 3; ++k) {
+    const Z61 zk = z.pow(k).s0(), zki = z.pow(7 - k).s0();
+    c[k] = (zk + zki) * half;
+    s[k] = (zk - zki) * half;
+  }
+  const Z61 k[8] = {
+    (c[1] + c[2] + c[3]) * third,         zero - (c[1] + c[1] - c[2] - c[3]) * third,
+    (c[1] - c[2] - c[2] + c[3]) * third,  zero - (c[1] + c[2] - c[3] - c[3]) * third,
+    (s[1] + s[2] - s[3]) * third,         zero - (s[1] + s[1] - s[2] + s[3]) * third,
+    (s[1] - s[2] - s[2] - s[3]) * third,  (s[1] + s[2] + s[3] + s[3]) * third};
+  std::array<u64, 8> out;
+  for (u32 i = 0; i < 8; ++i) { out[i] = k[i].get(); }
+  return out;
 }
 
 vector<ulong2> genSmallTrigGF61(u32 size, u32 radix) {

@@ -61,13 +61,17 @@ int main(int argc, char** argv) {
     std::istringstream in(spec);
     while (std::getline(in, item, ':')) parts.push_back(item);
     if (parts.size() < 5) throw std::runtime_error(std::string("bad resolved FFT: ") + spec);
-    const unsigned type = static_cast<unsigned>(std::stoul(parts[0]));
-    const unsigned middle = static_cast<unsigned>(std::stoul(parts[2]));
-    const unsigned width = static_cast<unsigned>(std::stoul(parts[1]));
-    const unsigned height = static_cast<unsigned>(std::stoul(parts[3]));
+    auto number = [](const std::string& text) {   // "1K" is 1024
+      return static_cast<unsigned>(std::stoul(text)) * (text.back() == 'K' ? 1024u : 1u);
+    };
+    const unsigned type = number(parts[0]);
+    const unsigned width = number(parts[1]);
+    const unsigned middle = number(parts[2]);
+    const unsigned height = number(parts[3]);
     const uint64_t words = uint64_t(width) * middle * height * 2;
     const double bpw = exponent / double(words);
-    if (type != 1 || middle < 2 || (middle & (middle - 1)) != 0 || bpw < 3.0) {
+    const bool middle_ok = middle >= 2 && ((middle & (middle - 1)) == 0 || middle == 7);
+    if (type != 1 || !middle_ok || bpw < 3.0 || bpw > 41.0) {
       throw std::runtime_error(std::string("invalid FFT3161 plan: ") + spec);
     }
     std::cout << "Aevum FFT " << exponent << " -> " << spec << std::endl;

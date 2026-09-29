@@ -107,6 +107,91 @@ void fft7by(T2 *u, u32 base, u32 step, u32 M) {
 #endif
 #undef A
 
-void fft7(T2 *u) { return fft7by(u, 0, 1, 7); }
+void OVERLOAD fft7(T2 *u) { return fft7by(u, 0, 1, 7); }
+
+#endif
+
+
+/**************************************************************************/
+/*          Radix-7 NTT butterflies over GF(M31^2) and GF(M61^2)          */
+/**************************************************************************/
+
+// u[j] := sum_k u[k] * z^(j*k), where z = root_one(7) is a 7th root of unity of GF(p) chosen by the host
+// to match the roots of the whole transform. This is fft7by above (Nussbaumer's 7-point DFT, 8 constant
+// multiplications) with z in place of e^(2 pi i / 7): the host constants FFT7GF*_C1..S4 replace cos(2 pi k/7)
+// by (z^k + z^-k) / 2 and i * sin(2 pi k/7) by (z^k - z^-k) / 2, so the multiplications by i disappear.
+// C2N, C4N and S2N are the negated constants.
+
+#if NTT_GF31 && defined(FFT7GF31_C1)
+
+GF31 OVERLOAD scalarMul(GF31 a, Z31 c) { return U2(mul(a.x, c), mul(a.y, c)); }
+
+void OVERLOAD fft7(GF31 *u) {
+  const Z31 C1 = FFT7GF31_C1, C2N = FFT7GF31_C2N, C3 = FFT7GF31_C3, C4N = FFT7GF31_C4N;
+  const Z31 S1 = FFT7GF31_S1, S2N = FFT7GF31_S2N, S3 = FFT7GF31_S3, S4 = FFT7GF31_S4;
+  X2(u[1], u[6]);
+  X2(u[2], u[5]);
+  X2(u[3], u[4]);
+  GF31 t13 = sub(u[2], u[1]);
+  GF31 t9 = sub(u[2], u[3]);
+  X2(u[1], u[3]);
+  GF31 m2 = scalarMul(u[3], C2N);
+  GF31 s0 = add(scalarMul(t9, C3), m2);
+  GF31 t4 = add(u[1], u[2]);
+  u[2] = add(scalarMul(t13, C4N), m2);
+  GF31 s4 = add(scalarMul(t4, C1), u[0]);
+  u[0] = add(u[0], t4);
+  u[1] = sub(s4, s0);
+  u[3] = sub(add(s4, s0), u[2]);
+  u[2] = add(s4, u[2]);
+  GF31 m6 = scalarMul(add(u[4], u[6]), S2N);
+  GF31 t2 = add(scalarMul(add(u[5], u[4]), S3), m6);
+  GF31 s3 = add(scalarMul(sub(u[6], u[5]), S4), m6);
+  GF31 t1 = scalarMul(add(sub(u[5], u[4]), u[6]), S1);
+  u[5] = add(t1, s3);
+  u[6] = sub(t1, t2);
+  t1 = sub(add(t1, t2), s3);
+  X2(u[1], u[6]);
+  X2(u[2], u[5]);
+  u[4] = add(u[3], t1);
+  u[3] = sub(u[3], t1);
+}
+
+#endif
+
+#if NTT_GF61 && defined(FFT7GF61_C1)
+
+GF61 OVERLOAD scalarMul(GF61 a, Z61 c) { return U2(mul(a.x, c), mul(a.y, c)); }
+
+void OVERLOAD fft7(GF61 *u) {
+  const Z61 C1 = FFT7GF61_C1, C2N = FFT7GF61_C2N, C3 = FFT7GF61_C3, C4N = FFT7GF61_C4N;
+  const Z61 S1 = FFT7GF61_S1, S2N = FFT7GF61_S2N, S3 = FFT7GF61_S3, S4 = FFT7GF61_S4;
+  X2(u[1], u[6]);
+  X2(u[2], u[5]);
+  X2(u[3], u[4]);
+  GF61 t13 = sub(u[2], u[1]);
+  GF61 t9 = sub(u[2], u[3]);
+  X2(u[1], u[3]);
+  GF61 m2 = scalarMul(u[3], C2N);
+  GF61 s0 = add(scalarMul(t9, C3), m2);
+  GF61 t4 = add(u[1], u[2]);
+  u[2] = add(scalarMul(t13, C4N), m2);
+  GF61 s4 = add(scalarMul(t4, C1), u[0]);
+  u[0] = add(u[0], t4);
+  u[1] = sub(s4, s0);
+  u[3] = sub(add(s4, s0), u[2]);
+  u[2] = add(s4, u[2]);
+  GF61 m6 = scalarMul(add(u[4], u[6]), S2N);
+  GF61 t2 = add(scalarMul(add(u[5], u[4]), S3), m6);
+  GF61 s3 = add(scalarMul(sub(u[6], u[5]), S4), m6);
+  GF61 t1 = scalarMul(add(sub(u[5], u[4]), u[6]), S1);
+  u[5] = add(t1, s3);
+  u[6] = sub(t1, t2);
+  t1 = sub(add(t1, t2), s3);
+  X2(u[1], u[6]);
+  X2(u[2], u[5]);
+  u[4] = add(u[3], t1);
+  u[3] = sub(u[3], t1);
+}
 
 #endif
