@@ -2,6 +2,7 @@
 // one aevum_engine_square_mul call per squaring.
 //
 // usage: engine_square_loop_gpu_test <libaevum_engine> <device> <tune_dir> [exponent[:iterations] ...]
+//   AEVUM_TEST_FFT=<spec> forces an FFT shape, e.g. 1:1K:7:256:202
 
 #include "../src/EngineApi.h"
 
@@ -108,7 +109,8 @@ int main(int argc, char** argv) {
     mpz_set_ui(three, 3);
 
     for (const Exponent& e : exponents) {
-        aevum_engine_handle h = api.create(e.p, 3, device, 0, "", tune_dir);
+        const char* spec = std::getenv("AEVUM_TEST_FFT");
+        aevum_engine_handle h = api.create(e.p, 3, device, 0, spec ? spec : "", tune_dir);
         if (!h) {
             std::printf("M%u: cannot create engine: %s\n", e.p, api.last_error());
             ++failures;
