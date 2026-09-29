@@ -10,6 +10,9 @@
 #include "../src/EngineApi.h"
 
 #if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX   // keep std::min/std::max usable
+#endif
 #include <windows.h>
 #else
 #include <dlfcn.h>
