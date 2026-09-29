@@ -308,6 +308,9 @@ public:
 	static gpu_backend configured_gpu_backend();
 	static const char * configured_gpu_backend_name();
 	static std::string configured_aevum_fft_spec();
+	// Aevum kernel settings ("-use KEY=VALUE,...") for the engines created afterwards.
+	static void configure_aevum_use(const std::string & settings);
+	static std::string configured_aevum_use();
 	static engine * create_gpu(const uint32_t q, const size_t reg_count, const size_t device, const bool verbose);
 	static engine * create_cpu(const uint32_t q, const size_t reg_count);
 };

@@ -346,6 +346,7 @@ App::App(int argc, char** argv)
         ? engine::gpu_backend::marin
         : (o.aevum ? engine::gpu_backend::aevum : engine::gpu_backend::auto_select);
     engine::configure_gpu_backend(selected_backend, o.aevum_fft_spec, workload);
+    engine::configure_aevum_use(o.aevum_use);
     return o;
   }())
   , context(options.device_id,

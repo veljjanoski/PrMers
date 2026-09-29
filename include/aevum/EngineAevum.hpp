@@ -12,8 +12,10 @@ bool aevum_engine_resolve_auto_fft(uint32_t exponent,
                                     std::string* resolved_spec = nullptr,
                                     std::string* reason = nullptr);
 
+// use: Aevum kernel settings "KEY=VALUE,..." (empty for the defaults).
 engine* create_aevum_engine(uint32_t exponent,
                             std::size_t register_count,
                             std::size_t device,
                             bool verbose,
-                            const std::string& fft_spec);
+                            const std::string& fft_spec,
+                            const std::string& use = "");

@@ -25,6 +25,7 @@ Licensed under GNU GPL version 3. See LICENSE and UPSTREAM.md.
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -33,6 +34,18 @@ Licensed under GNU GPL version 3. See LICENSE and UPSTREAM.md.
 namespace {
 
 thread_local std::string g_last_error;
+
+std::mutex g_use_mutex;
+std::string g_use;   // set by aevum_engine_set_use()
+
+// AEVUM_USE, then the aevum_engine_set_use() settings: later keys win in Args::splitUses order.
+std::string configured_use() {
+  std::string use;
+  if (const char* env = std::getenv("AEVUM_USE")) use = env;
+  std::lock_guard<std::mutex> lock(g_use_mutex);
+  if (!g_use.empty()) use += (use.empty() ? "" : ",") + g_use;
+  return use;
+}
 
 void set_error(const char* text) {
   g_last_error = text ? text : "unknown Aevum engine error";
@@ -69,6 +82,11 @@ public:
     args_.proofToVerifyDir = std::filesystem::absolute(".aevum-proof-tmp");
     if (tune_dir && *tune_dir) args_.masterDir = std::filesystem::absolute(tune_dir);
     args_.setDefaults();
+    // Kernel settings in Aevum's "-use KEY=VALUE,..." syntax, e.g. from a tuning run.
+    if (const std::string use = configured_use(); !use.empty()) {
+      for (const auto& [key, value] : Args::splitUses(use)) args_.flags[key] = value;
+      log("Aevum kernel settings: -use %s\n", use.c_str());
+    }
 
     context_ = std::make_unique<Context>(getDevice(device));
     cache_ = std::make_unique<TrigBufCache>(context_.get());
@@ -374,6 +392,13 @@ int aevum_engine_resolve_fft(uint32_t exponent, const char* fft_spec, char* outp
     set_error("unknown Aevum FFT selection exception");
   }
   return 0;
+}
+
+int aevum_engine_set_use(const char* settings) {
+  g_last_error.clear();
+  std::lock_guard<std::mutex> lock(g_use_mutex);
+  g_use = settings ? settings : "";
+  return 1;
 }
 
 aevum_engine_handle aevum_engine_create(uint32_t exponent, size_t register_count, uint32_t device, int verbose, const char* fft_spec, const char* tune_dir) {

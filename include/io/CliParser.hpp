@@ -29,6 +29,7 @@ struct CliOptions {
     bool aevum_auto = true;
     bool force_engine_marin = false;
     std::string aevum_fft_spec = "";
+    std::string aevum_use = "";
     bool bench = false;
     bool profiling = false;
     bool debug = false;

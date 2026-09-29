@@ -130,6 +130,7 @@ void printUsage(const char* progName) {
     std::cout << "  -aevum-auto          : Explicitly select automatic Marin/Aevum mode" << std::endl;
     std::cout << "  -marin               : Legacy internal PrMers NTT path (not supported with -llunsafe)" << std::endl;
     std::cout << "  -aevum-fft <spec>    : Force an Aevum FFT3161 shape, for example 1:1024:8:512" << std::endl;
+    std::cout << "  -aevum-use <list>    : Aevum kernel settings KEY=VALUE,... (as found by tests/run_aevum_tune.sh; env AEVUM_USE)" << std::endl;
     std::cout << "  Auto policy env      : AEVUM_AUTO_MAX_RATIO or workload-specific AEVUM_AUTO_PM1_STAGE1_MAX_RATIO, AEVUM_AUTO_PM1_STAGE2_MAX_RATIO, AEVUM_AUTO_ECM_MAX_RATIO" << std::endl;
     std::cout << "  -resume              : (Optional) write GMP-ECM and Prime 95 resume file after P-1 stage 1" << std::endl;
     //std::cout << "  -p95                 : (Optional) write Prime 95 resume file after P-1 stage 1" << std::endl;
@@ -265,6 +266,9 @@ CliOptions CliParser::parse(int argc, char** argv ) {
             opts.force_engine_marin = false;
             opts.marin = true;
             opts.aevum_fft_spec = argv[++i];
+        }
+        else if (std::strcmp(argv[i], "-aevum-use") == 0 && i + 1 < argc) {
+            opts.aevum_use = argv[++i];
         }
         else if (std::strcmp(argv[i], "-s3") == 0) {
             opts.s3only = true;

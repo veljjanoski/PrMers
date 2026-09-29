@@ -90,6 +90,7 @@ struct Api {
     using version_fn = const char* (*)();
     using error_fn = const char* (*)();
     using resolve_fn = int (*)(uint32_t, const char*, char*, std::size_t);
+    using set_use_fn = int (*)(const char*);
     using create_fn = Handle (*)(uint32_t, std::size_t, uint32_t, int, const char*, const char*);
     using destroy_fn = void (*)(Handle);
     using size_fn = std::size_t (*)(Handle);
@@ -111,6 +112,7 @@ struct Api {
     version_fn version = nullptr;
     error_fn last_error = nullptr;
     resolve_fn resolve_fft = nullptr;
+    set_use_fn set_use = nullptr;           // optional: absent in older plugins
     create_fn create = nullptr;
     destroy_fn destroy = nullptr;
     size_fn transform_size = nullptr;
@@ -239,6 +241,7 @@ struct Api {
         version = load_symbol<version_fn>("aevum_engine_version");
         last_error = load_symbol<error_fn>("aevum_engine_last_error");
         resolve_fft = load_symbol<resolve_fn>("aevum_engine_resolve_fft");
+        set_use = load_optional_symbol<set_use_fn>("aevum_engine_set_use");
         create = load_symbol<create_fn>("aevum_engine_create");
         destroy = load_symbol<destroy_fn>("aevum_engine_destroy");
         transform_size = load_symbol<size_fn>("aevum_engine_transform_size");
@@ -266,9 +269,15 @@ Api& api() {
 
 class engine_aevum final : public engine {
 public:
-    engine_aevum(uint32_t exponent, std::size_t register_count, std::size_t device, bool verbose, const std::string& fft_spec)
+    engine_aevum(uint32_t exponent, std::size_t register_count, std::size_t device, bool verbose, const std::string& fft_spec,
+                 const std::string& use)
         : exponent_(exponent), register_count_(register_count), api_(api()) {
         const std::string tune_dir = api_.tune_dir().string();
+        if (api_.set_use) {
+            if (!api_.set_use(use.c_str())) fail("set_use");
+        } else if (!use.empty()) {
+            std::cout << "[Backend Aevum] Warning: this engine plugin ignores -aevum-use" << std::endl;
+        }
         handle_ = api_.create(exponent, register_count, static_cast<uint32_t>(device), verbose ? 1 : 0,
                               fft_spec.empty() ? nullptr : fft_spec.c_str(), tune_dir.c_str());
         if (!handle_) fail("create");
@@ -591,6 +600,7 @@ engine* create_aevum_engine(uint32_t exponent,
                             std::size_t register_count,
                             std::size_t device,
                             bool verbose,
-                            const std::string& fft_spec) {
-    return new engine_aevum(exponent, register_count, device, verbose, fft_spec);
+                            const std::string& fft_spec,
+                            const std::string& use) {
+    return new engine_aevum(exponent, register_count, device, verbose, fft_spec, use);
 }

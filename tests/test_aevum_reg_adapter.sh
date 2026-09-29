@@ -17,7 +17,7 @@ fi
 "$CXX" -std=c++20 -O2 -fPIC "${SHARED_FLAGS[@]}" \
     "$ROOT/tests/aevum_fake_engine.cpp" \
     -o "$BUILD/libaevum_engine_fake.so"
-"$CXX" -std=c++20 -O2 -fPIC "${SHARED_FLAGS[@]}" -DAEVUM_FAKE_NO_SQUARE_LOOP \
+"$CXX" -std=c++20 -O2 -fPIC "${SHARED_FLAGS[@]}" -DAEVUM_FAKE_LEGACY \
     "$ROOT/tests/aevum_fake_engine.cpp" \
     -o "$BUILD/libaevum_engine_fake_legacy.so"
 
@@ -33,5 +33,6 @@ fi
     -o "$BUILD/test_aevum_reg_adapter"
 
 AEVUM_ENGINE_LIB="$BUILD/libaevum_engine_fake.so" "$BUILD/test_aevum_reg_adapter"
-# A plugin without aevum_engine_square_loop must still work through the generic fallback.
-AEVUM_ENGINE_LIB="$BUILD/libaevum_engine_fake_legacy.so" "$BUILD/test_aevum_reg_adapter"
+# A plugin without aevum_engine_square_loop and aevum_engine_set_use must still work, through the
+# generic squaring fallback and without kernel settings.
+AEVUM_FAKE_LEGACY=1 AEVUM_ENGINE_LIB="$BUILD/libaevum_engine_fake_legacy.so" "$BUILD/test_aevum_reg_adapter"

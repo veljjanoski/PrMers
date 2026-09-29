@@ -20,6 +20,7 @@ std::mutex backend_mutex;
 engine::gpu_backend backend = engine::gpu_backend::marin;
 engine::gpu_workload workload = engine::gpu_workload::generic;
 std::string aevum_fft_spec;
+std::string aevum_use;
 }
 
 void engine::configure_gpu_backend(const gpu_backend selected,
@@ -48,15 +49,27 @@ std::string engine::configured_aevum_fft_spec() {
     return aevum_fft_spec;
 }
 
+void engine::configure_aevum_use(const std::string& settings) {
+    std::lock_guard<std::mutex> lock(backend_mutex);
+    aevum_use = settings;
+}
+
+std::string engine::configured_aevum_use() {
+    std::lock_guard<std::mutex> lock(backend_mutex);
+    return aevum_use;
+}
+
 engine* engine::create_gpu(const uint32_t p, const size_t reg_count, const size_t device, const bool verbose) {
     gpu_backend selected;
     gpu_workload selected_workload;
     std::string fft_spec;
+    std::string use;
     {
         std::lock_guard<std::mutex> lock(backend_mutex);
         selected = backend;
         selected_workload = workload;
         fft_spec = aevum_fft_spec;
+        use = aevum_use;
     }
 
     const gpu_backend configured = selected;
@@ -113,7 +126,7 @@ engine* engine::create_gpu(const uint32_t p, const size_t reg_count, const size_
                     std::to_string(p) + ": " + reason);
             }
         }
-        engine* created = create_aevum_engine(p, reg_count, device, verbose, fft_spec);
+        engine* created = create_aevum_engine(p, reg_count, device, verbose, fft_spec, use);
         if (configured != gpu_backend::auto_select) {
             if (resolved_transform == 0) resolved_transform = created->get_size();
             publish("Forced Aevum", "Aevum", "selected by -aevum", resolved_transform, resolved_fft);

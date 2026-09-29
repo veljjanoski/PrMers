@@ -33,6 +33,10 @@ AEVUM_ENGINE_API int aevum_engine_resolve_fft(
     char* output,
     size_t output_size);
 
+/* Kernel settings for engines created afterwards, in Aevum's -use syntax "KEY=VALUE,...".
+   They override the AEVUM_USE environment variable; NULL or "" clears them. */
+AEVUM_ENGINE_API int aevum_engine_set_use(const char* settings);
+
 AEVUM_ENGINE_API aevum_engine_handle aevum_engine_create(
     uint32_t exponent,
     size_t register_count,
