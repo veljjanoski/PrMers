@@ -1039,8 +1039,6 @@ tests/run_aevum_tune.sh 0
 
 The tuned FFT shape applies to exponents of the same transform size (set `PRMERS_TUNE_EXPONENT` to tune another size). `tests/run_gpu_speedup_check.sh 0` checks the fused squaring loop, GPU proof generation and the Marin radix-5 kernels on a GPU and measures PRP throughput.
 
-Aevum can also run FFT3161 transforms of 7 * 2^k words (a radix-7 middle step): 3.5M words hold exponents up to about 144.8M, so the current wavefront needs 12.5% fewer words than with 4M. They are experimental: name one with `-aevum-fft` (for example `-aevum-fft 1:512:7:512:202`) or set `AEVUM_NTT7=1` to let the automatic choice use them, and check them on a GPU first with `tests/run_radix7_check.sh 0`.
-
 Aevum is a customized GPLv3 derivative of GPUOwl/PRPLL, adapted by cherubrock-seb into a reusable register engine. Its external interface is modeled after the kind of opaque register operations used by Marin, while the Aevum arithmetic implementation remains derived from GPUOwl/PRPLL. Aevum is not an official upstream release.
 
 The standalone source includes:

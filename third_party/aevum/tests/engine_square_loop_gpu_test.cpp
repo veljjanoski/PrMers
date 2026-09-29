@@ -2,7 +2,7 @@
 // one aevum_engine_square_mul call per squaring.
 //
 // usage: engine_square_loop_gpu_test <libaevum_engine> <device> <tune_dir> [exponent[:iterations] ...]
-//   AEVUM_TEST_FFT=<spec> forces an FFT shape, e.g. 1:1K:7:256:202
+//   AEVUM_TEST_FFT=<spec> forces an FFT shape, e.g. 1:512:8:512:202
 
 #include "../src/EngineApi.h"
 

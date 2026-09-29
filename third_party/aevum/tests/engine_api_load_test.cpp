@@ -70,8 +70,7 @@ int main(int argc, char** argv) {
     const unsigned height = number(parts[3]);
     const uint64_t words = uint64_t(width) * middle * height * 2;
     const double bpw = exponent / double(words);
-    const bool middle_ok = middle >= 2 && ((middle & (middle - 1)) == 0 || middle == 7);
-    if (type != 1 || !middle_ok || bpw < 3.0 || bpw > 41.0) {
+    if (type != 1 || middle < 2 || (middle & (middle - 1)) != 0 || bpw < 3.0) {
       throw std::runtime_error(std::string("invalid FFT3161 plan: ") + spec);
     }
     std::cout << "Aevum FFT " << exponent << " -> " << spec << std::endl;

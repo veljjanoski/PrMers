@@ -5,7 +5,6 @@
 #include "Buffer.h"
 #include "FFTConfig.h"
 
-#include <array>
 #include <mutex>
 
 using TrigBuf = Buffer<double2>;
@@ -57,14 +56,6 @@ float2 root1FP32(u32 N, u32 k);
 
 uint2 root1GF31(u32 N, u32 k);
 ulong2 root1GF61(u32 N, u32 k);
-
-// log2 of an n-th root of two in GF(M31) / GF(M61), used for the IBDWT weight shifts.
-u32 log2RootTwoGF31(u32 n);
-u32 log2RootTwoGF61(u32 n);
-
-// Constants of the radix-7 NTT butterfly (C1, -C2, C3, -C4, S1, -S2, S3, S4), see fft7ConstantsGF31.
-std::array<u32, 8> fft7ConstantsGF31();
-std::array<u64, 8> fft7ConstantsGF61();
 
 // Compute the size of the largest possible trig buffer given width, middle, height (in number of double2 values)
 #define SMALLTRIG_FP64_SIZE(W,M,H,nH)           (W != H || H == 0 ? W * 5 : SMALLTRIGCOMBO_FP64_SIZE(W,M,H,nH)) // See genSmallTrigFP64

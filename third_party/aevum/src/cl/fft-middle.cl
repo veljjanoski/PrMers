@@ -655,8 +655,6 @@ void OVERLOAD fft_MIDDLE(GF31 *u) {
   fft2(u);
 #elif MIDDLE == 4
   fft4(u);
-#elif MIDDLE == 7
-  fft7(u);
 #elif MIDDLE == 8
   fft8(u);
 #elif MIDDLE == 16
@@ -778,8 +776,6 @@ void OVERLOAD fft_MIDDLE(GF61 *u) {
   fft2(u);
 #elif MIDDLE == 4
   fft4(u);
-#elif MIDDLE == 7
-  fft7(u);
 #elif MIDDLE == 8
   fft8(u);
 #elif MIDDLE == 16

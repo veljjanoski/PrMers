@@ -199,13 +199,13 @@ private:
     mpz_t mp_, x_, t_;
 };
 
-// FFT3161 shapes of the given transform size, as Aevum enumerates them (middle 7 or a power of two).
+// FFT3161 shapes of the given transform size, as Aevum enumerates them (power-of-two middles).
 std::vector<std::string> shapes_of_size(size_t size) {
     std::vector<std::string> out;
     for (uint32_t w : {256u, 512u, 1024u, 4096u}) {
         for (uint32_t h : {256u, 512u, 1024u}) {
             if (w == 256 && h == 1024) continue;
-            for (uint32_t m : {2u, 4u, 7u, 8u, 16u}) {
+            for (uint32_t m : {2u, 4u, 8u, 16u}) {
                 if (size_t(2) * w * m * h == size) out.push_back("1:" + size_name(w) + ":" + std::to_string(m) + ":" + size_name(h) + ":202");
             }
         }
@@ -273,15 +273,9 @@ int main(int argc, char** argv) {
         std::printf("tune: the default configuration fails on this device\n");
         return 1;
     }
-    // Candidates: the shapes of that size and, when the exponent fits one with margin (under 39 bits
-    // per word), the 7 * 2^k shapes of 7/8 of that size.
-    std::vector<std::string> candidates = shapes_of_size(size);
-    if (size % 8 == 0 && p / double(size / 8 * 7) < 39.0) {
-        for (const std::string& fft : shapes_of_size(size / 8 * 7)) candidates.push_back(fft);
-    }
     std::string best_fft;
     double best = 0;
-    for (const std::string& fft : candidates) {
+    for (const std::string& fft : shapes_of_size(size)) {
         const double ms = tuner.time(fft, {});
         if (ms > 0 && (best <= 0 || ms < best)) { best = ms; best_fft = fft; }
     }
@@ -371,7 +365,7 @@ int main(int argc, char** argv) {
 
     // 3. The shapes again with the tuned settings, then the final comparison.
     std::string final_fft = best_fft;
-    for (const std::string& fft : candidates) {
+    for (const std::string& fft : shapes_of_size(size)) {
         if (fft == best_fft) continue;
         const double ms = tuner.time(fft, use);
         if (ms > 0 && ms < best * 0.997) { best = ms; final_fft = fft; }

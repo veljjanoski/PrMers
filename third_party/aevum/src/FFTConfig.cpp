@@ -7,7 +7,6 @@
 #include "TuneEntry.h"
 
 #include <cmath>
-#include <cstdlib>
 #include <cassert>
 #include <vector>
 #include <algorithm>
@@ -36,18 +35,6 @@ u32 parseInt(const string& s) {
   char c = s.back();
   u32 multiple = c == 'k' || c == 'K' ? 1024 : c == 'm' || c == 'M' ? 1024 * 1024 : 1;
   return u32(strtod(s.c_str(), nullptr) * multiple);
-}
-
-// NTT middle radices: powers of two, and 7 for FFT3161 (both GF(M31) and GF(M61) have 7th roots of unity).
-bool nttMiddleSupported(enum FFT_TYPES type, u32 middle) {
-  return !(middle & (middle - 1)) || (middle == 7 && type == FFT3161);
-}
-
-// 7 * 2^k FFT3161 transforms are picked automatically only with AEVUM_NTT7=1 until they have been
-// validated on more GPUs; an explicit FFT spec may always name them.
-bool autoRadix7() {
-  const char* e = getenv("AEVUM_NTT7");
-  return e && *e && *e != '0';
 }
 
 } // namespace
@@ -101,7 +88,7 @@ vector<FFTShape> FFTShape::allShapes(u32 sizeFrom, u32 sizeTo) {
       for (u32 height : {256, 512, 1024}) {
         if (width == 256 && height == 1024) { continue; } // Skip because we prefer width >= height
         for (u32 middle : {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}) {
-          if (type != FFT64 && !nttMiddleSupported(type, middle)) continue;   // Reject NTT middles without a butterfly
+          if (type != FFT64 && (middle & (middle - 1))) continue;   // Reject non-power-of-two NTTs
           u32 sz = width * height * middle * 2;
           if (sizeFrom <= sz && sz <= sizeTo) {
             configs.push_back({type, width, middle, height});
@@ -245,8 +232,8 @@ FFTConfig::FFTConfig(const string& spec) {
       log("Height must be 256, 512, 1024.\n");
       throw "Invalid FFT spec";
     }
-    if (fft_type != FFT64 && fft_type != FFT32 && !nttMiddleSupported(fft_type, m)) {
-      log("NTT middle must be a power of two (or 7 for FFT3161).\n");
+    if (fft_type != FFT64 && fft_type != FFT32 && (m & (m - 1))) {
+      log("NTT middle must be a power of two.\n");
       throw "Invalid FFT spec";
     }
   }
@@ -337,7 +324,6 @@ FFTConfig FFTConfig::bestFit(const Args& args, u64 E, const string& spec) {
   });
   for (const FFTShape& shape : shapes) {
     if (shape.fft_type != FFT3161) continue;
-    if (shape.middle == 7 && !autoRadix7()) continue;
     for (u32 v : {101, 202}) {
       FFTConfig fft{shape, v, CARRY_AUTO};
       const double bits_per_word = E / double(shape.size());

@@ -374,21 +374,9 @@ string clDefines(const Args& args, cl_device_id id, FFTConfig fft, const vector<
   }
   if (fft.NTT_GF31) {
     defines += toDefine("TAILTGF31", root1GF31(fft.shape.height * 2, 1));
-    defines += toDefine("LOG2_ROOT_TWO31", log2RootTwoGF31(N));
-    if (fft.shape.middle == 7) {
-      const auto c = fft7ConstantsGF31();
-      const char* names[] = {"C1", "C2N", "C3", "C4N", "S1", "S2N", "S3", "S4"};
-      for (u32 i = 0; i < 8; ++i) { defines += toDefine("FFT7GF31_"s + names[i], c[i]); }
-    }
   }
   if (fft.NTT_GF61) {
     defines += toDefine("TAILTGF61", root1GF61(fft.shape.height * 2, 1));
-    defines += toDefine("LOG2_ROOT_TWO61", log2RootTwoGF61(N));
-    if (fft.shape.middle == 7) {
-      const auto c = fft7ConstantsGF61();
-      const char* names[] = {"C1", "C2N", "C3", "C4N", "S1", "S2N", "S3", "S4"};
-      for (u32 i = 0; i < 8; ++i) { defines += toDefine("FFT7GF61_"s + names[i], c[i]); }
-    }
   }
 
   // Send the FFT/NTT type and booleans that enable/disable code for each possible FP and NTT
