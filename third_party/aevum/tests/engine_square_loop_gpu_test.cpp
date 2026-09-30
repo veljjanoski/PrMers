@@ -199,7 +199,9 @@ int main(int argc, char** argv) {
     }
 
     mpz_clears(mp, expected, actual, exponent, three, nullptr);
-    close_library(lib);
+    // Print before unloading: the engine's static destructors close stdout.
     std::printf("%s\n", failures ? "square chain GPU test FAILED" : "square chain GPU test passed");
+    std::fflush(stdout);
+    close_library(lib);
     return failures ? 1 : 0;
 }
