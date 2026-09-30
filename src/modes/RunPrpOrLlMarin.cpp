@@ -259,6 +259,11 @@ int App::runPrpOrLlMarin()
 
     // R4/R5 hold the last verified state: the state before iteration goodIter.
     uint64_t goodIter = ri;
+    // Gerbicz-Li failures since the last passed check. A random error is gone after the restore;
+    // the same failure three times in a row repeats deterministically (for example a transform
+    // plan that computes wrongly for this exponent), so the test stops instead of looping forever.
+    uint32_t gl_failure_streak = 0;
+    constexpr uint32_t gl_failure_limit = 3;
 
     uint64_t L = options.exponent;
     // Gerbicz-Li block size B. A full check costs B squarings and each block one multiplication,
@@ -413,18 +418,23 @@ int App::runPrpOrLlMarin()
                      mpz_clears(z0, z1, nullptr);
                     if (!is_eq) 
                     { 
-                        //delete eng; 
-                        //throw std::runtime_error("Gerbicz-Li error checking failed!"); 
-                        std::cout << "[Gerbicz Li] Mismatch \n"
-                            << "[Gerbicz Li] Check FAILED! iter=" << (iter + 1) << "\n"
-                            << "[Gerbicz Li] Restore iter=" << goodIter << " (j=" << (totalIters - goodIter) << ")\n";
-                        if (guiServer_) {
-                            std::ostringstream oss;
-                            oss << "[Gerbicz Li] Mismatch \n"
-                            << "[Gerbicz Li] Check FAILED! iter=" << (iter + 1) << "\n"
-                            << "[Gerbicz Li] Restore iter=" << goodIter << " (j=" << (totalIters - goodIter) << ")\n";
-                            guiServer_->appendLog(oss.str());
+                        std::ostringstream oss;
+                        oss << "[Gerbicz Li] Mismatch \n"
+                            << "[Gerbicz Li] Check FAILED! iter=" << (iter + 1) << "\n";
+                        if (++gl_failure_streak >= gl_failure_limit) {
+                            const std::string reason = "Gerbicz-Li check failed " + std::to_string(gl_failure_streak)
+                                + " times in a row from iteration " + std::to_string(goodIter)
+                                + ", so the error repeats and retrying will not help. Stopping: try -engine-marin or"
+                                  " another -aevum-fft plan, and check the GPU for stability.";
+                            oss << "[Gerbicz Li] " << reason << "\n";
+                            std::cout << oss.str();
+                            if (guiServer_) guiServer_->appendLog(oss.str());
+                            delete eng;
+                            throw std::runtime_error(reason);
                         }
+                        oss << "[Gerbicz Li] Restore iter=" << goodIter << " (j=" << (totalIters - goodIter) << ")\n";
+                        std::cout << oss.str();
+                        if (guiServer_) guiServer_->appendLog(oss.str());
                         // Resume from the last verified state (the checkpoint state if no check
                         // has passed since the start or resume of this run).
                         checkpass = 0;
@@ -444,6 +454,7 @@ int App::runPrpOrLlMarin()
                         eng->copy(R4, R0);//Last correct state
                         eng->copy(R5, R1);//Last correct bufd
                         goodIter = iter + 1;
+                        gl_failure_streak = 0;
                     }
             }
             

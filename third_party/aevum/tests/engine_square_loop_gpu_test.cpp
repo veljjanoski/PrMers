@@ -1,6 +1,7 @@
 // GPU check against GMP of consecutive aevum_engine_square_mul calls, which Aevum chains through
 // the carryFused kernel (register lead cache), of a prepared multiplication after such a chain and
-// of Lucas-Lehmer steps (square_mul then sub_u32 2), with the time per squaring.
+// of Lucas-Lehmer steps (square_mul then sub_u32 2) and of a square_mul by 3 inside a chain, as in the
+// Gerbicz-Li check, with the time per squaring.
 // AEVUM_REG_LEAD_CACHE=0 times unchained squarings.
 //
 // usage: engine_square_loop_gpu_test <libaevum_engine> <device> <tune_dir> [exponent[:iterations] ...]
@@ -177,6 +178,17 @@ int main(int argc, char** argv) {
                 require(api.sub_u32(h, 1, 2), "sub_u32");
             }
             check(1, "Lucas-Lehmer steps");
+
+            // Squarings with one square_mul by 3 in the middle, as in the Gerbicz-Li check.
+            mpz_set_ui(expected, 3);
+            for (uint64_t i = 0; i < k; ++i) {
+                mpz_mul(expected, expected, expected);
+                if (i == k / 2) mpz_mul_ui(expected, expected, 3);
+                mpz_mod(expected, expected, mp);
+            }
+            require(api.set_u32(h, 1, 3), "set");
+            for (uint64_t i = 0; i < k; ++i) require(api.square_mul(h, 1, i == k / 2 ? 3 : 1), "square_mul");
+            check(1, "square_mul x k with one x3");
 
             std::printf("M%u transform=%zu: %.3f ms/iter\n", e.p, api.transform_size(h), per_square * 1e3);
         } catch (const std::exception& ex) {
